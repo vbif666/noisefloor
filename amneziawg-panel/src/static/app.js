@@ -272,6 +272,8 @@ function fillServerForm(s) {
   $("f-mtu").value = s.mtu || "";
   $("f-cascade-enabled").checked = !!s.cascade_enabled;
   $("f-cascade-url").value = s.cascade_vless_url || "";
+  $("f-cascade-sync-url").value = s.cascade_sync_url || "";
+  $("f-cascade-sync-token").value = s.cascade_sync_token || "";
   $("f-jc").value = s.jc;
   $("f-jmin").value = s.jmin;
   $("f-jmax").value = s.jmax;
@@ -314,6 +316,8 @@ $("server-form").addEventListener("submit", async (e) => {
     mtu: $("f-mtu").value ? Number($("f-mtu").value) : null,
     cascade_enabled: $("f-cascade-enabled").checked,
     cascade_vless_url: $("f-cascade-url").value.trim(),
+    cascade_sync_url: $("f-cascade-sync-url").value.trim(),
+    cascade_sync_token: $("f-cascade-sync-token").value.trim(),
     jc: Number($("f-jc").value),
     jmin: Number($("f-jmin").value),
     jmax: Number($("f-jmax").value),
@@ -334,6 +338,54 @@ $("server-form").addEventListener("submit", async (e) => {
     showToast(err.message, true);
   }
 });
+
+$("cascade-sync-btn").addEventListener("click", async () => {
+  const btn = $("cascade-sync-btn");
+  const status = $("cascade-sync-status");
+  btn.disabled = true;
+  status.classList.remove("is-error", "is-ok");
+  status.textContent = "спрашиваю релей…";
+  try {
+    // Сохраняем адрес и токен перед синхронизацией: иначе спросим релей
+    // по старым данным и покажем непонятную ошибку.
+    await api("/server", {
+      method: "PUT",
+      body: JSON.stringify({
+        cascade_sync_url: $("f-cascade-sync-url").value.trim(),
+        cascade_sync_token: $("f-cascade-sync-token").value.trim(),
+      }),
+    });
+    const result = await api("/server/cascade/sync", { method: "POST" });
+    renderCascadeSync(result);
+    await loadServer();
+  } catch (err) {
+    status.textContent = err.message;
+    status.classList.add("is-error");
+  } finally {
+    btn.disabled = false;
+  }
+});
+
+function renderCascadeSync(c) {
+  const status = $("cascade-sync-status");
+  if (!status) return;
+  status.classList.remove("is-error", "is-ok");
+  if (!c.sync_enabled) {
+    status.textContent = "";
+    return;
+  }
+  if (c.sync_error) {
+    status.textContent = c.sync_error;
+    status.classList.add("is-error");
+    return;
+  }
+  if (c.synced_at) {
+    status.textContent = `параметры получены ${timeAgo(new Date(c.synced_at))}`;
+    status.classList.add("is-ok");
+  } else {
+    status.textContent = "ещё не синхронизировались";
+  }
+}
 
 $("randomize-btn").addEventListener("click", async () => {
   try {
@@ -865,6 +917,7 @@ function renderCascadeBadge(hist) {
 }
 
 function renderCascadeStatus(c) {
+  renderCascadeSync(c);
   const el = $("cascade-status");
   if (!el) return;
   el.classList.remove("is-error", "is-ok");

@@ -5,7 +5,7 @@ from pathlib import Path
 from fastapi import FastAPI
 from fastapi.staticfiles import StaticFiles
 
-from . import backup, bootstrap, cascade, config_sync, traffic_history
+from . import backup, bootstrap, cascade, cascade_sync, config_sync, traffic_history
 from .config import settings
 from .database import Base, SessionLocal, engine, run_migrations
 from .routers import auth, backup as backup_router, peers, server, status, updates
@@ -15,6 +15,7 @@ STATIC_DIR = Path(__file__).resolve().parent.parent / "static"
 _traffic_history_stop = threading.Event()
 _cascade_supervisor_stop = threading.Event()
 _backup_stop = threading.Event()
+_cascade_sync_stop = threading.Event()
 
 
 @asynccontextmanager
@@ -40,12 +41,16 @@ async def lifespan(app: FastAPI):
     # Резервные копии: одна сразу при старте, дальше раз в сутки. В data
     # лежат ключи всех клиентов — без копий их потеря невосстановима.
     threading.Thread(target=backup.run, args=(_backup_stop,), daemon=True).start()
+    # Синхронизация с релеем: подтягивает его SNI и camouflage dest, чтобы
+    # их не приходилось держать одинаковыми на двух серверах руками.
+    threading.Thread(target=cascade_sync.run, args=(_cascade_sync_stop,), daemon=True).start()
     try:
         yield
     finally:
         _traffic_history_stop.set()
         _cascade_supervisor_stop.set()
         _backup_stop.set()
+        _cascade_sync_stop.set()
 
 
 app = FastAPI(title="AmneziaWG Panel", version="1.0.0", lifespan=lifespan)

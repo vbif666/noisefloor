@@ -47,6 +47,16 @@ class ServerConfig(Base):
     cascade_vless_url = Column(Text, default="")
     cascade_last_error = Column(Text, nullable=True)
 
+    # Синхронизация с релеем. Если адрес задан, ссылка выше становится
+    # производной величиной: панель периодически спрашивает у релея его
+    # текущие параметры и подставляет их сама. Иначе SNI и camouflage dest
+    # приходится держать одинаковыми на двух серверах вручную, а разойдясь,
+    # они молча ломают каскад.
+    cascade_sync_url = Column(String(255), default="")
+    cascade_sync_token = Column(Text, default="")
+    cascade_sync_error = Column(Text, nullable=True)
+    cascade_synced_at = Column(DateTime, nullable=True)
+
     # --- Параметры обфускации AmneziaWG 2.0 ---
     jc = Column(Integer, default=6)
     jmin = Column(Integer, default=40)

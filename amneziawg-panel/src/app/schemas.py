@@ -38,6 +38,10 @@ class ServerRead(BaseModel):
     cascade_enabled: bool
     cascade_vless_url: str
     cascade_last_error: str | None
+    cascade_sync_url: str = ""
+    cascade_sync_token: str = ""
+    cascade_sync_error: str | None = None
+    cascade_synced_at: datetime | None = None
     jc: int
     jmin: int
     jmax: int
@@ -69,6 +73,8 @@ class ServerUpdate(BaseModel):
     egress_interface: str | None = None
     cascade_enabled: bool | None = None
     cascade_vless_url: str | None = None
+    cascade_sync_url: str | None = None
+    cascade_sync_token: str | None = None
     jc: int | None = Field(default=None, ge=0, le=128)
     jmin: int | None = Field(default=None, ge=0)
     jmax: int | None = Field(default=None, ge=0)
@@ -106,6 +112,10 @@ class CascadeStatus(BaseModel):
     verified_at: datetime | None = None
     verify_error: str | None = None
     restarts: int = 0  # сколько раз супервизор поднимал упавший xray
+    # Синхронизация параметров с релеем
+    sync_enabled: bool = False
+    sync_error: str | None = None
+    synced_at: datetime | None = None
 
 
 # --- Peers ---

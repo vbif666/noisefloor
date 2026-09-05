@@ -92,6 +92,16 @@ def restart_server_interface(db: Session = Depends(get_db), _admin: str = Depend
     return ApplyResult(ok=result.ok, message=result.output, live_management_available=awg_manager.tools_available())
 
 
+@router.post("/cascade/sync", response_model=CascadeStatus)
+def cascade_sync_now(db: Session = Depends(get_db), _admin: str = Depends(get_current_admin)):
+    """Синхронизация по кнопке: не ждать фонового цикла, когда только что
+    поменяли настройки на релее."""
+    from .. import cascade_sync
+
+    cascade_sync.sync_once(db)
+    return cascade_status(db=db, _admin=_admin)
+
+
 @router.get("/cascade/status", response_model=CascadeStatus)
 def cascade_status(db: Session = Depends(get_db), _admin: str = Depends(get_current_admin)):
     server = config_sync.get_server(db)
@@ -102,6 +112,9 @@ def cascade_status(db: Session = Depends(get_db), _admin: str = Depends(get_curr
         configured=bool((server.cascade_vless_url or "").strip()),
         running=cascade.is_running(),
         error=server.cascade_last_error,
+        sync_enabled=bool((server.cascade_sync_url or "").strip()),
+        sync_error=server.cascade_sync_error,
+        synced_at=server.cascade_synced_at,
         verified_ok=health.get("verified_ok"),
         verified_at=health.get("verified_at"),
         verify_error=health.get("verify_error"),

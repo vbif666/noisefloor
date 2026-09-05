@@ -26,6 +26,10 @@ _SERVER_CONFIG_MIGRATIONS = [
     ("cascade_enabled", "ALTER TABLE server_config ADD COLUMN cascade_enabled BOOLEAN NOT NULL DEFAULT 0"),
     ("cascade_vless_url", "ALTER TABLE server_config ADD COLUMN cascade_vless_url TEXT DEFAULT ''"),
     ("cascade_last_error", "ALTER TABLE server_config ADD COLUMN cascade_last_error TEXT"),
+    ("cascade_sync_url", "ALTER TABLE server_config ADD COLUMN cascade_sync_url VARCHAR(255) DEFAULT ''"),
+    ("cascade_sync_token", "ALTER TABLE server_config ADD COLUMN cascade_sync_token TEXT DEFAULT ''"),
+    ("cascade_sync_error", "ALTER TABLE server_config ADD COLUMN cascade_sync_error TEXT"),
+    ("cascade_synced_at", "ALTER TABLE server_config ADD COLUMN cascade_synced_at DATETIME"),
 ]
 
 

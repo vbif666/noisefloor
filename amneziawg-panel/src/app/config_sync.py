@@ -25,6 +25,13 @@ def apply_current_config(db: Session, *, restart: bool = False) -> awg_manager.C
     """
     server = get_server(db)
 
+    # Если настроена синхронизация, сначала забираем у релея актуальные
+    # параметры — иначе применим заведомо устаревшую ссылку.
+    if server.cascade_enabled and (server.cascade_sync_url or "").strip():
+        from . import cascade_sync
+        cascade_sync.sync_once(db)
+        server = get_server(db)
+
     # Каскад (xray -> VLESS) применяется ДО рендера awg-конфига: REDIRECT-
     # правило в PostUp имеет смысл только если процесс, на который оно
     # заворачивает трафик, реально поднят.

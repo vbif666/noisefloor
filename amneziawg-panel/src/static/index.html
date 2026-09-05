@@ -170,12 +170,38 @@
                 <input id="f-cascade-enabled" type="checkbox" style="width:auto;" /> Включить каскад
               </label>
             </div>
+            <div class="field-group">
+              <span class="eyebrow">Синхронизация с релеем</span>
+              <p class="field-hint" style="margin-top:6px;">
+                Укажите адрес релея и его токен — панель будет сама забирать оттуда
+                актуальные SNI и camouflage dest. Иначе эти настройки приходится
+                держать одинаковыми на двух серверах вручную, а разойдясь, они молча
+                ломают каскад. Токен показан на странице релея.
+              </p>
+              <div class="field-row">
+                <div class="field">
+                  <label for="f-cascade-sync-url">Адрес релея</label>
+                  <input id="f-cascade-sync-url" placeholder="http://203.0.113.10:8001" />
+                </div>
+                <div class="field">
+                  <label for="f-cascade-sync-token">Токен синхронизации</label>
+                  <input id="f-cascade-sync-token" type="password" placeholder="с панели релея" />
+                </div>
+              </div>
+              <div class="server-actions" style="margin-top:4px;">
+                <button type="button" id="cascade-sync-btn" class="btn btn-sm">Синхронизировать сейчас</button>
+                <span id="cascade-sync-status" class="apply-status"></span>
+              </div>
+            </div>
             <div class="field-group" style="margin-bottom:0;">
               <div class="field">
                 <label for="f-cascade-url">Ссылка клиента vless://</label>
                 <textarea id="f-cascade-url" rows="2" placeholder="vless://uuid@host:port?security=reality&amp;pbk=...&amp;sni=...#label"></textarea>
               </div>
-              <p class="field-hint">Поддерживается только security=reality.</p>
+              <p class="field-hint" id="f-cascade-url-hint">
+                Поддерживается только security=reality. При включённой синхронизации
+                это поле заполняется автоматически — править его вручную не нужно.
+              </p>
             </div>
           </div>
         </div>

@@ -34,7 +34,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import quote
 
-from fastapi import Depends, FastAPI, Form, HTTPException, status
+from fastapi import Depends, FastAPI, Form, HTTPException, Request, status
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 import qrcode
@@ -114,10 +114,47 @@ def get_admin_password() -> str:
 
 
 ADMIN_PASSWORD = get_admin_password()
-security = HTTPBasic()
+security = HTTPBasic(auto_error=False)
+
+SYNC_PATH = "/api/sync"
 
 
-def check_auth(credentials: HTTPBasicCredentials = Depends(security)):
+def _sync_token() -> str:
+    try:
+        return json.loads(CREDS_FILE.read_text()).get("sync_token", "")
+    except Exception:
+        return ""
+
+
+def _authorise_sync(request) -> str:
+    """Синхронизация ходит с токеном: у панели на соседнем сервере нет и не
+    должно быть пароля администратора от этого релея."""
+    expected = _sync_token()
+    header = request.headers.get("authorization", "")
+    presented = ""
+    if header.lower().startswith("bearer "):
+        presented = header[7:].strip()
+    else:
+        presented = request.headers.get("x-sync-token", "").strip()
+
+    if not expected or not presented or not secrets.compare_digest(presented, expected):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Неверный токен синхронизации",
+        )
+    return "sync"
+
+
+def check_auth(request: Request, credentials: HTTPBasicCredentials | None = Depends(security)):
+    if request.url.path == SYNC_PATH:
+        return _authorise_sync(request)
+
+    if credentials is None:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Unauthorized",
+            headers={"WWW-Authenticate": "Basic"},
+        )
     user_ok = secrets.compare_digest(credentials.username, ADMIN_USER)
     pass_ok = secrets.compare_digest(credentials.password, ADMIN_PASSWORD)
     if not (user_ok and pass_ok):
@@ -153,6 +190,11 @@ def provision() -> dict:
         creds.setdefault("dest", DEFAULT_REALITY_DEST)
         creds.setdefault("sni", DEFAULT_REALITY_SNI)
         creds.setdefault("vless_port", VLESS_PORT)
+        # Токен появился позже — дописываем его уже развёрнутым релеям,
+        # чтобы синхронизация заработала без пересоздания ключей.
+        if not creds.get("sync_token"):
+            creds["sync_token"] = secrets.token_urlsafe(32)
+            save_creds(creds)
         return creds
     keys = run_x25519()
     creds = {
@@ -163,6 +205,11 @@ def provision() -> dict:
         "dest": DEFAULT_REALITY_DEST,
         "sni": DEFAULT_REALITY_SNI,
         "vless_port": VLESS_PORT,
+        # Секрет для синхронизации: по нему панель на соседнем сервере
+        # забирает актуальные параметры подключения и сама подстраивается
+        # под них. Отдельный от пароля администратора — панели-клиенту
+        # незачем иметь полный доступ к этому релею.
+        "sync_token": secrets.token_urlsafe(32),
         "created_at": datetime.now(timezone.utc).isoformat(),
     }
     save_creds(creds)
@@ -463,6 +510,45 @@ def api_traffic_history():
     return JSONResponse(hist)
 
 
+@app.get(SYNC_PATH)
+def api_sync():
+    """Текущие параметры подключения к этому релею — для панели на соседнем
+    сервере.
+
+    Смысл в том, чтобы SNI и camouflage dest не приходилось держать
+    одинаковыми вручную: меняем их здесь, панель забирает изменение сама.
+    Раньше после смены dest каскад молча переставал пропускать трафик,
+    пока кто-нибудь не обновит ссылку на первом сервере руками."""
+    creds = json.loads(CREDS_FILE.read_text())
+    host = current_host()
+    return JSONResponse({
+        "label": LABEL,
+        "codename": APP_CODENAME,
+        "host": host,
+        "port": creds["vless_port"],
+        "uuid": creds["uuid"],
+        "public_key": creds["public_key"],
+        "short_id": creds["short_id"],
+        "sni": creds["sni"],
+        "dest": creds["dest"],
+        "flow": "xtls-rprx-vision",
+        "fp": "chrome",
+        # Готовая ссылка: собирает её тот, кто знает свои настройки, —
+        # меньше шансов, что стороны разойдутся в мелочах.
+        "vless_url": build_vless_url(creds, host),
+    })
+
+
+@app.post("/api/sync/rotate")
+def api_sync_rotate():
+    """Сменить токен. Прежний перестаёт работать сразу, поэтому на панели
+    соседнего сервера токен придётся обновить."""
+    creds = json.loads(CREDS_FILE.read_text())
+    creds["sync_token"] = secrets.token_urlsafe(32)
+    save_creds(creds)
+    return JSONResponse({"sync_token": creds["sync_token"]})
+
+
 @app.get("/api/qr.png")
 def api_qr():
     creds = json.loads(CREDS_FILE.read_text())
@@ -708,6 +794,17 @@ canvas.chart-canvas { width: 100%; height: 140px; display: block; }
         <label>Ссылка для клиента</label>
         <div class="key-display" id="vless-url" onclick="selectText(this)">@@VLESS_URL@@</div>
       </div>
+      <div class="field" style="margin-bottom:0;">
+        <label>Токен синхронизации</label>
+        <div class="key-display" id="sync-token" onclick="selectText(this)">@@SYNC_TOKEN@@</div>
+        <p class="field-hint">
+          Вставьте его в панель первого сервера — вкладка «Сервер», блок «Каскад».
+          Тогда SNI и camouflage dest не нужно держать одинаковыми вручную:
+          меняете их здесь, панель забирает изменение сама.
+          <button type="button" class="btn btn-sm" style="margin-left:8px;"
+                  onclick="rotateToken()">Сменить</button>
+        </p>
+      </div>
     </div>
   </div>
 
@@ -763,6 +860,18 @@ function selectText(el) {
   const sel = window.getSelection();
   sel.removeAllRanges();
   sel.addRange(range);
+}
+
+async function rotateToken() {
+  if (!confirm("Сменить токен? Панель, которая синхронизируется с этим релеем, "
+             + "перестанет получать обновления, пока вы не впишете новый токен.")) return;
+  try {
+    const res = await fetch("/api/sync/rotate", { method: "POST" });
+    const data = await res.json();
+    document.getElementById("sync-token").textContent = data.sync_token;
+  } catch (e) {
+    alert("Не удалось сменить токен: " + e.message);
+  }
 }
 
 function humanBytes(n) {
@@ -930,6 +1039,7 @@ def index():
         "@@CLIENT_IP@@": html.escape(ip),
         "@@TRAFFIC_TOTAL@@": traffic_total,
         "@@VLESS_URL@@": html.escape(vless_url),
+        "@@SYNC_TOKEN@@": html.escape(creds.get("sync_token", "—")),
         "@@DEST_RAW@@": html.escape(creds.get("dest", ""), quote=True),
         "@@SNI_RAW@@": html.escape(creds.get("sni", ""), quote=True),
     }
