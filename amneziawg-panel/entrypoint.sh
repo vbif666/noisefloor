@@ -44,20 +44,24 @@ else
 fi
 
 echo "[entrypoint] AWG_INTERFACE=${AWG_INTERFACE:-awg0} AWG_CONFIG_DIR=${AWG_CONFIG_DIR:-/etc/amnezia/amneziawg} EGRESS_INTERFACE=${EGRESS_INTERFACE}"
+echo "[entrypoint] версии: amneziawg-go=${AWG_GO_BUILT_REF:-?} amneziawg-tools=${AWG_TOOLS_BUILT_REF:-?} xray=${XRAY_BUILT_REF:-?}"
 if [ -e /sys/module/amneziawg ]; then
     echo "[entrypoint] kernel-модуль amneziawg виден в контейнере - будет использован он (network_mode: host)."
 else
     echo "[entrypoint] kernel-модуль amneziawg не виден - awg-quick упадёт в userspace (amneziawg-go)."
 fi
 
-# Фоновое автообновление бинарников awg/awg-quick/amneziawg-go (по умолчанию
-# включено), из официальных репозиториев amnezia-vpn. Интервал — см.
-# AWG_AUTO_UPDATE_* в .env. Работает в фоне, не блокирует старт панели.
-if [ "${AWG_AUTO_UPDATE_ENABLED:-true}" != "false" ]; then
-    /usr/local/bin/update-awg-tools.sh --loop &
-    echo "[entrypoint] автообновление awg-бинарников включено (каждые ${AWG_AUTO_UPDATE_INTERVAL_HOURS:-24}ч, источники amnezia-vpn/amneziawg-go + amnezia-vpn/amneziawg-tools)"
-else
-    echo "[entrypoint] автообновление awg-бинарников выключено (AWG_AUTO_UPDATE_ENABLED=false)"
-fi
+# Сборки бинарников в рантайме здесь намеренно нет.
+#
+# Раньше отсюда фоном запускался update-awg-tools.sh: раз в сутки он тянул
+# самый свежий git-тег (не релиз, без подписи и контрольной суммы), собирал
+# его из исходников прямо в проде и сам передёргивал сетевой интерфейс - то
+# есть устраивал незапланированный обрыв связи в случайный момент, а заодно
+# требовал держать в образе go, git и компилятор.
+#
+# Теперь версии закреплены в Dockerfile, а обновление выглядит так:
+#     docker compose pull && docker compose up -d
+# Панель по-прежнему СМОТРИТ, не вышло ли новых версий (только запрос к
+# GitHub API, без сборки), и показывает это в интерфейсе.
 
 exec "$@"

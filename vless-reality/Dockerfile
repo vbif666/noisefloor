@@ -3,7 +3,7 @@
 # at build time (not vendored, not a third-party fork) and checksum-verified.
 
 FROM python:3.12-slim AS xray-fetch
-ARG XRAY_VERSION=latest
+ARG XRAY_VERSION=v26.7.28
 RUN apt-get update && apt-get install -y --no-install-recommends curl unzip ca-certificates && rm -rf /var/lib/apt/lists/*
 WORKDIR /tmp/xray
 RUN set -eux; \
