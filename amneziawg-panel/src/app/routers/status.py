@@ -1,0 +1,59 @@
+from __future__ import annotations
+
+from datetime import datetime, timezone
+
+from fastapi import APIRouter, Depends
+from sqlalchemy.orm import Session
+
+from .. import awg_manager, config_sync, traffic_history
+from ..database import get_db
+from ..models import Peer
+from ..schemas import LivePeerStatus, StatusResponse, TrafficHistoryPoint
+from ..security import get_current_admin
+from .peers import ONLINE_THRESHOLD_SECONDS
+
+router = APIRouter()
+
+
+@router.get("", response_model=StatusResponse)
+def get_status(db: Session = Depends(get_db), _admin: str = Depends(get_current_admin)):
+    server = config_sync.get_server(db)
+    live_status = config_sync.live_status_by_pubkey(server)
+    peers = db.query(Peer).all()
+
+    peer_statuses = []
+    for peer in peers:
+        entry = (live_status or {}).get(peer.public_key)
+        is_online = False
+        if entry and entry.latest_handshake:
+            age = datetime.now(timezone.utc).timestamp() - entry.latest_handshake
+            is_online = age < ONLINE_THRESHOLD_SECONDS
+        peer_statuses.append(
+            LivePeerStatus(
+                peer_id=peer.id,
+                name=peer.name,
+                online=is_online,
+                endpoint=entry.endpoint if entry else None,
+                latest_handshake=(
+                    datetime.fromtimestamp(entry.latest_handshake, tz=timezone.utc)
+                    if entry and entry.latest_handshake
+                    else None
+                ),
+                transfer_rx=entry.transfer_rx if entry else 0,
+                transfer_tx=entry.transfer_tx if entry else 0,
+            )
+        )
+
+    return StatusResponse(
+        live_management_available=awg_manager.tools_available(),
+        interface_name=server.interface_name,
+        interface_up=awg_manager.interface_is_up(server.interface_name) if awg_manager.tools_available() else False,
+        interface_mtu=awg_manager.interface_mtu(server.interface_name) if awg_manager.tools_available() else None,
+        listen_port=server.listen_port,
+        peers=peer_statuses,
+    )
+
+
+@router.get("/traffic-history", response_model=list[TrafficHistoryPoint])
+def get_traffic_history(_admin: str = Depends(get_current_admin)):
+    return traffic_history.get_history()

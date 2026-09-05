@@ -1,0 +1,24 @@
+services:
+  vless-reality:
+    # `image:` lets a fresh deployment just `docker compose pull && up -d`
+    # with no local source at all; `build: .` is still here so `docker
+    # compose build` (re)builds from ./src and tags this same name, e.g.
+    # after changing app.py locally.
+    image: vbif666/noisefloor-vless-reality:latest
+    build: .
+    container_name: NOISEFLOOR-vless-reality
+    restart: unless-stopped
+    network_mode: host
+    environment:
+      VLESS_PORT: "${VLESS_PORT:-8443}"
+      PANEL_PORT: "${PANEL_PORT:-8001}"
+      REALITY_DEST: "${REALITY_DEST:-dl.google.com:443}"
+      REALITY_SNI: "${REALITY_SNI:-}"
+      PUBLIC_HOST: "${PUBLIC_HOST:-}"
+      LABEL: "${LABEL:-vless-reality}"
+      ADMIN_USER: "${ADMIN_USER:-admin}"
+      ADMIN_PASSWORD: "${ADMIN_PASSWORD:-}"
+      APP_NAME: "${APP_NAME:-NOISEFLOOR}"
+      APP_CODENAME: "${APP_CODENAME:-Relay-01}"
+    volumes:
+      - ./data:/data

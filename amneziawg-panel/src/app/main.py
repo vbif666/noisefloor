@@ -1,0 +1,50 @@
+import threading
+from contextlib import asynccontextmanager
+from pathlib import Path
+
+from fastapi import FastAPI
+from fastapi.staticfiles import StaticFiles
+
+from . import bootstrap, config_sync, traffic_history
+from .config import settings
+from .database import Base, SessionLocal, engine, run_migrations
+from .routers import auth, peers, server, status, updates
+
+STATIC_DIR = Path(__file__).resolve().parent.parent / "static"
+
+_traffic_history_stop = threading.Event()
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    Base.metadata.create_all(bind=engine)
+    run_migrations()
+    db = SessionLocal()
+    try:
+        bootstrap.run(db)
+        if settings.auto_apply_on_start:
+            # Docker-шаблон: поднимаем awg0 сразу при старте, без ручного
+            # клика "Apply" в UI. best-effort — если утилит awg нет в PATH
+            # или live_management выключен, apply() сама вернёт ok=False,
+            # панель всё равно останется рабочей как генератор конфигов.
+            result = config_sync.apply_current_config(db)
+            print(f"[startup] auto-apply awg0: ok={result.ok} {result.output}")
+    finally:
+        db.close()
+    threading.Thread(target=traffic_history.run, args=(_traffic_history_stop,), daemon=True).start()
+    try:
+        yield
+    finally:
+        _traffic_history_stop.set()
+
+
+app = FastAPI(title="AmneziaWG Panel", version="1.0.0", lifespan=lifespan)
+
+app.include_router(auth.router, prefix="/api/auth", tags=["auth"])
+app.include_router(server.router, prefix="/api/server", tags=["server"])
+app.include_router(peers.router, prefix="/api/peers", tags=["peers"])
+app.include_router(status.router, prefix="/api/status", tags=["status"])
+app.include_router(updates.router, prefix="/api/updates", tags=["updates"])
+
+if STATIC_DIR.exists():
+    app.mount("/", StaticFiles(directory=str(STATIC_DIR), html=True), name="static")

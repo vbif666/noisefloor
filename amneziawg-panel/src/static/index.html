@@ -1,0 +1,310 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>NOISEFLOOR — панель AmneziaWG</title>
+<link rel="icon" href="data:," />
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600;700&family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet" />
+<link rel="stylesheet" href="style.css" />
+</head>
+<body>
+
+<!-- ============================== ВХОД ============================== -->
+<div id="login-screen" class="login-screen">
+  <div class="login-card">
+    <div class="login-wordmark"><span class="dot"></span><h1>NOISEFLOOR</h1></div>
+    <p class="login-tagline">Панель управления AmneziaWG 2.0</p>
+    <div id="login-error" class="form-error" hidden></div>
+    <form id="login-form">
+      <div class="field">
+        <label for="login-username">Логин</label>
+        <input id="login-username" name="username" type="text" autocomplete="username" required />
+      </div>
+      <div class="field">
+        <label for="login-password">Пароль</label>
+        <input id="login-password" name="password" type="password" autocomplete="current-password" required />
+      </div>
+      <button type="submit" class="btn btn-primary btn-block" id="login-submit">
+        <span class="btn-label">Войти</span>
+      </button>
+    </form>
+  </div>
+</div>
+
+<!-- ============================== ПРИЛОЖЕНИЕ ============================== -->
+<div id="app" class="app-shell" hidden>
+
+  <header class="topbar">
+    <div class="wordmark"><span class="dot"></span><span>NOISEFLOOR</span></div>
+    <div class="topbar-right">
+      <span id="status-pill" class="status-pill"><span class="indicator"></span><span id="status-pill-text">проверка…</span></span>
+      <button id="update-btn" class="btn btn-primary btn-sm" hidden title="Пересобрать awg/amneziawg-go из официальных исходников amnezia-vpn">Доступно обновление AWG</button>
+      <span id="username-chip" class="username-chip"></span>
+      <button id="logout-btn" class="btn btn-ghost btn-sm">Выйти</button>
+    </div>
+  </header>
+
+  <div class="signal-strip" id="signal-strip" aria-hidden="true"></div>
+
+  <nav class="tabs">
+    <button class="tab-btn is-active" data-tab="peers">Пиры</button>
+    <button class="tab-btn" data-tab="server">Сервер</button>
+  </nav>
+
+  <main>
+
+    <!-- --------------------------- ВКЛАДКА: ПИРЫ --------------------------- -->
+    <section id="tab-peers">
+      <div class="panel" style="margin-bottom:16px;">
+        <div class="panel-header">
+          <h2>Трафик</h2>
+          <span class="eyebrow" id="traffic-range-label">последний час</span>
+        </div>
+        <div class="panel-body">
+          <div class="chart-wrap">
+            <canvas class="chart-canvas" id="traffic-chart"></canvas>
+            <div class="chart-empty" id="traffic-chart-empty" hidden>ещё нет данных — соберём график за пару минут</div>
+          </div>
+          <div class="chart-legend">
+            <span class="legend-item"><span class="legend-dot down"></span>от клиентов <span class="legend-value" id="legend-iface-rx">—</span></span>
+            <span class="legend-item"><span class="legend-dot up"></span>клиентам <span class="legend-value" id="legend-iface-tx">—</span></span>
+          </div>
+          <div class="cascade-badge" id="cascade-badge" hidden>
+            <span class="cascade-badge-dot"></span>
+            <span class="cascade-badge-text" id="cascade-badge-text">каскад</span>
+            <span class="cascade-badge-rate" id="cascade-badge-rate">—</span>
+          </div>
+        </div>
+      </div>
+
+      <div class="panel">
+        <div class="panel-header">
+          <h2>Клиенты</h2>
+          <button id="add-peer-btn" class="btn btn-primary btn-sm">+ Добавить пира</button>
+        </div>
+        <div id="peers-empty" class="empty-state" hidden>
+          <span class="eyebrow">Пусто</span>
+          <p>Пиров пока нет. Добавьте первого — панель сама сгенерирует ключи, IP-адрес в туннеле и уникальный набор параметров обфускации, а затем покажет QR-код для импорта.</p>
+          <button class="btn btn-primary btn-sm" data-action="add-peer">+ Добавить пира</button>
+        </div>
+        <table class="peer-table" id="peers-table" hidden>
+          <thead>
+            <tr>
+              <th>Имя</th>
+              <th>Адрес в туннеле</th>
+              <th title="Получено сервером от клиента / отправлено сервером клиенту">Передано ↓ / ↑</th>
+              <th>Последний контакт</th>
+              <th></th>
+            </tr>
+          </thead>
+          <tbody id="peers-tbody"></tbody>
+        </table>
+      </div>
+    </section>
+
+    <!-- --------------------------- ВКЛАДКА: СЕРВЕР --------------------------- -->
+    <section id="tab-server" hidden>
+      <form id="server-form">
+
+        <div class="panel" style="margin-bottom:16px;">
+          <div class="panel-header"><h2>Идентичность сервера</h2></div>
+          <div class="panel-body">
+            <div class="field-group" style="margin-bottom:0;">
+              <span class="eyebrow">Публичный ключ (для клиентов)</span>
+              <div class="key-display" id="server-pubkey-display">—</div>
+            </div>
+          </div>
+        </div>
+
+        <div class="panel" style="margin-bottom:16px;">
+          <div class="panel-header"><h2>Сеть</h2></div>
+          <div class="panel-body">
+            <div class="field-group">
+              <div class="field-row">
+                <div class="field">
+                  <label for="f-endpoint-host">Публичный адрес сервера (для клиентов)</label>
+                  <input id="f-endpoint-host" placeholder="vpn.example.com или 203.0.113.5" />
+                </div>
+                <div class="field">
+                  <label for="f-listen-port">Порт (UDP)</label>
+                  <input id="f-listen-port" type="number" min="1" max="65535" />
+                </div>
+              </div>
+              <div class="field-row">
+                <div class="field">
+                  <label for="f-address">Подсеть туннеля</label>
+                  <input id="f-address" placeholder="10.13.13.1/24" />
+                </div>
+                <div class="field">
+                  <label for="f-dns">DNS для клиентов</label>
+                  <input id="f-dns" placeholder="1.1.1.1, 1.0.0.1" />
+                </div>
+              </div>
+              <div class="field-row">
+                <div class="field">
+                  <label for="f-egress">Внешний интерфейс (для NAT)</label>
+                  <input id="f-egress" placeholder="eth0" />
+                </div>
+                <div class="field">
+                  <label for="f-mtu">MTU (необязательно)</label>
+                  <input id="f-mtu" type="number" placeholder="по умолчанию" />
+                  <p class="field-hint" id="f-mtu-live">на интерфейсе сейчас: —</p>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div class="panel" style="margin-bottom:16px;">
+          <div class="panel-header">
+            <h2>Каскад (маршрут через VLESS)</h2>
+            <span id="cascade-status" class="apply-status"></span>
+          </div>
+          <div class="panel-body">
+            <p class="field-hint">Весь TCP-трафик клиентов туннеля дополнительно заворачивается через внешний VLESS+Reality эндпоинт — сервер прячется за ещё одним хопом (UDP каскад не затрагивает, идёт напрямую).</p>
+            <div class="field-group">
+              <label for="f-cascade-enabled" style="display:flex; align-items:center; gap:8px;">
+                <input id="f-cascade-enabled" type="checkbox" style="width:auto;" /> Включить каскад
+              </label>
+            </div>
+            <div class="field-group" style="margin-bottom:0;">
+              <div class="field">
+                <label for="f-cascade-url">Ссылка клиента vless://</label>
+                <textarea id="f-cascade-url" rows="2" placeholder="vless://uuid@host:port?security=reality&amp;pbk=...&amp;sni=...#label"></textarea>
+              </div>
+              <p class="field-hint">Поддерживается только security=reality.</p>
+            </div>
+          </div>
+        </div>
+
+        <div class="panel" style="margin-bottom:16px;">
+          <div class="panel-header">
+            <h2>Обфускация</h2>
+            <button type="button" id="randomize-btn" class="btn btn-sm">⟳ Пересоздать параметры</button>
+          </div>
+          <div class="panel-body">
+            <div class="field-group">
+              <span class="eyebrow">Мусорные пакеты перед хендшейком</span>
+              <div class="field-grid">
+                <div class="field"><label for="f-jc">Jc — число пакетов</label><input id="f-jc" type="number" min="0" /></div>
+                <div class="field"><label for="f-jmin">Jmin — мин. размер</label><input id="f-jmin" type="number" min="0" /></div>
+                <div class="field"><label for="f-jmax">Jmax — макс. размер</label><input id="f-jmax" type="number" min="0" /></div>
+              </div>
+            </div>
+            <div class="field-group">
+              <span class="eyebrow">Паддинг пакетов (S1–S4)</span>
+              <div class="field-grid">
+                <div class="field"><label for="f-s1">S1 — Init</label><input id="f-s1" type="number" min="0" /></div>
+                <div class="field"><label for="f-s2">S2 — Response</label><input id="f-s2" type="number" min="0" /></div>
+                <div class="field"><label for="f-s3">S3 — Cookie</label><input id="f-s3" type="number" min="0" /></div>
+                <div class="field"><label for="f-s4">S4 — Data</label><input id="f-s4" type="number" min="0" /></div>
+              </div>
+            </div>
+            <div class="field-group" style="margin-bottom:0;">
+              <span class="eyebrow">Динамические заголовки (H1–H4)</span>
+              <div class="field-grid">
+                <div class="field"><label for="f-h1">H1 — Init</label><input id="f-h1" placeholder="475542756" /></div>
+                <div class="field"><label for="f-h2">H2 — Response</label><input id="f-h2" placeholder="936793109" /></div>
+                <div class="field"><label for="f-h3">H3 — Cookie</label><input id="f-h3" placeholder="1029366561" /></div>
+                <div class="field"><label for="f-h4">H4 — Data</label><input id="f-h4" placeholder="1831864389" /></div>
+              </div>
+              <p class="field-hint">Каждое поле — одно целое число, все четыре должны отличаться друг от друга. Эти значения одинаковы для сервера и ВСЕХ его клиентов — панель подставляет их в конфиг каждого пира автоматически, менять на пира по отдельности нельзя.</p>
+            </div>
+          </div>
+        </div>
+
+        <div class="panel">
+          <div class="panel-body">
+            <div class="server-actions">
+              <button type="submit" class="btn btn-primary">Сохранить</button>
+              <button type="button" id="apply-btn" class="btn">Применить на сервере</button>
+              <button type="button" id="restart-btn" class="btn btn-ghost btn-sm">Перезапустить интерфейс</button>
+              <span id="apply-status" class="apply-status"></span>
+            </div>
+          </div>
+        </div>
+
+      </form>
+    </section>
+
+  </main>
+</div>
+
+<div class="toast-container" id="toast-container"></div>
+
+<!-- ============================== МОДАЛКИ ============================== -->
+
+<dialog id="add-peer-dialog">
+  <form id="add-peer-form">
+    <div class="modal-header"><h3>Новый пир</h3><button type="button" class="btn btn-ghost btn-icon" data-close>✕</button></div>
+    <div class="modal-body">
+      <div id="add-peer-error" class="form-error" hidden></div>
+      <div class="field">
+        <label for="np-name">Имя устройства</label>
+        <input id="np-name" required placeholder="Ноутбук Джейкоба" />
+      </div>
+      <div class="field">
+        <label for="np-allowed">Маршруты через туннель (AllowedIPs у клиента)</label>
+        <input id="np-allowed" value="0.0.0.0/0, ::/0" />
+        <p class="field-hint">Оставьте как есть для полного туннелирования всего трафика.</p>
+      </div>
+      <div class="field-row">
+        <div class="field">
+          <label for="np-keepalive">PersistentKeepalive, сек</label>
+          <input id="np-keepalive" type="number" value="25" min="0" />
+        </div>
+        <div class="field">
+          <label for="np-dns">DNS (переопределить)</label>
+          <input id="np-dns" placeholder="по умолчанию сервера" />
+        </div>
+      </div>
+      <div class="field" style="margin-bottom:0;">
+        <label for="np-note">Заметка (необязательно)</label>
+        <input id="np-note" placeholder="" />
+      </div>
+    </div>
+    <div class="modal-footer">
+      <button type="button" class="btn btn-ghost" data-close>Отмена</button>
+      <button type="submit" class="btn btn-primary" id="add-peer-submit">Создать</button>
+    </div>
+  </form>
+</dialog>
+
+<dialog id="peer-dialog">
+  <div class="modal-header">
+    <h3 id="peer-dialog-title">Пир</h3>
+    <button type="button" class="btn btn-ghost btn-icon" data-close>✕</button>
+  </div>
+  <div class="modal-body">
+    <div class="qr-wrap"><img id="peer-qr-img" alt="QR-код конфигурации" width="220" height="220" /></div>
+    <div class="config-actions">
+      <button class="btn btn-sm" id="peer-copy-btn">Скопировать конфиг</button>
+      <button class="btn btn-sm" id="peer-download-btn">Скачать .conf</button>
+      <button class="btn btn-sm" id="peer-toggle-btn">Выключить</button>
+      <button class="btn btn-sm" id="peer-regen-btn">Пересоздать ключи</button>
+    </div>
+    <pre class="config-text" id="peer-config-text"></pre>
+  </div>
+  <div class="modal-footer is-split">
+    <button class="btn btn-danger btn-sm" id="peer-delete-btn">Удалить пира</button>
+    <button class="btn" data-close>Готово</button>
+  </div>
+</dialog>
+
+<dialog id="confirm-dialog">
+  <div class="modal-header"><h3 id="confirm-title">Подтвердите действие</h3></div>
+  <div class="modal-body">
+    <p id="confirm-message" class="text-dim"></p>
+  </div>
+  <div class="modal-footer">
+    <button type="button" class="btn btn-ghost" data-close>Отмена</button>
+    <button type="button" class="btn btn-danger" id="confirm-ok-btn">Подтвердить</button>
+  </div>
+</dialog>
+
+<script src="app.js"></script>
+</body>
+</html>
