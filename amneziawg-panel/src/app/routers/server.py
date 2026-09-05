@@ -96,11 +96,16 @@ def restart_server_interface(db: Session = Depends(get_db), _admin: str = Depend
 def cascade_status(db: Session = Depends(get_db), _admin: str = Depends(get_current_admin)):
     server = config_sync.get_server(db)
     stats = cascade.traffic_stats() or {}
+    health = cascade.health()
     return CascadeStatus(
         enabled=server.cascade_enabled,
         configured=bool((server.cascade_vless_url or "").strip()),
         running=cascade.is_running(),
         error=server.cascade_last_error,
+        verified_ok=health.get("verified_ok"),
+        verified_at=health.get("verified_at"),
+        verify_error=health.get("verify_error"),
+        restarts=health.get("restarts", 0),
         uplink=stats.get("uplink", 0),
         downlink=stats.get("downlink", 0),
     )

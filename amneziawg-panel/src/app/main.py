@@ -5,7 +5,7 @@ from pathlib import Path
 from fastapi import FastAPI
 from fastapi.staticfiles import StaticFiles
 
-from . import bootstrap, config_sync, traffic_history
+from . import bootstrap, cascade, config_sync, traffic_history
 from .config import settings
 from .database import Base, SessionLocal, engine, run_migrations
 from .routers import auth, peers, server, status, updates
@@ -13,6 +13,7 @@ from .routers import auth, peers, server, status, updates
 STATIC_DIR = Path(__file__).resolve().parent.parent / "static"
 
 _traffic_history_stop = threading.Event()
+_cascade_supervisor_stop = threading.Event()
 
 
 @asynccontextmanager
@@ -32,10 +33,14 @@ async def lifespan(app: FastAPI):
     finally:
         db.close()
     threading.Thread(target=traffic_history.run, args=(_traffic_history_stop,), daemon=True).start()
+    # Надзор за каскадом: перезапускает упавший xray и регулярно проверяет
+    # реальной пробой, что через каскад вообще идёт трафик.
+    threading.Thread(target=cascade.supervise, args=(_cascade_supervisor_stop,), daemon=True).start()
     try:
         yield
     finally:
         _traffic_history_stop.set()
+        _cascade_supervisor_stop.set()
 
 
 app = FastAPI(title="AmneziaWG Panel", version="1.0.0", lifespan=lifespan)

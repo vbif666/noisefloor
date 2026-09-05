@@ -100,6 +100,12 @@ class CascadeStatus(BaseModel):
     error: str | None
     uplink: int = 0
     downlink: int = 0
+    # Ниже — итог реальной пробы наружу через каскад. Отличать это от
+    # running обязательно: процесс может быть жив, а трафик не идти.
+    verified_ok: bool | None = None  # None — проверки ещё не было
+    verified_at: datetime | None = None
+    verify_error: str | None = None
+    restarts: int = 0  # сколько раз супервизор поднимал упавший xray
 
 
 # --- Peers ---
