@@ -40,8 +40,8 @@ VOLUME ["/data"]
 ENV DATA_DIR=/data \
     PANEL_PORT=8001 \
     VLESS_PORT=8443 \
-    REALITY_DEST=www.microsoft.com:443 \
-    LABEL=vpn-nd-reality
+    REALITY_DEST=dl.google.com:443 \
+    LABEL=vless-reality
 
 EXPOSE 8001 8443
 
