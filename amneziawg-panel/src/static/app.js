@@ -271,7 +271,6 @@ function fillServerForm(s) {
   $("f-egress").value = s.egress_interface || "";
   $("f-mtu").value = s.mtu || "";
   $("f-cascade-enabled").checked = !!s.cascade_enabled;
-  $("f-cascade-url").value = s.cascade_vless_url || "";
   $("f-cascade-sync-url").value = s.cascade_sync_url || "";
   $("f-cascade-sync-token").value = s.cascade_sync_token || "";
   $("f-jc").value = s.jc;
@@ -315,7 +314,6 @@ $("server-form").addEventListener("submit", async (e) => {
     egress_interface: $("f-egress").value.trim(),
     mtu: $("f-mtu").value ? Number($("f-mtu").value) : null,
     cascade_enabled: $("f-cascade-enabled").checked,
-    cascade_vless_url: $("f-cascade-url").value.trim(),
     cascade_sync_url: $("f-cascade-sync-url").value.trim(),
     cascade_sync_token: $("f-cascade-sync-token").value.trim(),
     jc: Number($("f-jc").value),
@@ -365,6 +363,21 @@ $("cascade-sync-btn").addEventListener("click", async () => {
     btn.disabled = false;
   }
 });
+
+function renderCascadeSummary(c) {
+  const el = $("cascade-summary");
+  if (!el) return;
+  if (!c.relay_host) {
+    el.textContent = c.configured ? "параметры получены" : "—";
+    return;
+  }
+  // Намеренно без uuid и ключей: администратору нужно понимать, куда и
+  // подо что настроен каскад, а не держать перед глазами доступ к нему.
+  const parts = [`${c.relay_host}:${c.relay_port}`];
+  if (c.relay_sni) parts.push(`sni ${c.relay_sni}`);
+  if (c.relay_label) parts.push(c.relay_label);
+  el.textContent = parts.join("  ·  ");
+}
 
 function renderCascadeSync(c) {
   const status = $("cascade-sync-status");
@@ -918,6 +931,7 @@ function renderCascadeBadge(hist) {
 
 function renderCascadeStatus(c) {
   renderCascadeSync(c);
+  renderCascadeSummary(c);
   const el = $("cascade-status");
   if (!el) return;
   el.classList.remove("is-error", "is-ok");

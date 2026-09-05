@@ -194,13 +194,12 @@
               </div>
             </div>
             <div class="field-group" style="margin-bottom:0;">
-              <div class="field">
-                <label for="f-cascade-url">Ссылка клиента vless://</label>
-                <textarea id="f-cascade-url" rows="2" placeholder="vless://uuid@host:port?security=reality&amp;pbk=...&amp;sni=...#label"></textarea>
-              </div>
-              <p class="field-hint" id="f-cascade-url-hint">
-                Поддерживается только security=reality. При включённой синхронизации
-                это поле заполняется автоматически — править его вручную не нужно.
+              <span class="eyebrow">Что получено от релея</span>
+              <div class="key-display" id="cascade-summary" style="margin-top:6px;">—</div>
+              <p class="field-hint">
+                Параметры подключения хранятся на сервере и здесь не показываются:
+                в них входит UUID, то есть готовый доступ к релею. Меняются они
+                только на самом релее.
               </p>
             </div>
           </div>

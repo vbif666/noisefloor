@@ -107,11 +107,24 @@ def cascade_status(db: Session = Depends(get_db), _admin: str = Depends(get_curr
     server = config_sync.get_server(db)
     stats = cascade.traffic_stats() or {}
     health = cascade.health()
+
+    # Разбираем сохранённую ссылку, чтобы показать администратору адрес и
+    # маскировку, но не uuid и не ключи.
+    relay: dict = {}
+    if (server.cascade_vless_url or "").strip():
+        try:
+            relay = cascade.parse_vless_url(server.cascade_vless_url)
+        except cascade.VlessParseError:
+            relay = {}
     return CascadeStatus(
         enabled=server.cascade_enabled,
         configured=bool((server.cascade_vless_url or "").strip()),
         running=cascade.is_running(),
         error=server.cascade_last_error,
+        relay_host=relay.get("host"),
+        relay_port=relay.get("port"),
+        relay_sni=relay.get("sni"),
+        relay_label=relay.get("label") or None,
         sync_enabled=bool((server.cascade_sync_url or "").strip()),
         sync_error=server.cascade_sync_error,
         synced_at=server.cascade_synced_at,

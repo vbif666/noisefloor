@@ -708,9 +708,6 @@ main { max-width: 880px; margin: 0 auto; padding: 24px 20px 60px; display: flex;
 .panel-body { padding: 20px; }
 
 .overview-row { display: flex; gap: 24px; align-items: flex-start; flex-wrap: wrap; }
-.qr-box { background: #fff; padding: 8px; border-radius: var(--radius-sm); line-height: 0; flex-shrink: 0; }
-.qr-box img { display: block; width: 176px; height: 176px; }
-
 .stat-grid {
   flex: 1; min-width: 240px;
   display: grid; grid-template-columns: 1fr 1fr; gap: 10px 20px;
@@ -778,7 +775,6 @@ canvas.chart-canvas { width: 100%; height: 140px; display: block; }
     <div class="panel-header"><h2>Обзор</h2></div>
     <div class="panel-body">
       <div class="overview-row">
-        <div class="qr-box"><img src="/api/qr.png" width="176" height="176" alt="QR" /></div>
         <div class="stat-grid">
           <div class="stat-item"><span class="eyebrow">SNI</span><div class="stat-value mono">@@SNI@@</div></div>
           <div class="stat-item"><span class="eyebrow">Camouflage dest</span><div class="stat-value mono">@@DEST@@</div></div>
@@ -790,17 +786,16 @@ canvas.chart-canvas { width: 100%; height: 140px; display: block; }
           <div class="stat-item"><span class="eyebrow">Всего трафика</span><div class="stat-value mono" id="stat-traffic-total">@@TRAFFIC_TOTAL@@</div></div>
         </div>
       </div>
-      <div class="field" style="margin-top:20px;">
-        <label>Ссылка для клиента</label>
-        <div class="key-display" id="vless-url" onclick="selectText(this)">@@VLESS_URL@@</div>
-      </div>
-      <div class="field" style="margin-bottom:0;">
+      <div class="field" style="margin-top:20px; margin-bottom:0;">
         <label>Токен синхронизации</label>
         <div class="key-display" id="sync-token" onclick="selectText(this)">@@SYNC_TOKEN@@</div>
         <p class="field-hint">
           Вставьте его в панель первого сервера — вкладка «Сервер», блок «Каскад».
           Тогда SNI и camouflage dest не нужно держать одинаковыми вручную:
           меняете их здесь, панель забирает изменение сама.
+          Ссылка подключения и QR-код здесь намеренно не показываются: в ссылке
+          лежит UUID, то есть готовый доступ к этому релею, а для связки узлов
+          достаточно токена.
           <button type="button" class="btn btn-sm" style="margin-left:8px;"
                   onclick="rotateToken()">Сменить</button>
         </p>
@@ -1017,8 +1012,11 @@ def index():
     with state_lock:
         s = dict(state)
     creds = json.loads(CREDS_FILE.read_text()) if CREDS_FILE.exists() else {}
-    host = current_host()
-    vless_url = build_vless_url(creds, host) if creds else ""
+    # current_host() здесь больше не зовём: при пустом PUBLIC_HOST он ходил
+    # к ifconfig.me при КАЖДОМ открытии страницы, а страница опрашивается
+    # дашбордом каждые несколько секунд. Ссылка на странице больше не нужна: она содержит UUID, то есть
+    # готовый доступ к релею. Получить её при необходимости можно через
+    # /api/status — там она под паролем администратора.
     status_text = "подключено" if s["connected"] else "ожидание подключения"
     status_pill_class = "is-up" if s["connected"] else "is-down"
     last = s["last_connect"] or "—"
@@ -1038,7 +1036,6 @@ def index():
         "@@LAST_CONNECT@@": html.escape(last),
         "@@CLIENT_IP@@": html.escape(ip),
         "@@TRAFFIC_TOTAL@@": traffic_total,
-        "@@VLESS_URL@@": html.escape(vless_url),
         "@@SYNC_TOKEN@@": html.escape(creds.get("sync_token", "—")),
         "@@DEST_RAW@@": html.escape(creds.get("dest", ""), quote=True),
         "@@SNI_RAW@@": html.escape(creds.get("sni", ""), quote=True),
