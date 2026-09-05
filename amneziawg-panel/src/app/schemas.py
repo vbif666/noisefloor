@@ -1,8 +1,26 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timezone
+from typing import Annotated
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import AfterValidator, BaseModel, ConfigDict, Field
+
+
+def _assume_utc(value: datetime | None) -> datetime | None:
+    """Проставить UTC времени, пришедшему из БД без часового пояса.
+
+    SQLite зону не хранит: записанное как UTC читается обратно «голым».
+    Браузер строку без зоны понимает как МЕСТНОЕ время, поэтому только что
+    выполненная синхронизация показывалась как «3 часа назад» на UTC+3.
+    Чиним на выходе из API — тогда любой потребитель, не только наш
+    интерфейс, получает однозначную метку времени."""
+    if value is not None and value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value
+
+
+# Время, которое пришло из базы и обязано уехать наружу с зоной.
+UtcDatetime = Annotated[datetime, AfterValidator(_assume_utc)]
 
 
 # --- Auth ---
@@ -41,7 +59,7 @@ class ServerRead(BaseModel):
     cascade_sync_url: str = ""
     cascade_sync_token: str = ""
     cascade_sync_error: str | None = None
-    cascade_synced_at: datetime | None = None
+    cascade_synced_at: UtcDatetime | None = None
     jc: int
     jmin: int
     jmax: int
@@ -60,8 +78,8 @@ class ServerRead(BaseModel):
     i5: str
     last_apply_status: str | None
     last_apply_error: str | None
-    last_applied_at: datetime | None
-    updated_at: datetime
+    last_applied_at: UtcDatetime | None
+    updated_at: UtcDatetime
 
 
 class ServerUpdate(BaseModel):
@@ -109,13 +127,13 @@ class CascadeStatus(BaseModel):
     # Ниже — итог реальной пробы наружу через каскад. Отличать это от
     # running обязательно: процесс может быть жив, а трафик не идти.
     verified_ok: bool | None = None  # None — проверки ещё не было
-    verified_at: datetime | None = None
+    verified_at: UtcDatetime | None = None
     verify_error: str | None = None
     restarts: int = 0  # сколько раз супервизор поднимал упавший xray
     # Синхронизация параметров с релеем
     sync_enabled: bool = False
     sync_error: str | None = None
-    synced_at: datetime | None = None
+    synced_at: UtcDatetime | None = None
     # Куда и подо что настроен каскад — без uuid и ключей: панель показывает
     # это администратору, а держать перед глазами готовый доступ к релею
     # незачем, тем более что панель работает без TLS.
@@ -159,11 +177,11 @@ class PeerRead(BaseModel):
     persistent_keepalive: int
     enabled: bool
     note: str | None
-    created_at: datetime
+    created_at: UtcDatetime
 
     # живой статус (заполняется отдельно, не хранится в БД)
     online: bool = False
-    latest_handshake: datetime | None = None
+    latest_handshake: UtcDatetime | None = None
     transfer_rx: int = 0
     transfer_tx: int = 0
 
@@ -179,7 +197,7 @@ class LivePeerStatus(BaseModel):
     name: str
     online: bool
     endpoint: str | None
-    latest_handshake: datetime | None
+    latest_handshake: UtcDatetime | None
     transfer_rx: int
     transfer_tx: int
 
@@ -208,7 +226,7 @@ class TrafficHistoryPoint(BaseModel):
 class BackupInfo(BaseModel):
     name: str
     size: int
-    created_at: datetime
+    created_at: UtcDatetime
     encrypted: bool
 
 

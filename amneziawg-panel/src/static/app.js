@@ -294,7 +294,9 @@ function renderApplyStatus(s) {
     el.textContent = "ещё не применялось на сервере";
     return;
   }
-  const when = timeAgo(new Date(s.last_applied_at));
+  const appliedAt = new Date(s.last_applied_at);
+  const when = timeAgo(appliedAt);
+  el.title = appliedAt.toLocaleString();
   if (s.last_apply_status === "ok") {
     el.textContent = `применено ${when}`;
     el.classList.add("is-ok");
@@ -393,10 +395,15 @@ function renderCascadeSync(c) {
     return;
   }
   if (c.synced_at) {
-    status.textContent = `параметры получены ${timeAgo(new Date(c.synced_at))}`;
+    const at = new Date(c.synced_at);
+    status.textContent = `параметры получены ${timeAgo(at)}`;
+    // Точный момент — подсказкой: относительное время удобно читать, но
+    // сразу после нажатия кнопки хочется убедиться, что это именно оно.
+    status.title = at.toLocaleString();
     status.classList.add("is-ok");
   } else {
     status.textContent = "ещё не синхронизировались";
+    status.title = "";
   }
 }
 
