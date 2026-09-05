@@ -254,7 +254,7 @@ document.querySelectorAll(".tab-btn").forEach((btn) => {
    ========================================================================== */
 
 async function loadEverything() {
-  await Promise.all([loadServer(), loadPeers()]);
+  await Promise.all([loadServer(), loadPeers(), loadBackups()]);
 }
 
 async function loadServer() {
@@ -358,6 +358,60 @@ async function runApply(path, btn) {
     showToast(err.message, true);
   } finally {
     btn.disabled = false;
+  }
+}
+
+/* ==========================================================================
+   Резервные копии
+   ========================================================================== */
+
+$("backup-download-btn").addEventListener("click", async () => {
+  const btn = $("backup-download-btn");
+  const status = $("backup-status");
+  btn.disabled = true;
+  status.classList.remove("is-error", "is-ok");
+  status.textContent = "собираю копию…";
+  try {
+    // Копия собирается на лету, чтобы забрать состояние прямо сейчас,
+    // а не последнее суточное.
+    const res = await apiBlob("/backup/download");
+    const blob = await res.blob();
+    const disposition = res.headers.get("content-disposition") || "";
+    const match = disposition.match(/filename="?([^"]+)"?/);
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = match ? match[1] : "noisefloor-backup.tar.gz";
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+    status.textContent = `готово, ${formatBytes(blob.size)}`;
+    status.classList.add("is-ok");
+    loadBackups();
+  } catch (err) {
+    status.textContent = err.message;
+    status.classList.add("is-error");
+  } finally {
+    btn.disabled = false;
+  }
+});
+
+async function loadBackups() {
+  const el = $("backup-list");
+  if (!el) return;
+  try {
+    const items = await api("/backup");
+    if (items.length === 0) {
+      el.textContent = "копий пока нет";
+      return;
+    }
+    const newest = items[0];
+    el.textContent = `последняя: ${timeAgo(new Date(newest.created_at))}, ${formatBytes(newest.size)}`
+      + (newest.encrypted ? " (зашифрована)" : "")
+      + ` · всего ${items.length}`;
+  } catch (_) {
+    el.textContent = "";
   }
 }
 

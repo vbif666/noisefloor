@@ -216,6 +216,29 @@
           </div>
         </div>
 
+        <div class="panel" style="margin-bottom:16px;">
+          <div class="panel-header">
+            <h2>Резервная копия</h2>
+            <span class="apply-status" id="backup-status"></span>
+          </div>
+          <div class="panel-body">
+            <p class="field-hint" style="margin-top:0;">
+              В копию попадают ключи сервера и всех клиентов, секрет сессий и база.
+              Без неё потеря каталога data означает, что каждому клиенту придётся
+              заново раздавать конфиг. Копия снимается автоматически раз в сутки;
+              последние 14 хранятся на сервере.
+            </p>
+            <p class="field-hint">
+              Файл содержит приватные ключи в открытом виде. Задайте
+              <code>BACKUP_PASSPHRASE</code> в .env, чтобы архив шифровался AES-256.
+            </p>
+            <div class="server-actions" style="margin-top:14px;">
+              <button type="button" id="backup-download-btn" class="btn btn-primary btn-sm">Скачать копию</button>
+              <span id="backup-list" class="apply-status"></span>
+            </div>
+          </div>
+        </div>
+
         <div class="panel">
           <div class="panel-body">
             <div class="server-actions">

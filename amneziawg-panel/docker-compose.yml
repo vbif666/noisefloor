@@ -3,6 +3,13 @@ services:
     image: vbif666/noisefloor-amneziawg-panel:latest
     container_name: NOISEFLOOR-amneziawg-panel
     restart: unless-stopped
+    # Без лимита json-лог растёт бесконечно: панель пишет строку на каждый
+    # запрос дашборда, а дашборд опрашивает сервер каждые несколько секунд.
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
     network_mode: host
     cap_add:
       - NET_ADMIN

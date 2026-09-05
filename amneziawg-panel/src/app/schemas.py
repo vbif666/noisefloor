@@ -186,6 +186,15 @@ class TrafficHistoryPoint(BaseModel):
     cascade_downlink: int
 
 
+# --- Резервные копии ---
+
+class BackupInfo(BaseModel):
+    name: str
+    size: int
+    created_at: datetime
+    encrypted: bool
+
+
 # --- Обновление бинарников AmneziaWG ---
 
 class UpdateComponent(BaseModel):

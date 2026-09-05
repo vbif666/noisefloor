@@ -8,6 +8,13 @@ services:
     build: .
     container_name: NOISEFLOOR-vless-reality
     restart: unless-stopped
+    # Без лимита json-лог растёт бесконечно: панель пишет строку на каждый
+    # запрос дашборда, а дашборд опрашивает сервер каждые несколько секунд.
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
     network_mode: host
     environment:
       VLESS_PORT: "${VLESS_PORT:-8443}"

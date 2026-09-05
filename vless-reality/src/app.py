@@ -43,7 +43,16 @@ DATA_DIR = Path(os.environ.get("DATA_DIR", "/data"))
 CREDS_FILE = DATA_DIR / "creds.json"
 CONFIG_FILE = DATA_DIR / "xray-config.json"
 ADMIN_PW_FILE = DATA_DIR / "INITIAL_ADMIN_PASSWORD.txt"
-ACCESS_LOG = Path("/var/log/xray/access.log")
+# Лог лежит в volume, а не в слое контейнера: раньше он жил в
+# /var/log/xray и обнулялся при каждом пересоздании контейнера, то есть
+# разбирать вчерашний инцидент было уже нечем. Заодно теперь он попадает
+# в резервные копии.
+LOG_DIR = DATA_DIR / "logs"
+ACCESS_LOG = LOG_DIR / "xray-access.log"
+# Ротации у xray нет, а пишет он строку на каждое соединение — без
+# ограничения файл со временем съедает диск.
+ACCESS_LOG_MAX_BYTES = 20 * 1024 * 1024
+ACCESS_LOG_CHECK_SECONDS = 60
 XRAY_BIN = os.environ.get("XRAY_BIN", "/usr/local/bin/xray")
 STATS_API_ADDR = "127.0.0.1:10085"
 
@@ -70,7 +79,7 @@ APP_NAME = os.environ.get("APP_NAME", "NOISEFLOOR")
 APP_CODENAME = os.environ.get("APP_CODENAME", "Relay-01")
 
 DATA_DIR.mkdir(parents=True, exist_ok=True)
-ACCESS_LOG.parent.mkdir(parents=True, exist_ok=True)
+LOG_DIR.mkdir(parents=True, exist_ok=True)
 
 HISTORY_INTERVAL = 5  # seconds, matches poll_stats sleep
 HISTORY_MAX = 1080  # 1080 * 5s = 1.5h of samples kept in memory
@@ -326,6 +335,23 @@ def poll_stats(stop_event: threading.Event):
             continue
 
 
+def rotate_access_log(stop_event: threading.Event):
+    """Грубая ротация: при превышении лимита обрезаем файл на месте.
+
+    Полноценная ротация потребовала бы перезапуска xray (он держит файл
+    открытым), а это разрыв всех клиентских соединений ради уборки логов.
+    Лог нужен, чтобы разобрать последний инцидент, а не как вечный журнал,
+    поэтому "последние N мегабайт" — разумный размен."""
+    while not stop_event.is_set():
+        stop_event.wait(ACCESS_LOG_CHECK_SECONDS)
+        try:
+            if ACCESS_LOG.exists() and ACCESS_LOG.stat().st_size > ACCESS_LOG_MAX_BYTES:
+                with ACCESS_LOG.open("w"):
+                    pass
+        except OSError:
+            continue
+
+
 def watchdog(stop_event: threading.Event):
     while not stop_event.is_set():
         time.sleep(5)
@@ -348,6 +374,7 @@ async def lifespan(app: FastAPI):
         threading.Thread(target=tail_access_log, args=(_stop_event,), daemon=True),
         threading.Thread(target=watchdog, args=(_stop_event,), daemon=True),
         threading.Thread(target=poll_stats, args=(_stop_event,), daemon=True),
+        threading.Thread(target=rotate_access_log, args=(_stop_event,), daemon=True),
     ]
     for t in threads:
         t.start()
