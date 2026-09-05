@@ -12,6 +12,24 @@ from .routers import auth, backup as backup_router, peers, server, status, updat
 
 STATIC_DIR = Path(__file__).resolve().parent.parent / "static"
 
+
+class RevalidatingStaticFiles(StaticFiles):
+    """Статика с обязательной перепроверкой у сервера.
+
+    Без Cache-Control браузер кэширует файлы по своему усмотрению, и после
+    docker compose pull человек продолжает видеть СТАРЫЙ интерфейс: контейнер
+    обновился, а app.js в браузере остался прежний. Выглядит это как «обновление
+    не доехало» и заставляет искать поломку там, где её нет.
+
+    no-cache не запрещает хранить копию — он требует спросить сервер, не
+    изменился ли файл. ETag уже отдаётся, поэтому неизменившийся файл стоит
+    один ответ 304 без тела."""
+
+    def file_response(self, *args, **kwargs):
+        response = super().file_response(*args, **kwargs)
+        response.headers["Cache-Control"] = "no-cache"
+        return response
+
 _traffic_history_stop = threading.Event()
 _cascade_supervisor_stop = threading.Event()
 _backup_stop = threading.Event()
@@ -63,4 +81,4 @@ app.include_router(updates.router, prefix="/api/updates", tags=["updates"])
 app.include_router(backup_router.router, prefix="/api/backup", tags=["backup"])
 
 if STATIC_DIR.exists():
-    app.mount("/", StaticFiles(directory=str(STATIC_DIR), html=True), name="static")
+    app.mount("/", RevalidatingStaticFiles(directory=str(STATIC_DIR), html=True), name="static")

@@ -1008,7 +1008,11 @@ window.addEventListener("resize", drawChart);
 
 
 @app.get("/", response_class=HTMLResponse)
-def index():
+def index(response: Response):
+    # Страница собирается на лету, но без этого заголовка браузер вправе
+    # показать свою старую копию — и после обновления образа человек видит
+    # прежний интерфейс, не понимая почему.
+    response.headers["Cache-Control"] = "no-cache"
     with state_lock:
         s = dict(state)
     creds = json.loads(CREDS_FILE.read_text()) if CREDS_FILE.exists() else {}
