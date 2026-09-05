@@ -16,7 +16,7 @@ services:
       REALITY_SNI: "${REALITY_SNI:-}"
       PUBLIC_HOST: "${PUBLIC_HOST:-}"
       LABEL: "${LABEL:-vless-reality}"
-      ADMIN_USER: "${ADMIN_USER:-admin}"
+      ADMIN_USERNAME: "${ADMIN_USERNAME:-admin}"
       ADMIN_PASSWORD: "${ADMIN_PASSWORD:-}"
       APP_NAME: "${APP_NAME:-NOISEFLOOR}"
       APP_CODENAME: "${APP_CODENAME:-Relay-01}"

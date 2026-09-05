@@ -58,7 +58,11 @@ DEFAULT_REALITY_DEST = os.environ.get("REALITY_DEST") or "dl.google.com:443"
 DEFAULT_REALITY_SNI = os.environ.get("REALITY_SNI") or DEFAULT_REALITY_DEST.split(":")[0]
 PUBLIC_HOST = os.environ.get("PUBLIC_HOST", "")
 LABEL = os.environ.get("LABEL", "vless-reality")
-ADMIN_USER = os.environ.get("ADMIN_USER", "admin")
+# Имя переменной единое с панелью — ADMIN_USERNAME. Прежнее ADMIN_USER
+# оставлено синонимом, чтобы не сломать уже развёрнутые инсталляции:
+# два родственных сервиса с разными именами одной и той же настройки —
+# лишний повод ошибиться при развёртывании.
+ADMIN_USER = os.environ.get("ADMIN_USERNAME") or os.environ.get("ADMIN_USER") or "admin"
 # Cosmetic-only page identity - deliberately generic so the browser tab /
 # title doesn't reveal this is a VPN endpoint. Does not affect the vless://
 # link (that still uses LABEL).
@@ -394,6 +398,35 @@ def api_status():
     s["dest"] = creds.get("dest")
     s["port"] = creds.get("vless_port")
     return JSONResponse(s)
+
+
+@app.get("/api/metrics", response_class=Response)
+def api_metrics():
+    """Метрики в формате Prometheus — те же, что отдаёт панель, чтобы за
+    обоими сервисами следить одинаково."""
+    with state_lock:
+        s = dict(state)
+    lines = [
+        "# HELP noisefloor_relay_xray_up Жив ли процесс xray",
+        "# TYPE noisefloor_relay_xray_up gauge",
+        f"noisefloor_relay_xray_up {int(bool(s['xray_running']))}",
+        "# HELP noisefloor_relay_client_connected Было ли хоть одно подключение клиента",
+        "# TYPE noisefloor_relay_client_connected gauge",
+        f"noisefloor_relay_client_connected {int(bool(s['connected']))}",
+        "# HELP noisefloor_relay_connections_total Всего рукопожатий клиентов",
+        "# TYPE noisefloor_relay_connections_total counter",
+        f"noisefloor_relay_connections_total {s['connect_count']}",
+        "# HELP noisefloor_relay_uplink_bytes_total Отправлено через релей",
+        "# TYPE noisefloor_relay_uplink_bytes_total counter",
+        f"noisefloor_relay_uplink_bytes_total {s['traffic_uplink']}",
+        "# HELP noisefloor_relay_downlink_bytes_total Получено через релей",
+        "# TYPE noisefloor_relay_downlink_bytes_total counter",
+        f"noisefloor_relay_downlink_bytes_total {s['traffic_downlink']}",
+        "# HELP noisefloor_relay_traffic_active Шёл ли трафик на последнем замере",
+        "# TYPE noisefloor_relay_traffic_active gauge",
+        f"noisefloor_relay_traffic_active {int(bool(s['traffic_active']))}",
+    ]
+    return Response(content="\n".join(lines) + "\n", media_type="text/plain; charset=utf-8")
 
 
 @app.get("/api/traffic-history")

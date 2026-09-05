@@ -74,6 +74,30 @@ class ServerConfig(Base):
     updated_at = Column(DateTime, default=_utcnow, onupdate=_utcnow)
 
 
+class TrafficSample(Base):
+    """
+    Точка истории трафика, поминутно.
+
+    Раньше история жила только в памяти процесса: любой перезапуск обнулял
+    графики, и сравнить нагрузку с прошлой неделей было нечем. В памяти
+    по-прежнему держится подробное окно (раз в 5 секунд) для живого графика,
+    а сюда откладывается поминутный слепок на длинную дистанцию.
+
+    Счётчики накопительные и сбрасываются при перезапуске интерфейса или
+    xray, поэтому потребитель обязан считать разницу с защитой от
+    отрицательных значений.
+    """
+
+    __tablename__ = "traffic_samples"
+
+    id = Column(Integer, primary_key=True)
+    at = Column(DateTime, nullable=False, index=True)
+    iface_rx = Column(Integer, nullable=False, default=0)
+    iface_tx = Column(Integer, nullable=False, default=0)
+    cascade_uplink = Column(Integer, nullable=False, default=0)
+    cascade_downlink = Column(Integer, nullable=False, default=0)
+
+
 class Peer(Base):
     __tablename__ = "peers"
 
