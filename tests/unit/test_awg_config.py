@@ -84,6 +84,22 @@ class PostUpDownTests(unittest.TestCase):
         self.assertIn("--mode off", _hook("PostUp", block))
         self.assertNotIn("--cascade-port", _hook("PostUp", block))
 
+    def test_client_isolation_enabled_by_default(self):
+        """Подключение к одному серверу не повод открывать устройствам
+        доступ друг к другу."""
+        up = _hook("PostUp", awg_config.server_interface_block(_Server()))
+        self.assertIn("--isolate-clients", up)
+
+    def test_client_isolation_can_be_turned_off(self):
+        from app.config import settings
+        original = settings.isolate_clients
+        try:
+            object.__setattr__(settings, "isolate_clients", False)
+            up = _hook("PostUp", awg_config.server_interface_block(_Server()))
+            self.assertNotIn("--isolate-clients", up)
+        finally:
+            object.__setattr__(settings, "isolate_clients", original)
+
     def test_cascade_enabled_passes_mode_and_port(self):
         server = _Server()
         server.cascade_enabled = True
