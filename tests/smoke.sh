@@ -240,6 +240,58 @@ EOF
     fi
 }
 
+# ------------------------------------------------- правила и перехват ----
+
+# Гоняется в контейнере с собственным сетевым стеком (bridge + NET_ADMIN),
+# поэтому правила хоста не затрагиваются вообще.
+test_rules() {
+    echo
+    echo "Правила фаервола  ($PANEL_IMAGE)"
+
+    local out
+    out="$(docker run --rm --cap-add NET_ADMIN --cap-add NET_RAW \
+        --entrypoint sh "$PANEL_IMAGE" -c '
+        set -e
+        ip link add awg0 type dummy && ip addr add 10.13.13.1/24 dev awg0 && ip link set awg0 up
+        for i in 1 2 3; do
+            noisefloor-rules up --iface awg0 --egress eth0 --cascade-port 12345 --mode tproxy >/dev/null
+        done
+        echo "fwd=$(iptables -S NOISEFLOOR-FWD | grep -c "^-A")"
+        echo "fwd_jumps=$(iptables -S FORWARD | grep -c NOISEFLOOR-FWD)"
+        echo "nat_jumps=$(iptables -t nat -S POSTROUTING | grep -c NOISEFLOOR-POST)"
+        echo "tproxy_tcp=$(iptables -t mangle -S NOISEFLOOR-TPROXY | grep -c "p tcp -j TPROXY")"
+        echo "tproxy_udp=$(iptables -t mangle -S NOISEFLOOR-TPROXY | grep -c "p udp -j TPROXY")"
+        echo "iprules=$(ip rule list | grep -c "lookup 100")"
+        noisefloor-rules down --iface awg0 --egress eth0 >/dev/null
+        echo "left=$(iptables-save | grep -c NOISEFLOOR || true)"
+        echo "left_iprules=$(ip rule list | grep -c "lookup 100" || true)"
+    ' 2>/dev/null)"
+
+    check() {
+        local key="$1" want="$2" got
+        got="$(printf '%s' "$out" | grep "^$key=" | cut -d= -f2)"
+        [ "$got" = "$want" ] && return 0 || { echo "    ($key=$got, ожидалось $want)"; return 1; }
+    }
+
+    # Трижды применили — обязана остаться ровно одна копия. Именно этого
+    # не было раньше: на проде накопилось по семь комплектов правил.
+    if check fwd_jumps 1 && check nat_jumps 1 && check iprules 1; then
+        pass "троекратное применение не дублирует правила"
+    else
+        fail "правила дублируются при повторном применении"
+    fi
+
+    check tproxy_tcp 1 && check tproxy_udp 1 \
+        && pass "перехват настроен и на TCP, и на UDP (QUIC и DNS в каскаде)" \
+        || fail "UDP не перехватывается — QUIC и DNS пойдут мимо каскада"
+
+    if check left 0 && check left_iprules 0; then
+        pass "down убирает правила и маршрут метки полностью"
+    else
+        fail "после down остались следы правил"
+    fi
+}
+
 # ------------------------------------------------------------------ main ----
 
 echo "NOISEFLOOR · приёмочный тест"
@@ -247,8 +299,9 @@ dim "рабочий каталог: $WORKDIR"
 
 case "${1:-}" in
     --relay-only) test_relay ;;
-    --panel-only) test_panel ;;
-    "")           test_relay; test_panel ;;
+    --panel-only) test_panel; test_rules ;;
+    --rules-only) test_rules ;;
+    "")           test_relay; test_panel; test_rules ;;
     *) echo "неизвестный аргумент: $1" >&2; exit 2 ;;
 esac
 

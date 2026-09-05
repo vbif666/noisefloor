@@ -11,7 +11,11 @@ ServerConfig, а не из собственных полей Peer.
 from __future__ import annotations
 
 from . import cascade
+from .config import settings
 from .models import Peer, ServerConfig
+
+# Скрипт лежит в образе; он же отвечает за идемпотентность правил.
+RULES_SCRIPT = "/usr/local/bin/noisefloor-rules"
 
 _OBFS_INT_FIELDS = ("jc", "jmin", "jmax", "s1", "s2", "s3", "s4")
 _OBFS_STR_FIELDS = ("h1", "h2", "h3", "h4")
@@ -44,45 +48,32 @@ def server_interface_block(server: ServerConfig) -> str:
         lines.append(f"MTU = {server.mtu}")
     lines.extend(_obfuscation_lines(server))
     if server.egress_interface:
-        iface = server.interface_name
-        egress = server.egress_interface
-        # TCPMSS clamp: без него клиенты, у которых реальный path MTU меньше
-        # выставленного (мобильные сети с доп. инкапсуляцией, второй VPN и
-        # т.п.), получают PMTU black hole — крупные TLS-сегменты (медиа,
-        # стикеры, кастомные эмодзи с CDN) молча теряются, а мелкие запросы
-        # проходят. Правило чинит это прозрачно для TCP независимо от того,
-        # что клиент сам думает о своём MTU.
-        postup = [
-            "iptables -A FORWARD -i %s -j ACCEPT" % iface,
-            "iptables -A FORWARD -o %s -j ACCEPT" % iface,
-            "iptables -t nat -A POSTROUTING -o %s -j MASQUERADE" % egress,
-            "iptables -A FORWARD -i %s -o %s -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu" % (iface, egress),
-            "ip6tables -A FORWARD -i %s -j ACCEPT 2>/dev/null || true" % iface,
-            "ip6tables -A FORWARD -o %s -j ACCEPT 2>/dev/null || true" % iface,
-        ]
-        postdown = [
-            "iptables -D FORWARD -i %s -j ACCEPT" % iface,
-            "iptables -D FORWARD -o %s -j ACCEPT" % iface,
-            "iptables -t nat -D POSTROUTING -o %s -j MASQUERADE" % egress,
-            "iptables -D FORWARD -i %s -o %s -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu" % (iface, egress),
-            "ip6tables -D FORWARD -i %s -j ACCEPT 2>/dev/null || true" % iface,
-            "ip6tables -D FORWARD -o %s -j ACCEPT 2>/dev/null || true" % iface,
+        # Раньше здесь собиралась цепочка из шести iptables-команд через
+        # точку с запятой, а PostDown удалял их по одной. При жёсткой
+        # остановке контейнера PostDown не отрабатывал, и правила
+        # накапливались — на проде их набралось по семь копий.
+        #
+        # Теперь вся работа у noisefloor-rules: он держит правила в
+        # собственных цепочках и очищает их перед заполнением, поэтому
+        # повторный запуск не может ничего продублировать.
+        mode = settings.cascade_intercept_mode if server.cascade_enabled else "off"
+        up = [
+            RULES_SCRIPT, "up",
+            "--iface", server.interface_name,
+            "--egress", server.egress_interface,
+            "--mode", mode,
         ]
         if server.cascade_enabled:
-            # Каскад: весь TCP от клиентов туннеля перехватываем ДО обычной
-            # маршрутизации/MASQUERADE и заворачиваем на локальный xray
-            # (см. cascade.py), который сам уходит наружу через VLESS.
-            # UDP каскад не трогает - идёт как обычно через MASQUERADE выше.
-            postup.append(
-                "iptables -t nat -A PREROUTING -i %s -p tcp -j REDIRECT --to-ports %d"
-                % (iface, cascade.REDIRECT_PORT)
-            )
-            postdown.append(
-                "iptables -t nat -D PREROUTING -i %s -p tcp -j REDIRECT --to-ports %d"
-                % (iface, cascade.REDIRECT_PORT)
-            )
-        lines.append("PostUp = " + "; ".join(postup))
-        lines.append("PostDown = " + "; ".join(postdown))
+            up += ["--cascade-port", str(cascade.REDIRECT_PORT)]
+        if settings.isolate_clients:
+            up.append("--isolate-clients")
+        down = [
+            RULES_SCRIPT, "down",
+            "--iface", server.interface_name,
+            "--egress", server.egress_interface,
+        ]
+        lines.append("PostUp = " + " ".join(up))
+        lines.append("PostDown = " + " ".join(down))
     return "\n".join(lines)
 
 

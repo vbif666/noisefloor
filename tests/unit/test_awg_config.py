@@ -42,38 +42,56 @@ class _Peer:
     enabled = True
 
 
-def _rules(line_prefix: str, block: str) -> list[str]:
+def _hook(name: str, block: str) -> str:
     for line in block.splitlines():
-        if line.startswith(line_prefix):
-            return [r.strip() for r in line.split("=", 1)[1].split(";")]
-    return []
+        if line.startswith(name):
+            return line.split("=", 1)[1].strip()
+    return ""
 
 
 class PostUpDownTests(unittest.TestCase):
-    def test_postup_and_postdown_are_symmetric(self):
-        """Каждому -A/-I в PostUp обязано соответствовать -D в PostDown."""
+    """
+    Правила больше не собираются строкой в конфиге: PostUp/PostDown зовут
+    noisefloor-rules, который держит их в собственных цепочках и очищает
+    перед заполнением. Раньше повторный запуск дублировал правила — на
+    проде накопилось по семь копий каждого набора.
+    """
+
+    def test_hooks_call_the_rules_script(self):
+        block = awg_config.server_interface_block(_Server())
+        self.assertIn("/usr/local/bin/noisefloor-rules up", _hook("PostUp", block))
+        self.assertIn("/usr/local/bin/noisefloor-rules down", _hook("PostDown", block))
+
+    def test_no_raw_iptables_left_in_config(self):
+        # Ровно то, от чего уходим: сырые -A в конфиге не идемпотентны.
         for cascade_on in (False, True):
             with self.subTest(cascade=cascade_on):
                 server = _Server()
                 server.cascade_enabled = cascade_on
                 block = awg_config.server_interface_block(server)
-                added = [r.replace(" -A ", " -D ").replace(" -I ", " -D ")
-                         for r in _rules("PostUp", block)]
-                removed = _rules("PostDown", block)
-                self.assertEqual(sorted(added), sorted(removed))
+                self.assertNotIn("iptables -A", block)
+                self.assertNotIn("iptables -t nat -A", block)
 
-    def test_cascade_redirect_present_only_when_enabled(self):
-        server = _Server()
-        off = awg_config.server_interface_block(server)
-        self.assertNotIn("REDIRECT", off)
-
-        server.cascade_enabled = True
-        on = awg_config.server_interface_block(server)
-        self.assertIn(f"--to-ports {cascade.REDIRECT_PORT}", on)
-
-    def test_masquerade_uses_egress_interface(self):
+    def test_down_undoes_the_same_interface(self):
         block = awg_config.server_interface_block(_Server())
-        self.assertIn("-t nat -A POSTROUTING -o eth0 -j MASQUERADE", block)
+        up, down = _hook("PostUp", block), _hook("PostDown", block)
+        for flag in ("--iface awg0", "--egress eth0"):
+            self.assertIn(flag, up)
+            self.assertIn(flag, down)
+
+    def test_cascade_mode_off_when_cascade_disabled(self):
+        block = awg_config.server_interface_block(_Server())
+        self.assertIn("--mode off", _hook("PostUp", block))
+        self.assertNotIn("--cascade-port", _hook("PostUp", block))
+
+    def test_cascade_enabled_passes_mode_and_port(self):
+        server = _Server()
+        server.cascade_enabled = True
+        up = _hook("PostUp", awg_config.server_interface_block(server))
+        # По умолчанию tproxy: только он заворачивает ещё и UDP/QUIC/DNS,
+        # то есть делает то, что каскад обещает пользователю.
+        self.assertIn("--mode tproxy", up)
+        self.assertIn(f"--cascade-port {cascade.REDIRECT_PORT}", up)
 
 
 class ServerConfigTests(unittest.TestCase):

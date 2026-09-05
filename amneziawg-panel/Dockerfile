@@ -101,7 +101,8 @@ COPY src/manage.py ./manage.py
 RUN mkdir -p /opt/panel/data /etc/amnezia/amneziawg
 
 COPY entrypoint.sh /entrypoint.sh
-RUN chmod +x /entrypoint.sh
+COPY noisefloor-rules /usr/local/bin/noisefloor-rules
+RUN chmod +x /entrypoint.sh /usr/local/bin/noisefloor-rules
 
 EXPOSE 8000
 VOLUME ["/opt/panel/data", "/etc/amnezia/amneziawg"]

@@ -1,0 +1,185 @@
+#!/bin/sh
+# Правила фаервола для туннеля NOISEFLOOR.
+#
+# Зачем отдельный скрипт вместо цепочки команд в PostUp:
+#
+# 1. Идемпотентность. Раньше PostUp делал "iptables -A ...", а PostDown —
+#    "-D ...". Если контейнер убивали (а docker compose up -d делает именно
+#    это), PostDown не отрабатывал, и следующий старт добавлял ещё один
+#    комплект правил поверх старого. На проде так накопилось семь копий.
+#    Здесь все правила живут в собственных цепочках, которые перед
+#    заполнением ПОЛНОСТЬЮ очищаются, — накопление невозможно в принципе,
+#    сколько бы раз ни перезапускали.
+#
+# 2. Читаемость. Набор правил виден одним "iptables -L NOISEFLOOR-FWD"
+#    вместо вычитывания их из строки PostUp вперемешку с чужими правилами.
+#
+# Почему iptables, а не nftables: FORWARD policy DROP на хосте ставит Docker
+# через iptables. Своя inet-таблица nftables его не переопределит (при
+# обходе всех цепочек хука выигрывает drop), и форвардинг просто ляжет.
+#
+# Использование:
+#   noisefloor-rules up --iface awg0 --egress eth0 \
+#       [--cascade-port 12345] [--mode tproxy|redirect|off] [--isolate-clients]
+#   noisefloor-rules down --iface awg0 --egress eth0
+
+set -u
+
+IFACE=""
+EGRESS=""
+CASCADE_PORT=""
+MODE="off"
+ISOLATE="no"
+MARK=1
+RT_TABLE=100
+
+FWD_CHAIN="NOISEFLOOR-FWD"
+NAT_POST_CHAIN="NOISEFLOOR-POST"
+NAT_PRE_CHAIN="NOISEFLOOR-PRE"
+MANGLE_PRE_CHAIN="NOISEFLOOR-TPROXY"
+
+# Адреса, которые никогда не заворачиваем в каскад: сам туннель, локалхост,
+# служебные диапазоны. Иначе клиент не достучится ни до соседа по туннелю,
+# ни до самого сервера.
+LOCAL_NETS="127.0.0.0/8 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 169.254.0.0/16 224.0.0.0/4 240.0.0.0/4"
+
+log() { echo "[rules] $*"; }
+die() { echo "[rules] ОШИБКА: $*" >&2; exit 1; }
+
+# Создать цепочку или очистить, если уже есть, — ключ к идемпотентности.
+ensure_chain() {
+    iptables -t "$1" -N "$2" 2>/dev/null || iptables -t "$1" -F "$2"
+}
+
+# Поставить переход в нашу цепочку, только если его ещё нет.
+ensure_jump() {
+    iptables -t "$1" -C "$2" -j "$3" 2>/dev/null || iptables -t "$1" -I "$2" 1 -j "$3"
+}
+
+drop_chain() {
+    iptables -t "$1" -D "$2" -j "$3" 2>/dev/null || true
+    iptables -t "$1" -F "$3" 2>/dev/null || true
+    iptables -t "$1" -X "$3" 2>/dev/null || true
+}
+
+parse_args() {
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --iface)         IFACE="$2"; shift 2 ;;
+            --egress)        EGRESS="$2"; shift 2 ;;
+            --cascade-port)  CASCADE_PORT="$2"; shift 2 ;;
+            --mode)          MODE="$2"; shift 2 ;;
+            --isolate-clients) ISOLATE="yes"; shift ;;
+            *) die "неизвестный аргумент: $1" ;;
+        esac
+    done
+    [ -n "$IFACE" ] || die "не задан --iface"
+}
+
+# --------------------------------------------------------------------- up ---
+
+cmd_up() {
+    [ -n "$EGRESS" ] || die "не задан --egress"
+
+    # --- форвардинг клиентского трафика ---
+    ensure_chain filter "$FWD_CHAIN"
+
+    if [ "$ISOLATE" = "yes" ]; then
+        # Клиенты не должны видеть друг друга: без этого пир свободно
+        # сканирует соседа по туннелю.
+        iptables -t filter -A "$FWD_CHAIN" -i "$IFACE" -o "$IFACE" -j DROP
+    fi
+
+    iptables -t filter -A "$FWD_CHAIN" -i "$IFACE" -j ACCEPT
+    iptables -t filter -A "$FWD_CHAIN" -o "$IFACE" -j ACCEPT
+    # Клиент не знает реального path MTU до сервера; без клэмпа крупные
+    # TCP-сегменты молча теряются на сетях с меньшим MTU (мобильный интернет,
+    # второй VPN поверх), а мелкие проходят — классическая PMTU black hole.
+    iptables -t filter -A "$FWD_CHAIN" -i "$IFACE" -o "$EGRESS" \
+        -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
+    ensure_jump filter FORWARD "$FWD_CHAIN"
+
+    # --- NAT наружу ---
+    ensure_chain nat "$NAT_POST_CHAIN"
+    iptables -t nat -A "$NAT_POST_CHAIN" -o "$EGRESS" -j MASQUERADE
+    ensure_jump nat POSTROUTING "$NAT_POST_CHAIN"
+
+    # --- перехват в каскад ---
+    # Старые цепочки перехвата всегда убираем: режим мог смениться.
+    drop_chain nat PREROUTING "$NAT_PRE_CHAIN"
+    drop_chain mangle PREROUTING "$MANGLE_PRE_CHAIN"
+    teardown_tproxy_routing
+
+    case "$MODE" in
+        off)
+            log "каскад выключен: трафик идёт напрямую через MASQUERADE"
+            ;;
+        redirect)
+            [ -n "$CASCADE_PORT" ] || die "режим redirect требует --cascade-port"
+            # Только TCP: у REDIRECT нет аналога для UDP. QUIC и DNS уйдут
+            # мимо каскада — режим оставлен как запасной путь отката.
+            ensure_chain nat "$NAT_PRE_CHAIN"
+            iptables -t nat -A "$NAT_PRE_CHAIN" -i "$IFACE" -p tcp -j REDIRECT --to-ports "$CASCADE_PORT"
+            ensure_jump nat PREROUTING "$NAT_PRE_CHAIN"
+            log "каскад в режиме redirect (только TCP), порт $CASCADE_PORT"
+            ;;
+        tproxy)
+            [ -n "$CASCADE_PORT" ] || die "режим tproxy требует --cascade-port"
+            setup_tproxy_routing
+            ensure_chain mangle "$MANGLE_PRE_CHAIN"
+            # Служебные адреса мимо каскада, иначе клиент теряет и соседей
+            # по туннелю, и сам сервер.
+            for net in $LOCAL_NETS; do
+                iptables -t mangle -A "$MANGLE_PRE_CHAIN" -i "$IFACE" -d "$net" -j RETURN
+            done
+            iptables -t mangle -A "$MANGLE_PRE_CHAIN" -i "$IFACE" -p tcp \
+                -j TPROXY --on-port "$CASCADE_PORT" --tproxy-mark "$MARK"
+            iptables -t mangle -A "$MANGLE_PRE_CHAIN" -i "$IFACE" -p udp \
+                -j TPROXY --on-port "$CASCADE_PORT" --tproxy-mark "$MARK"
+            ensure_jump mangle PREROUTING "$MANGLE_PRE_CHAIN"
+            log "каскад в режиме tproxy (TCP и UDP, включая QUIC и DNS), порт $CASCADE_PORT"
+            ;;
+        *)
+            die "неизвестный режим: $MODE"
+            ;;
+    esac
+}
+
+# TPROXY отдаёт помеченные пакеты локальному сокету, а для этого ядру нужен
+# отдельный маршрут: всё помеченное считать местным.
+setup_tproxy_routing() {
+    ip rule list 2>/dev/null | grep -q "fwmark 0x$MARK lookup $RT_TABLE" \
+        || ip rule add fwmark "$MARK" lookup "$RT_TABLE"
+    ip route show table "$RT_TABLE" 2>/dev/null | grep -q "^local default" \
+        || ip route add local default dev lo table "$RT_TABLE"
+}
+
+teardown_tproxy_routing() {
+    while ip rule list 2>/dev/null | grep -q "fwmark 0x$MARK lookup $RT_TABLE"; do
+        ip rule del fwmark "$MARK" lookup "$RT_TABLE" 2>/dev/null || break
+    done
+    ip route flush table "$RT_TABLE" 2>/dev/null || true
+}
+
+# ------------------------------------------------------------------- down ---
+
+cmd_down() {
+    drop_chain filter FORWARD "$FWD_CHAIN"
+    drop_chain nat POSTROUTING "$NAT_POST_CHAIN"
+    drop_chain nat PREROUTING "$NAT_PRE_CHAIN"
+    drop_chain mangle PREROUTING "$MANGLE_PRE_CHAIN"
+    teardown_tproxy_routing
+    log "правила сняты"
+}
+
+# ------------------------------------------------------------------- main ---
+
+[ $# -ge 1 ] || die "нужна команда: up или down"
+COMMAND="$1"; shift
+parse_args "$@"
+
+case "$COMMAND" in
+    up)   cmd_up ;;
+    down) cmd_down ;;
+    *)    die "неизвестная команда: $COMMAND" ;;
+esac

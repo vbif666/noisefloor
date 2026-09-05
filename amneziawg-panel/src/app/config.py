@@ -57,6 +57,18 @@ class Settings(BaseSettings):
     # первичной настройки. В контейнере такого шага быть не должно.
     auto_apply_on_start: bool = True
 
+    # Как перехватывать клиентский трафик в каскад:
+    #   tproxy   — TCP и UDP, то есть QUIC и DNS тоже идут через каскад.
+    #              Единственный режим, в котором каскад делает то, что обещает.
+    #   redirect — только TCP (у REDIRECT нет аналога для UDP). Оставлен как
+    #              путь отката: UDP при нём уходит напрямую с реальным IP.
+    cascade_intercept_mode: str = "tproxy"
+
+    # Запрещать клиентам видеть друг друга внутри туннеля. По умолчанию
+    # выключено, чтобы не сломать сценарии вроде доступа к домашней машине
+    # через тот же туннель.
+    isolate_clients: bool = False
+
     def model_post_init(self, __context) -> None:
         if not self.secret_key:
             object.__setattr__(self, "secret_key", _get_or_create_secret_key())

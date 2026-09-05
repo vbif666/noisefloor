@@ -70,6 +70,15 @@ class BuildXrayConfigTests(unittest.TestCase):
         # константа; расхождение молча выключает каскад целиком.
         self.assertEqual(self.inbounds["cascade-in"]["port"], cascade.REDIRECT_PORT)
 
+    def test_cascade_inbound_accepts_udp_for_tproxy(self):
+        """Без udp в network каскад не заворачивает QUIC и DNS — а это
+        основная часть трафика современного браузера, уходившая мимо."""
+        self.assertIn("udp", self.inbounds["cascade-in"]["settings"]["network"])
+
+    def test_cascade_inbound_has_tproxy_sockopt(self):
+        sockopt = self.inbounds["cascade-in"]["streamSettings"]["sockopt"]
+        self.assertEqual(sockopt["tproxy"], "tproxy")
+
     def test_stats_api_stays_on_loopback(self):
         # А вот этот, наоборот, наружу торчать не должен.
         self.assertEqual(self.inbounds["api-in"]["listen"], "127.0.0.1")

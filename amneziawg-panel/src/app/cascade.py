@@ -145,8 +145,14 @@ def build_xray_config(params: dict) -> dict:
                 "listen": "0.0.0.0",
                 "port": REDIRECT_PORT,
                 "protocol": "dokodemo-door",
-                "settings": {"network": "tcp", "followRedirect": True},
-                "sniffing": {"enabled": True, "destOverride": ["http", "tls"]},
+                # network включает udp: в режиме tproxy сюда приходят и QUIC,
+                # и DNS — то, что при старом REDIRECT уходило мимо каскада
+                # напрямую с реальным IP сервера.
+                "settings": {"network": "tcp,udp", "followRedirect": True},
+                # sockopt.tproxy обязателен, чтобы xray принял прозрачно
+                # перенаправленные пакеты и увидел исходный адрес назначения.
+                "streamSettings": {"sockopt": {"tproxy": "tproxy"}},
+                "sniffing": {"enabled": True, "destOverride": ["http", "tls", "quic"]},
             },
         ],
         "outbounds": [
