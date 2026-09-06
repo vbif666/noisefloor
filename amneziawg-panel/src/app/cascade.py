@@ -29,7 +29,7 @@ import threading
 from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlparse
 
-from .config import DATA_DIR
+from .config import DATA_DIR, settings
 
 XRAY_BIN = shutil.which("xray") or "/usr/local/bin/xray"
 CONFIG_PATH = DATA_DIR / "cascade-xray-config.json"
@@ -50,6 +50,11 @@ PROBE_TIMEOUT_SECONDS = 12
 # Логи xray: раньше уходили в DEVNULL, и при поломке смотреть было нечего.
 LOG_PATH = DATA_DIR / "cascade-xray.log"
 LOG_MAX_BYTES = 5 * 1024 * 1024
+
+# Строка, которой xray сообщает, что не смог сделать TCP-слушателя прозрачным.
+# Она приходит уровнем Info и сама по себе процесс не роняет — а между тем без
+# этого флага ядро дропает весь клиентский TCP (см. _tproxy_sockopt_error).
+TPROXY_SOCKOPT_MARKER = "failed to set IP_TRANSPARENT"
 
 # Как часто супервизор проверяет каскад и как долго ждёт после неудач.
 SUPERVISE_INTERVAL_SECONDS = 30
@@ -108,6 +113,16 @@ def parse_vless_url(url: str) -> dict:
     }
 
 
+def _tproxy_mode() -> bool:
+    """Перехват идёт через TPROXY (а не через nat REDIRECT)?
+
+    От этого зависит, как xray узнаёт исходный адрес назначения, и потому —
+    какой у входа cascade-in должен быть streamSettings. Настройка одна и та
+    же, что и у noisefloor-rules: CASCADE_INTERCEPT_MODE.
+    """
+    return getattr(settings, "cascade_intercept_mode", "tproxy") != "redirect"
+
+
 def build_xray_config(params: dict) -> dict:
     return {
         "log": {"loglevel": "warning"},
@@ -147,11 +162,22 @@ def build_xray_config(params: dict) -> dict:
                 "protocol": "dokodemo-door",
                 # network включает udp: в режиме tproxy сюда приходят и QUIC,
                 # и DNS — то, что при старом REDIRECT уходило мимо каскада
-                # напрямую с реальным IP сервера.
-                "settings": {"network": "tcp,udp", "followRedirect": True},
-                # sockopt.tproxy обязателен, чтобы xray принял прозрачно
-                # перенаправленные пакеты и увидел исходный адрес назначения.
-                "streamSettings": {"sockopt": {"tproxy": "tproxy"}},
+                # напрямую с реальным IP сервера. В режиме redirect UDP до
+                # xray не доходит вовсе, и объявлять его здесь незачем.
+                "settings": {
+                    "network": "tcp,udp" if _tproxy_mode() else "tcp",
+                    "followRedirect": True,
+                },
+                # sockopt.tproxy нужен ТОЛЬКО для TPROXY: с ним xray берёт
+                # исходный адрес назначения с прозрачного сокета. После nat
+                # REDIRECT адрес на сокете — это сам xray, и каждое соединение
+                # умирает с "loopback connection detected"; там адрес приходит
+                # из SO_ORIGINAL_DST и никакого sockopt не требует.
+                **(
+                    {"streamSettings": {"sockopt": {"tproxy": "tproxy"}}}
+                    if _tproxy_mode()
+                    else {}
+                ),
                 "sniffing": {"enabled": True, "destOverride": ["http", "tls", "quic"]},
             },
         ],
@@ -243,6 +269,9 @@ def sync(server) -> str | None:
         CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
         CONFIG_PATH.write_text(json.dumps(build_xray_config(params), indent=2))
         CONFIG_PATH.chmod(0o600)
+        # Запоминаем, где кончается лог, чтобы потом читать только то, что
+        # написал именно этот запуск, а не жалобы прошлого.
+        log_offset = LOG_PATH.stat().st_size if LOG_PATH.exists() else 0
         try:
             _proc = subprocess.Popen(
                 [XRAY_BIN, "run", "-config", str(CONFIG_PATH)],
@@ -258,7 +287,38 @@ def sync(server) -> str | None:
             pass
         if not is_running():
             return "xray сразу завершился после запуска — проверьте ссылку vless:// (эндпоинт недоступен?)"
+        return _tproxy_sockopt_error(log_offset)
+
+
+def _tproxy_sockopt_error(log_offset: int) -> str | None:
+    """Проверяет, получилось ли у xray сделать TCP-слушателя прозрачным.
+
+    В режиме tproxy ядро отдаёт пакет локальному сокету только если на том
+    стоит IP_TRANSPARENT. Если xray не смог его выставить (наблюдалось на
+    ядре 5.15: UDP-слушатель флаг получает, TCP — нет, "operation not
+    supported"), то xt_TPROXY просто дропает каждый клиентский TCP-пакет.
+    Снаружи это выглядит идеально здоровым: процесс жив, проба через
+    probe-in ходит (она идёт мимо перехвата), DNS по UDP работает — а у
+    клиентов не открывается ни один сайт. Поэтому смотрим лог сами и
+    показываем причину, вместо того чтобы молча отдать сломанный каскад."""
+    if not _tproxy_mode():
         return None
+    try:
+        size = LOG_PATH.stat().st_size
+        with LOG_PATH.open("rb") as fh:
+            # Лог мог быть обрезан при старте — тогда читаем с начала.
+            fh.seek(log_offset if size >= log_offset else 0)
+            fresh = fh.read().decode("utf-8", "replace")
+    except OSError:
+        return None
+    if TPROXY_SOCKOPT_MARKER not in fresh:
+        return None
+    return (
+        "xray не смог включить IP_TRANSPARENT на TCP-слушателе — в режиме "
+        "tproxy весь TCP клиентов будет отброшен ядром (UDP при этом "
+        "работает). Так ведёт себя старое ядро: проверьте uname -r, "
+        "обновите ядро до 6.x или переключите CASCADE_INTERCEPT_MODE=redirect."
+    )
 
 
 def _open_log():
