@@ -130,7 +130,26 @@ curl -fsSL https://get.docker.com | sh
 
 ## Быстрый старт
 
-Минимальный вариант — только VPN, без каскада:
+Если ставите на чистый сервер, всю работу сделают два скрипта — по одному на
+узел связки. Они ставят Docker, готовят систему, поднимают контейнер и
+показывают пароль администратора:
+
+```bash
+# сервер 1 — релей (выходной узел), нужен только для каскада
+curl -fsSLO https://raw.githubusercontent.com/vbif666/noisefloor/master/vless-reality/install.sh
+bash install.sh --label "Амстердам"
+
+# сервер 2 — панель (к ней подключаются устройства)
+curl -fsSLO https://raw.githubusercontent.com/vbif666/noisefloor/master/amneziawg-panel/install.sh
+bash install.sh --relay http://АДРЕС_РЕЛЕЯ:8001 --relay-token ТОКЕН_С_ЕГО_СТРАНИЦЫ
+```
+
+Без `--relay` панель встанет просто как VPN, каскад можно включить позже.
+Повторный запуск безопасен: он обновляет установку, а не сносит её. Что и
+почему делает каждый шаг — в [`docs/DEPLOY.md`](docs/DEPLOY.md).
+
+Вручную то же самое выглядит так. Минимальный вариант — только VPN, без
+каскада:
 
 Возьмите из репозитория два файла — `amneziawg-panel/docker-compose.yml` и
 `amneziawg-panel/.env.example` — и положите их в отдельный каталог на сервере
