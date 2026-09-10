@@ -104,7 +104,9 @@ HTTPS.
 отбрасывает весь TCP клиентов. Панель это распознаёт и пишет в ошибку каскада,
 а обойтись без обновления ядра можно переключением
 `CASCADE_INTERCEPT_MODE=redirect` (тогда TCP пойдёт через каскад, а UDP —
-напрямую). Подробности — в [`docs/OPERATIONS.md`](docs/OPERATIONS.md).
+напрямую; QUIC клиентам при этом закрывают, чтобы браузер не уводил основную
+часть трафика мимо каскада, — см. `CASCADE_BLOCK_QUIC`). Подробности — в
+[`docs/OPERATIONS.md`](docs/OPERATIONS.md).
 
 **Docker** с плагином Compose:
 
@@ -217,6 +219,8 @@ docker exec NOISEFLOOR-amneziawg-panel cat /opt/panel/data/INITIAL_ADMIN_PASSWOR
 | `DEFAULT_LISTEN_PORT` | `443` | UDP-порт приёма клиентов |
 | `DEFAULT_DNS` | `1.1.1.1` | DNS, который получают клиенты |
 | `CASCADE_INTERCEPT_MODE` | `tproxy` | `tproxy` — TCP и UDP через каскад; `redirect` — только TCP (откат) |
+| `CASCADE_BLOCK_QUIC` | `true` | В режиме `redirect` закрывать клиентам QUIC (UDP/443): иначе браузер уводит основную часть трафика мимо каскада и с другим IP |
+| `CASCADE_DNS_VIA_CASCADE` | `false` | В режиме `redirect` заворачивать DNS клиентов в каскад (запрос уходит по TCP через релей) |
 | `CASCADE_SYNC_URL` | пусто | Адрес панели релея. Задан — параметры каскада берутся оттуда автоматически |
 | `ISOLATE_CLIENTS` | `true` | Клиенты не видят друг друга внутри туннеля. `false` — если ходите между своими машинами через тот же туннель |
 | `BACKUP_PASSPHRASE` | пусто | Задан — резервные копии шифруются AES-256 |
@@ -262,7 +266,7 @@ vless-reality/            релей: FastAPI + xray, одно приложен�
   src/app.py
 
 tests/
-  unit/                   47 тестов, stdlib unittest, без зависимостей
+  unit/                   96 тестов, stdlib unittest, без зависимостей
   smoke.sh                приёмочный: поднимает оба сервиса с нуля
 
 docs/                     DEPLOY, ARCHITECTURE, OPERATIONS

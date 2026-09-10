@@ -5,6 +5,7 @@ test_postup_and_postdown_are_symmetric закрывает класс дефек�
 которого на ru2 накопилось по семь копий каждого правила: любое правило,
 добавленное в PostUp, обязано иметь парное удаление в PostDown.
 """
+import contextlib
 import unittest
 
 from app import awg_config, cascade
@@ -40,6 +41,18 @@ class _Peer:
     dns_override = None
     persistent_keepalive = 25
     enabled = True
+
+
+@contextlib.contextmanager
+def _setting(name: str, value):
+    """Настройки — обычный pydantic-объект: подменяем поле на время теста."""
+    from app.config import settings
+    original = getattr(settings, name, None)
+    object.__setattr__(settings, name, value)
+    try:
+        yield
+    finally:
+        object.__setattr__(settings, name, original)
 
 
 def _hook(name: str, block: str) -> str:
@@ -111,6 +124,33 @@ class PostUpDownTests(unittest.TestCase):
 
 
 class ServerConfigTests(unittest.TestCase):
+    def test_quic_is_blocked_in_redirect_mode(self):
+        """В redirect-режиме UDP в каскад не заворачивается, а браузер
+        предпочитает QUIC: без этого флага основная часть трафика идёт
+        мимо каскада и с настоящим адресом сервера."""
+        server = _Server()
+        server.cascade_enabled = True
+        with _setting("cascade_intercept_mode", "redirect"), _setting("cascade_block_quic", True):
+            self.assertIn("--block-quic", _hook("PostUp", awg_config.server_interface_block(server)))
+        with _setting("cascade_intercept_mode", "redirect"), _setting("cascade_block_quic", False):
+            self.assertNotIn("--block-quic", _hook("PostUp", awg_config.server_interface_block(server)))
+
+    def test_quic_is_not_blocked_in_tproxy_mode(self):
+        # Там QUIC проходит через каскад, резать нечего.
+        server = _Server()
+        server.cascade_enabled = True
+        with _setting("cascade_intercept_mode", "tproxy"), _setting("cascade_block_quic", True):
+            self.assertNotIn("--block-quic", _hook("PostUp", awg_config.server_interface_block(server)))
+
+    def test_dns_port_passed_only_when_dns_goes_through_cascade(self):
+        server = _Server()
+        server.cascade_enabled = True
+        with _setting("cascade_intercept_mode", "redirect"), _setting("cascade_dns_via_cascade", True):
+            up = _hook("PostUp", awg_config.server_interface_block(server))
+            self.assertIn(f"--cascade-dns-port {cascade.DNS_REDIRECT_PORT}", up)
+        with _setting("cascade_intercept_mode", "redirect"), _setting("cascade_dns_via_cascade", False):
+            self.assertNotIn("--cascade-dns-port", _hook("PostUp", awg_config.server_interface_block(server)))
+
     def test_disabled_peers_are_not_rendered(self):
         enabled, disabled = _Peer(), _Peer()
         disabled.enabled = False

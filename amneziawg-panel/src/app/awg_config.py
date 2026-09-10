@@ -65,6 +65,13 @@ def server_interface_block(server: ServerConfig) -> str:
         ]
         if server.cascade_enabled:
             up += ["--cascade-port", str(cascade.REDIRECT_PORT)]
+            if cascade.dns_via_cascade():
+                up += ["--cascade-dns-port", str(cascade.DNS_REDIRECT_PORT)]
+            # QUIC в режиме redirect не перехватывается вовсе, поэтому его
+            # либо режем, либо сознательно выпускаем мимо каскада с
+            # настоящим адресом сервера.
+            if mode == "redirect" and settings.cascade_block_quic:
+                up.append("--block-quic")
         if settings.isolate_clients:
             up.append("--isolate-clients")
         down = [

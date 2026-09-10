@@ -16,8 +16,15 @@ vless-reality-docker), конфиг генерируется из ссылки v
 работает только для TCP — у него нет аналога для UDP без TPROXY/fwmark.
 Поэтому UDP/QUIC-трафик клиентов каскад не затрагивает и продолжает идти
 напрямую через обычный MASQUERADE (см. awg_config.server_interface_block).
-Для большинства сценариев (веб, мессенджеры без принудительного QUIC) это
-не проблема: TCP fallback есть почти everywhere.
+
+Само по себе это не "мелкое неудобство": браузер предпочитает QUIC, и без
+дополнительных мер основная часть трафика уходила бы мимо каскада, да ещё
+и с настоящим адресом сервера — сайт видел бы два разных IP от одного
+клиента. Поэтому в режиме redirect QUIC клиентам закрывают
+(CASCADE_BLOCK_QUIC, отказ по icmp-port-unreachable — браузер сразу берёт
+TCP), а DNS при желании заворачивают в каскад отдельным слушателем
+(CASCADE_DNS_VIA_CASCADE). Правильное решение всё равно одно — ядро 6.x+
+и режим tproxy.
 """
 from __future__ import annotations
 
@@ -37,6 +44,12 @@ CONFIG_PATH = DATA_DIR / "cascade-xray-config.json"
 # Порт, на который iptables REDIRECT заворачивает TCP-трафик клиентов —
 # должен совпадать с тем, что зашивается в PostUp/PostDown (awg_config.py).
 REDIRECT_PORT = 12345
+# Порт, куда nat REDIRECT заворачивает DNS клиентов в режиме redirect.
+# Обычный UDP через REDIRECT не завернуть — исходный адрес назначения не
+# восстановить, — но DNS этого и не требует: ответ важен, а кто ответил,
+# клиенту всё равно. Так запрос уходит наружу по TCP через каскад и не
+# светит настоящий адрес сервера. Включается CASCADE_DNS_VIA_CASCADE.
+DNS_REDIRECT_PORT = 12353
 STATS_API_ADDR = "127.0.0.1:10086"
 
 # Локальный socks-вход, через который панель сама ходит наружу, чтобы
@@ -123,12 +136,62 @@ def _tproxy_mode() -> bool:
     return getattr(settings, "cascade_intercept_mode", "tproxy") != "redirect"
 
 
-def build_xray_config(params: dict) -> dict:
+def dns_via_cascade() -> bool:
+    """Заворачивать ли DNS клиентов в каскад (только режим redirect).
+
+    В tproxy-режиме DNS и так уходит через каскад вместе со всем UDP, и
+    отдельный слушатель не нужен."""
+    return bool(getattr(settings, "cascade_dns_via_cascade", False)) and not _tproxy_mode()
+
+
+def build_xray_config(params: dict, dns_server: str = "1.1.1.1") -> dict:
+    dns_inbounds = []
+    dns_outbounds = []
+    dns_rules = []
+    if dns_via_cascade():
+        dns_host, _, dns_port = (dns_server or "1.1.1.1").partition(":")
+        dns_inbounds.append({
+            "tag": "dns-in",
+            "listen": "0.0.0.0",
+            "port": DNS_REDIRECT_PORT,
+            "protocol": "dokodemo-door",
+            "settings": {"address": dns_host, "port": int(dns_port or 53), "network": "udp"},
+        })
+        dns_outbounds.append({
+            "tag": "dns-out",
+            "protocol": "dns",
+            "settings": {"network": "tcp", "address": dns_host, "port": int(dns_port or 53)},
+            # Запрос уходит не напрямую, а внутрь каскада — иначе смысл
+            # перехвата теряется: адрес сервера видел бы уже DNS-резолвер.
+            "proxySettings": {"tag": "cascade-out"},
+        })
+        dns_rules.append({"type": "field", "inboundTag": ["dns-in"], "outboundTag": "dns-out"})
+
     return {
-        "log": {"loglevel": "warning"},
+        # access: none — иначе движок пишет строку на КАЖДОЕ соединение
+        # клиента в тот же файл, куда идут ошибки. На проде это 23 МБ за
+        # четыре дня и постоянная запись на диск ради данных, которые
+        # никто не читает: панель разбирает только сообщения об ошибках.
+        # Ротация (_rotate_log_if_needed) от роста спасала лишь на старте.
+        "log": {"loglevel": "warning", "access": "none"},
         "stats": {},
         "api": {"tag": "api", "services": ["StatsService"]},
         "policy": {
+            # Без этого блока действуют умолчания движка, а они для
+            # прокси-режима вредны:
+            #   connIdle 300 — соединение без трафика 5 минут закрывается.
+            #     Так молча рвутся ssh, rdp, imap и вебсокеты мессенджеров;
+            #     снаружи это выглядит как "иногда отваливается".
+            #   uplinkOnly 2 / downlinkOnly 5 — после закрытия одной
+            #     половины соединения вторую добивают через 2 и 5 секунд,
+            #     чем обрезают хвост длинных ответов и больших загрузок.
+            #     0 = ждать штатного закрытия.
+            "levels": {"0": {
+                "handshake": 8,
+                "connIdle": 900,
+                "uplinkOnly": 0,
+                "downlinkOnly": 0,
+            }},
             "system": {"statsOutboundUplink": True, "statsOutboundDownlink": True},
         },
         "inbounds": [
@@ -178,8 +241,14 @@ def build_xray_config(params: dict) -> dict:
                     if _tproxy_mode()
                     else {}
                 ),
-                "sniffing": {"enabled": True, "destOverride": ["http", "tls", "quic"]},
+                # quic разбирают только там, где UDP вообще доходит до движка:
+                # в redirect-режиме его в этом списке быть не должно.
+                "sniffing": {
+                    "enabled": True,
+                    "destOverride": ["http", "tls", "quic"] if _tproxy_mode() else ["http", "tls"],
+                },
             },
+            *dns_inbounds,
         ],
         "outbounds": [
             {
@@ -206,6 +275,7 @@ def build_xray_config(params: dict) -> dict:
                     },
                 },
             },
+            *dns_outbounds,
             {"tag": "direct", "protocol": "freedom"},
             {"tag": "block", "protocol": "blackhole"},
         ],
@@ -216,6 +286,7 @@ def build_xray_config(params: dict) -> dict:
                 # Проба обязана идти тем же путём, что и клиентский трафик,
                 # иначе она проверяет не то.
                 {"type": "field", "inboundTag": ["probe-in"], "outboundTag": "cascade-out"},
+                *dns_rules,
             ]
         },
     }
@@ -267,7 +338,8 @@ def sync(server) -> str | None:
 
         _stop_locked()
         CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
-        CONFIG_PATH.write_text(json.dumps(build_xray_config(params), indent=2))
+        dns_server = (getattr(server, "dns", "") or "1.1.1.1").split(",")[0].strip()
+        CONFIG_PATH.write_text(json.dumps(build_xray_config(params, dns_server), indent=2))
         CONFIG_PATH.chmod(0o600)
         # Запоминаем, где кончается лог, чтобы потом читать только то, что
         # написал именно этот запуск, а не жалобы прошлого.
@@ -332,6 +404,22 @@ def _open_log():
         return LOG_PATH.open("ab")
     except OSError:
         return subprocess.DEVNULL
+
+
+def _rotate_log_if_needed() -> None:
+    """Обрезать лог, не трогая работающий процесс.
+
+    Проверки на старте мало: каскад живёт неделями между перезапусками, и
+    за это время файл успевал вырасти до десятков мегабайт на диске, где
+    свободно три гигабайта. Обрезаем на месте — дескриптор открыт с
+    O_APPEND, поэтому после truncate процесс продолжит писать с нуля, а не
+    в дыру."""
+    try:
+        if LOG_PATH.exists() and LOG_PATH.stat().st_size > LOG_MAX_BYTES:
+            with LOG_PATH.open("r+b") as fh:
+                fh.truncate(0)
+    except OSError:
+        pass
 
 
 def verify() -> tuple[bool, str | None]:
@@ -415,6 +503,8 @@ def supervise(stop_event) -> None:
                 backoff = BACKOFF_START_SECONDS
                 last_verify = 0.0  # после перезапуска проверяем сразу
 
+            _rotate_log_if_needed()
+
             now = time.monotonic()
             if now - last_verify >= VERIFY_EVERY_SECONDS:
                 ok, error = verify()
@@ -427,11 +517,24 @@ def supervise(stop_event) -> None:
             db.close()
 
 
+# Счётчики спрашивает и график истории (раз в HISTORY_INTERVAL секунд), и
+# каждый скрап /metrics. Каждый запрос — это запуск отдельного процесса
+# `xray api`, поэтому одинаковые ответы отдаём из кэша: на одноядерной
+# машине лишние запуски процессов заметны, а точность в пределах секунд
+# графику не нужна.
+STATS_CACHE_SECONDS = 4.0
+_stats_cache: tuple[float, dict | None] = (0.0, None)
+
+
 def traffic_stats() -> dict | None:
     """Суммарный трафик через cascade-out (uplink/downlink в байтах,
     накопительно с момента старта xray) — по нему видно "идёт трафик или нет"."""
+    global _stats_cache
     if not is_running() or not (XRAY_BIN and Path(XRAY_BIN).exists()):
         return None
+    cached_at, cached = _stats_cache
+    if cached is not None and time.monotonic() - cached_at < STATS_CACHE_SECONDS:
+        return cached
     try:
         out = subprocess.run(
             [XRAY_BIN, "api", "statsquery", f"-server={STATS_API_ADDR}", "-pattern", "outbound>>>cascade-out"],
@@ -452,4 +555,6 @@ def traffic_stats() -> dict | None:
             up += val
         elif name.endswith("downlink"):
             down += val
-    return {"uplink": up, "downlink": down}
+    stats = {"uplink": up, "downlink": down}
+    _stats_cache = (time.monotonic(), stats)
+    return stats

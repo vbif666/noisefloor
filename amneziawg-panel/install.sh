@@ -130,12 +130,61 @@ fi
 [ -e /dev/net/tun ] || modprobe tun 2>/dev/null || true
 [ -e /dev/net/tun ] || die "нет /dev/net/tun — на этом ядре VPN не поднимется"
 
-# Без форвардинга клиенты подключатся, но интернета у них не будет. Пишем в
-# sysctl.d, а не в sysctl.conf: свой файл переживёт обновление системы.
-if [ "$(sysctl -n net.ipv4.ip_forward)" != "1" ] || ! grep -rqs "^net.ipv4.ip_forward *= *1" /etc/sysctl.d /etc/sysctl.conf; then
-    log "включаю пересылку пакетов (net.ipv4.ip_forward)"
-    echo "net.ipv4.ip_forward = 1" > /etc/sysctl.d/99-noisefloor.conf
-    sysctl -q -w net.ipv4.ip_forward=1
+# --- Сетевые настройки ядра -------------------------------------------------
+#
+# Пишем одним файлом в sysctl.d: свой файл переживёт обновление системы, и
+# всё, что мы трогаем, видно в одном месте.
+#
+# Зачем каждая строка:
+#   ip_forward           — без него клиенты подключатся, но интернета не будет.
+#   bbr + fq             — дальнее плечо каскада (панель → релей) это одно
+#                          TCP-соединение через полконтинента. cubic на такой
+#                          дистанции обваливает окно от каждой потери; замер на
+#                          связке 147→Амстердам: 10-11 МБ/с на cubic против
+#                          13-15 МБ/с на bbr при прочих равных.
+#   rmem/wmem            — 208 КБ по умолчанию меньше, чем произведение полосы
+#                          на задержку этого плеча, то есть окно упирается в
+#                          буфер раньше, чем в канал.
+#   nf_conntrack_max     — на гигабайте памяти ядро берёт 7-8 тысяч записей.
+#                          Десяток активных клиентов их выбирает, и дальше
+#                          новые соединения молча теряются: на проде набежало
+#                          331 тысяча дропнутых пакетов (conntrack -S,
+#                          insert_failed) — те самые "иногда не открывается".
+#   tcp_timeout_established — пять суток на запись о соединении, которого
+#                          давно нет, — это и есть переполнение таблицы.
+#   tcp_be_liberal       — пакеты вне окна (обычная вещь при ретрансмитах на
+#                          длинном плече) иначе считаются INVALID.
+#   tcp_mtu_probing      — страховка от PMTU black hole внутри туннеля.
+#   slow_start_after_idle — иначе каждая пауза в соединении обнуляет окно, и
+#                          скорость приходится набирать заново.
+sysctl_file=/etc/sysctl.d/99-noisefloor.conf
+log "настраиваю сеть ядра ($sysctl_file)"
+modprobe nf_conntrack 2>/dev/null || true
+modprobe tcp_bbr 2>/dev/null || true
+printf 'nf_conntrack\ntcp_bbr\n' > /etc/modules-load.d/noisefloor.conf 2>/dev/null || true
+cat > "$sysctl_file" <<'SYSCTL'
+net.ipv4.ip_forward = 1
+net.core.default_qdisc = fq
+net.ipv4.tcp_congestion_control = bbr
+
+net.core.rmem_max = 16777216
+net.core.wmem_max = 16777216
+net.ipv4.tcp_rmem = 4096 131072 16777216
+net.ipv4.tcp_wmem = 4096 16384 16777216
+net.core.netdev_max_backlog = 4096
+net.ipv4.tcp_mtu_probing = 1
+net.ipv4.tcp_slow_start_after_idle = 0
+
+net.netfilter.nf_conntrack_max = 131072
+net.netfilter.nf_conntrack_tcp_timeout_established = 86400
+net.netfilter.nf_conntrack_tcp_be_liberal = 1
+SYSCTL
+# Размер хеш-таблицы conntrack — параметр модуля, а не sysctl. Держим его
+# в четверть от максимума: иначе длинные цепочки съедают выигрыш.
+echo 32768 > /sys/module/nf_conntrack/parameters/hashsize 2>/dev/null || true
+sysctl -q -p "$sysctl_file" 2>/dev/null || warn "часть сетевых настроек ядро не приняло — смотрите sysctl -p $sysctl_file"
+if [ "$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)" != "bbr" ]; then
+    warn "bbr в этом ядре недоступен — остаётся $(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null); каскад будет медленнее"
 fi
 
 # --- Режим перехвата для каскада -------------------------------------------

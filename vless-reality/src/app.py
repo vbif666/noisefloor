@@ -226,7 +226,21 @@ def render_config(creds: dict) -> None:
         "stats": {},
         "api": {"tag": "api", "services": ["StatsService"]},
         "policy": {
-            "levels": {"0": {"statsUserUplink": True, "statsUserDownlink": True}},
+            # Таймауты выставлены явно, потому что умолчания движка рвут
+            # длинные соединения: connIdle 300 закрывает всё, что молчит
+            # пять минут (ssh, imap, вебсокеты мессенджеров), а uplinkOnly 2
+            # и downlinkOnly 5 добивают вторую половину соединения сразу
+            # после закрытия первой, обрезая хвост больших ответов. Те же
+            # значения стоят на входе каскада в панели — плечо одно, и
+            # таймауты на его концах расходиться не должны.
+            "levels": {"0": {
+                "statsUserUplink": True,
+                "statsUserDownlink": True,
+                "handshake": 8,
+                "connIdle": 900,
+                "uplinkOnly": 0,
+                "downlinkOnly": 0,
+            }},
             "system": {"statsInboundUplink": True, "statsInboundDownlink": True},
         },
         "inbounds": [

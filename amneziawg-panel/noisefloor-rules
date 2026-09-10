@@ -20,7 +20,8 @@
 #
 # Использование:
 #   noisefloor-rules up --iface awg0 --egress eth0 \
-#       [--cascade-port 12345] [--mode tproxy|redirect|off] [--isolate-clients]
+#       [--cascade-port 12345] [--cascade-dns-port 12353] \
+#       [--mode tproxy|redirect|off] [--isolate-clients] [--block-quic]
 #   noisefloor-rules down --iface awg0 --egress eth0
 
 set -u
@@ -28,8 +29,10 @@ set -u
 IFACE=""
 EGRESS=""
 CASCADE_PORT=""
+CASCADE_DNS_PORT=""
 MODE="off"
 ISOLATE="no"
+BLOCK_QUIC="no"
 MARK=1
 RT_TABLE=100
 
@@ -37,6 +40,7 @@ FWD_CHAIN="NOISEFLOOR-FWD"
 NAT_POST_CHAIN="NOISEFLOOR-POST"
 NAT_PRE_CHAIN="NOISEFLOOR-PRE"
 MANGLE_PRE_CHAIN="NOISEFLOOR-TPROXY"
+IN_CHAIN="NOISEFLOOR-IN"
 
 # Адреса, которые никогда не заворачиваем в каскад: сам туннель, локалхост,
 # служебные диапазоны. Иначе клиент не достучится ни до соседа по туннелю,
@@ -68,8 +72,10 @@ parse_args() {
             --iface)         IFACE="$2"; shift 2 ;;
             --egress)        EGRESS="$2"; shift 2 ;;
             --cascade-port)  CASCADE_PORT="$2"; shift 2 ;;
+            --cascade-dns-port) CASCADE_DNS_PORT="$2"; shift 2 ;;
             --mode)          MODE="$2"; shift 2 ;;
             --isolate-clients) ISOLATE="yes"; shift ;;
+            --block-quic)    BLOCK_QUIC="yes"; shift ;;
             *) die "неизвестный аргумент: $1" ;;
         esac
     done
@@ -91,12 +97,32 @@ cmd_up() {
         iptables -t filter -A "$FWD_CHAIN" -i "$IFACE" -o "$IFACE" -j DROP
     fi
 
+    if [ "$BLOCK_QUIC" = "yes" ]; then
+        # QUIC (HTTP/3) — это UDP, и в режиме redirect он физически не может
+        # попасть в каскад: уходит напрямую с настоящим адресом сервера.
+        # Получается расщепление — сайт видит один IP по TCP и другой по
+        # QUIC; браузер при этом предпочитает QUIC, так что через каскад
+        # идёт меньшая часть трафика, а YouTube и прочие тяжёлые сервисы
+        # ходят мимо. Закрываем порт с icmp-port-unreachable: браузер
+        # мгновенно откатывается на TCP, а не ждёт таймаута.
+        iptables -t filter -A "$FWD_CHAIN" -i "$IFACE" -p udp --dport 443 \
+            -j REJECT --reject-with icmp-port-unreachable
+    fi
+
     iptables -t filter -A "$FWD_CHAIN" -i "$IFACE" -j ACCEPT
     iptables -t filter -A "$FWD_CHAIN" -o "$IFACE" -j ACCEPT
     # Клиент не знает реального path MTU до сервера; без клэмпа крупные
     # TCP-сегменты молча теряются на сетях с меньшим MTU (мобильный интернет,
     # второй VPN поверх), а мелкие проходят — классическая PMTU black hole.
+    #
+    # Клэмп нужен в ОБЕ стороны: MSS объявляется каждой стороной в своём
+    # SYN, и раньше правился только клиентский SYN. SYN-ACK удалённого
+    # сервера уходил нетронутым, тот продолжал слать сегменты под свой MTU
+    # 1500 — и в туннель они не влезали. Симптом ровно тот же: мелкие
+    # страницы открываются, крупные загрузки встают.
     iptables -t filter -A "$FWD_CHAIN" -i "$IFACE" -o "$EGRESS" \
+        -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
+    iptables -t filter -A "$FWD_CHAIN" -i "$EGRESS" -o "$IFACE" \
         -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
     ensure_jump filter FORWARD "$FWD_CHAIN"
 
@@ -117,12 +143,31 @@ cmd_up() {
             ;;
         redirect)
             [ -n "$CASCADE_PORT" ] || die "режим redirect требует --cascade-port"
-            # Только TCP: у REDIRECT нет аналога для UDP. QUIC и DNS уйдут
-            # мимо каскада — режим оставлен как запасной путь отката.
+            # Произвольный UDP через REDIRECT не заворачивается: исходный
+            # адрес назначения на UDP-сокете не восстановить без TPROXY.
+            # DNS — исключение: ему всё равно, кто ответит, поэтому запрос
+            # можно отдать своему слушателю и уже он сходит наружу по TCP
+            # через каскад (см. --cascade-dns-port).
             ensure_chain nat "$NAT_PRE_CHAIN"
+            # Служебные адреса мимо каскада. В tproxy-режиме такое
+            # исключение было с самого начала, а здесь его не было: TCP к
+            # самой панели (10.13.13.1:8000) и к соседям по туннелю уезжал
+            # в каскад, где релей пытался соединиться с приватным адресом
+            # у себя — соединение просто умирало по таймауту.
+            for net in $LOCAL_NETS; do
+                iptables -t nat -A "$NAT_PRE_CHAIN" -i "$IFACE" -d "$net" -j RETURN
+            done
+            if [ -n "$CASCADE_DNS_PORT" ]; then
+                iptables -t nat -A "$NAT_PRE_CHAIN" -i "$IFACE" -p udp --dport 53 \
+                    -j REDIRECT --to-ports "$CASCADE_DNS_PORT"
+            fi
             iptables -t nat -A "$NAT_PRE_CHAIN" -i "$IFACE" -p tcp -j REDIRECT --to-ports "$CASCADE_PORT"
             ensure_jump nat PREROUTING "$NAT_PRE_CHAIN"
-            log "каскад в режиме redirect (только TCP), порт $CASCADE_PORT"
+            if [ -n "$CASCADE_DNS_PORT" ]; then
+                log "каскад в режиме redirect (TCP порт $CASCADE_PORT, DNS порт $CASCADE_DNS_PORT)"
+            else
+                log "каскад в режиме redirect (только TCP), порт $CASCADE_PORT"
+            fi
             ;;
         tproxy)
             [ -n "$CASCADE_PORT" ] || die "режим tproxy требует --cascade-port"
@@ -144,6 +189,26 @@ cmd_up() {
             die "неизвестный режим: $MODE"
             ;;
     esac
+
+    # --- порт перехвата не должен торчать в интернет ---
+    # Слушатель каскада обязан висеть на 0.0.0.0 (REDIRECT переписывает
+    # адрес назначения на адрес awg0, а не на loopback), поэтому его порт
+    # виден снаружи. В логе движка это выглядит как поток "loopback
+    # connection detected" от сканеров — каждый, кто подключится с eth0,
+    # получает адресом назначения сам слушатель. Пускаем на эти порты
+    # только туннель и локалхост.
+    drop_chain filter INPUT "$IN_CHAIN"
+    if [ "$MODE" != "off" ] && [ -n "$CASCADE_PORT" ]; then
+        ensure_chain filter "$IN_CHAIN"
+        iptables -t filter -A "$IN_CHAIN" -i "$IFACE" -j RETURN
+        iptables -t filter -A "$IN_CHAIN" -i lo -j RETURN
+        iptables -t filter -A "$IN_CHAIN" -p tcp --dport "$CASCADE_PORT" -j DROP
+        iptables -t filter -A "$IN_CHAIN" -p udp --dport "$CASCADE_PORT" -j DROP
+        if [ -n "$CASCADE_DNS_PORT" ]; then
+            iptables -t filter -A "$IN_CHAIN" -p udp --dport "$CASCADE_DNS_PORT" -j DROP
+        fi
+        ensure_jump filter INPUT "$IN_CHAIN"
+    fi
 }
 
 # TPROXY отдаёт помеченные пакеты локальному сокету, а для этого ядру нужен
@@ -166,6 +231,7 @@ teardown_tproxy_routing() {
 
 cmd_down() {
     drop_chain filter FORWARD "$FWD_CHAIN"
+    drop_chain filter INPUT "$IN_CHAIN"
     drop_chain nat POSTROUTING "$NAT_POST_CHAIN"
     drop_chain nat PREROUTING "$NAT_PRE_CHAIN"
     drop_chain mangle PREROUTING "$MANGLE_PRE_CHAIN"
