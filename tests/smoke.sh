@@ -14,6 +14,7 @@
 #   tests/smoke.sh                       # оба сервиса, образы :latest
 #   tests/smoke.sh --relay-only
 #   tests/smoke.sh --panel-only
+#   tests/smoke.sh --rules-only
 #   RELAY_IMAGE=... PANEL_IMAGE=... tests/smoke.sh
 #
 # Работает на bridge-сети с портами из диапазона 291xx, поэтому безопасен
@@ -290,6 +291,52 @@ test_rules() {
     else
         fail "после down остались следы правил"
     fi
+
+    # Режим redirect — не «то же самое, но без UDP»: у него своя половина
+    # правил, и каждая из них закрывает уже случавшуюся поломку.
+    out="$(docker run --rm --cap-add NET_ADMIN --cap-add NET_RAW \
+        --entrypoint sh "$PANEL_IMAGE" -c '
+        set -e
+        ip link add awg0 type dummy && ip addr add 10.13.13.1/24 dev awg0 && ip link set awg0 up
+        noisefloor-rules up --iface awg0 --egress eth0 --cascade-port 12345 \
+            --mode redirect --block-quic --isolate-clients >/dev/null
+        # Служебные сети обязаны обойти каскад РАНЬШЕ правила перехвата.
+        # Сравниваем позиции, а не считаем строки: набор исключений ещё
+        # будет меняться, и тест не должен ломаться от каждой новой сети.
+        echo "last_return=$(iptables -t nat -S NOISEFLOOR-PRE | grep -n "j RETURN" | tail -1 | cut -d: -f1)"
+        echo "first_redirect=$(iptables -t nat -S NOISEFLOOR-PRE | grep -n "p tcp -j REDIRECT" | head -1 | cut -d: -f1)"
+        echo "quic=$(iptables -S NOISEFLOOR-FWD | grep -c "dport 443 -j REJECT")"
+        echo "mss=$(iptables -S NOISEFLOOR-FWD | grep -c TCPMSS)"
+        echo "port_closed=$(iptables -S NOISEFLOOR-IN | grep -c "dport 12345 -j DROP")"
+        noisefloor-rules down --iface awg0 --egress eth0 >/dev/null
+        echo "left=$(iptables-save | grep -c NOISEFLOOR || true)"
+    ' 2>/dev/null)"
+
+    local last_return first_redirect
+    last_return="$(printf '%s' "$out" | grep "^last_return=" | cut -d= -f2)"
+    first_redirect="$(printf '%s' "$out" | grep "^first_redirect=" | cut -d= -f2)"
+    if [ -n "$last_return" ] && [ -n "$first_redirect" ] && [ "$last_return" -lt "$first_redirect" ]; then
+        pass "служебные сети обходят каскад раньше правила перехвата"
+    else
+        fail "в redirect-режиме TCP к панели и соседям по туннелю уедет в каскад"
+    fi
+
+    check quic 1 \
+        && pass "QUIC закрыт отказом — браузер сразу возьмёт TCP" \
+        || fail "QUIC уйдёт мимо каскада с настоящим адресом сервера"
+
+    check mss 2 \
+        && pass "MSS подрезается в обе стороны" \
+        || fail "MSS правится только в одну сторону — крупные загрузки встанут"
+
+    # Две строки: TCP и UDP — порт перехвата закрывается для обоих.
+    check port_closed 2 \
+        && pass "порт перехвата закрыт для всех, кроме туннеля" \
+        || fail "служебный порт каскада виден из интернета"
+
+    check left 0 \
+        && pass "down убирает и правила redirect-режима" \
+        || fail "после down остались следы правил redirect-режима"
 }
 
 # ------------------------------------------------------------------ main ----

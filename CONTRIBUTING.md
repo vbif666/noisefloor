@@ -34,9 +34,13 @@ docker build -t noisefloor-relay:dev vless-reality
 ```bash
 docker run --rm \
     -v "$PWD/amneziawg-panel/src:/src" -v "$PWD/tests/unit:/tests:ro" \
+    -v "$PWD/amneziawg-panel/noisefloor-rules:/usr/local/bin/noisefloor-rules:ro" \
     -e PYTHONPATH=/src -w /src noisefloor-panel:dev \
     python3 -m unittest discover -s /tests -p 'test_*.py' -v
 ```
+
+Третий том — не лишний: часть тестов читает сам скрипт правил, и без него
+проверялась бы копия из образа, а не та, которую вы только что поправили.
 
 ### Приёмочный тест
 
