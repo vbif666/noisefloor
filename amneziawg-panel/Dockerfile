@@ -12,6 +12,10 @@ ARG GO_VERSION=1.27.1
 ARG AWG_GO_REF=v3.1.20260828
 ARG AWG_TOOLS_REF=v3.1.20260812
 ARG XRAY_VERSION=v26.7.28
+# База geoip для разделения маршрутов: по ней движок отличает российский
+# адрес от прочих. Версия закреплена так же, как всё остальное — обновление
+# базы это осознанная пересборка, а не «что там сегодня в latest».
+ARG GEOIP_REF=202609092346
 
 # ------------------------ сборка: amneziawg-go + amneziawg-tools ----------
 FROM debian:bookworm-slim AS awg-build
@@ -64,11 +68,30 @@ RUN set -eux; \
     [ -n "$expected" ] && [ "$expected" = "$actual" ]; \
     unzip -oq Xray-linux-64.zip -d /out
 
+# ------------------------------------- загрузка geoip.dat (с проверкой) ---
+FROM debian:bookworm-slim AS geoip-fetch
+ARG GEOIP_REF
+
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /tmp/geoip
+RUN set -eux; \
+    base="https://github.com/Loyalsoldier/v2ray-rules-dat/releases/download/${GEOIP_REF}"; \
+    curl -fsSL -o geoip.dat "${base}/geoip.dat"; \
+    curl -fsSL -o geoip.dat.sha256sum "${base}/geoip.dat.sha256sum"; \
+    expected="$(cut -d' ' -f1 geoip.dat.sha256sum | tr -d ' \r')"; \
+    actual="$(sha256sum geoip.dat | cut -d' ' -f1)"; \
+    echo "geoip ${GEOIP_REF}: ожидалось $expected, получено $actual"; \
+    [ -n "$expected" ] && [ "$expected" = "$actual" ]; \
+    mkdir -p /out && mv geoip.dat /out/geoip.dat
+
 # ------------------------------------------------------------- рантайм ---
 FROM python:3.12-slim-bookworm
 ARG AWG_GO_REF
 ARG AWG_TOOLS_REF
 ARG XRAY_VERSION
+ARG GEOIP_REF
 
 # bash — awg-quick это bash-скрипт; iproute2/iptables/nftables — поднятие
 # интерфейса и правила; curl — проверка обновлений и HEALTHCHECK.
@@ -80,6 +103,9 @@ COPY --from=awg-build  /build/awg-go/amneziawg-go              /usr/local/bin/am
 COPY --from=awg-build  /build/awg-tools/src/wg                 /usr/local/bin/awg
 COPY --from=awg-build  /build/awg-tools/src/wg-quick/linux.bash /usr/local/bin/awg-quick
 COPY --from=xray-fetch /out/xray                               /usr/local/bin/xray
+# Движок ищет базы в каталоге ассетов; сюда же их кладут все стандартные
+# сборки, поэтому путь оставлен по умолчанию.
+COPY --from=geoip-fetch /out/geoip.dat                         /usr/local/share/xray/geoip.dat
 RUN chmod +x /usr/local/bin/amneziawg-go /usr/local/bin/awg \
              /usr/local/bin/awg-quick /usr/local/bin/xray
 
@@ -88,6 +114,7 @@ RUN chmod +x /usr/local/bin/amneziawg-go /usr/local/bin/awg \
 ENV AWG_GO_BUILT_REF=${AWG_GO_REF} \
     AWG_TOOLS_BUILT_REF=${AWG_TOOLS_REF} \
     XRAY_BUILT_REF=${XRAY_VERSION} \
+    GEOIP_BUILT_REF=${GEOIP_REF} \
     PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1
 

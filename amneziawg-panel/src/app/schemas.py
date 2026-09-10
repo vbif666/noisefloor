@@ -56,6 +56,7 @@ class ServerRead(BaseModel):
     cascade_enabled: bool
     cascade_vless_url: str
     cascade_last_error: str | None
+    split_ru_direct: bool = False
     cascade_sync_url: str = ""
     cascade_sync_token: str = ""
     cascade_sync_error: str | None = None
@@ -91,6 +92,7 @@ class ServerUpdate(BaseModel):
     egress_interface: str | None = None
     cascade_enabled: bool | None = None
     cascade_vless_url: str | None = None
+    split_ru_direct: bool | None = None
     cascade_sync_url: str | None = None
     cascade_sync_token: str | None = None
     jc: int | None = Field(default=None, ge=0, le=128)

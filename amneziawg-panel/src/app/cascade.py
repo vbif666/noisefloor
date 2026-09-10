@@ -52,6 +52,11 @@ REDIRECT_PORT = 12345
 DNS_REDIRECT_PORT = 12353
 STATS_API_ADDR = "127.0.0.1:10086"
 
+# База geoip лежит в каталоге ассетов движка (кладётся в образ, версия
+# закреплена в Dockerfile). Без неё правило geoip:ru не с чем сверять, и
+# разделение маршрутов включать нельзя — молча уехало бы всё в каскад.
+GEOIP_PATH = Path("/usr/local/share/xray/geoip.dat")
+
 # Локальный socks-вход, через который панель сама ходит наружу, чтобы
 # проверить каскад по-настоящему. Без него "здоровье" каскада измеряется
 # фактом живости процесса — а именно этот показатель месяц врал, показывая
@@ -85,7 +90,11 @@ _health: dict = {
 
 _lock = threading.Lock()
 _proc: subprocess.Popen | None = None
-_last_url: str | None = None
+# Конфиг, с которым запущен текущий процесс. Раньше здесь лежала только
+# ссылка vless://, и от неё зависело решение «перезапускать или нет» — из-за
+# чего смена любой ДРУГОЙ настройки (режим перехвата, разделение маршрутов,
+# DNS) до движка не доезжала: ссылка та же, значит «ничего не изменилось».
+_last_config: dict | None = None
 
 
 class VlessParseError(ValueError):
@@ -144,7 +153,32 @@ def dns_via_cascade() -> bool:
     return bool(getattr(settings, "cascade_dns_via_cascade", False)) and not _tproxy_mode()
 
 
-def build_xray_config(params: dict, dns_server: str = "1.1.1.1") -> dict:
+def geoip_available() -> bool:
+    return GEOIP_PATH.exists()
+
+
+def _split_ru_rules() -> list[dict]:
+    """Правила разделения: российские адреса — напрямую, остальное — в каскад.
+
+    Порядок здесь не косметика, а суть механизма. Выученные исключения
+    (ruleTag nf-fallback, наполняется на следующем этапе) обязаны стоять
+    ВЫШЕ правила geoip:ru: адрес числится российским, но не отвечает —
+    значит идём в каскад, а не долбимся в него напрямую.
+
+    Сам список исключений здесь пуст: его на ходу подменяет панель через
+    `xray api adrules`, не перезапуская движок и не рвя соединения.
+    """
+    return [
+        {"ruleTag": "nf-private", "type": "field", "inboundTag": ["cascade-in"],
+         "ip": ["geoip:private"], "outboundTag": "direct"},
+        {"ruleTag": "nf-fallback", "type": "field", "inboundTag": ["cascade-in"],
+         "ip": ["0.0.0.0/32"], "outboundTag": "cascade-out"},
+        {"ruleTag": "nf-ru", "type": "field", "inboundTag": ["cascade-in"],
+         "ip": ["geoip:ru"], "outboundTag": "direct"},
+    ]
+
+
+def build_xray_config(params: dict, dns_server: str = "1.1.1.1", split_ru_direct: bool = False) -> dict:
     dns_inbounds = []
     dns_outbounds = []
     dns_rules = []
@@ -167,7 +201,21 @@ def build_xray_config(params: dict, dns_server: str = "1.1.1.1") -> dict:
         })
         dns_rules.append({"type": "field", "inboundTag": ["dns-in"], "outboundTag": "dns-out"})
 
+    # Вход каскада разбирает домен из TLS/HTTP, поэтому до правил доезжает
+    # имя, а не адрес, — и чтобы geoip:ru вообще срабатывал, движку нужно
+    # сначала разрешить имя (domainStrategy ниже).
+    #
+    # servers: localhost — это системный резолвер, и запрос уходит мимо
+    # маршрутизации. С явным адресом (1.1.1.1) служебные запросы самого
+    # движка попадали под правило «всё остальное» и уезжали в каскад: на
+    # каждое определение «российский адрес или нет» получался поход в
+    # Амстердам и обратно. Проверено на живом сервере.
+    dns_block = {}
+    if split_ru_direct:
+        dns_block = {"dns": {"servers": ["localhost"], "queryStrategy": "UseIPv4"}}
+
     return {
+        **dns_block,
         # access: none — иначе движок пишет строку на КАЖДОЕ соединение
         # клиента в тот же файл, куда идут ошибки. На проде это 23 МБ за
         # четыре дня и постоянная запись на диск ради данных, которые
@@ -175,7 +223,10 @@ def build_xray_config(params: dict, dns_server: str = "1.1.1.1") -> dict:
         # Ротация (_rotate_log_if_needed) от роста спасала лишь на старте.
         "log": {"loglevel": "warning", "access": "none"},
         "stats": {},
-        "api": {"tag": "api", "services": ["StatsService"]},
+        # RoutingService нужен, чтобы менять набор правил на ходу
+        # (`xray api adrules`): таблица исключений меняется часто, а
+        # перезапуск движка рвёт все соединения клиентов разом.
+        "api": {"tag": "api", "services": ["StatsService", "RoutingService"]},
         "policy": {
             # Без этого блока действуют умолчания движка, а они для
             # прокси-режима вредны:
@@ -276,16 +327,31 @@ def build_xray_config(params: dict, dns_server: str = "1.1.1.1") -> dict:
                 },
             },
             *dns_outbounds,
-            {"tag": "direct", "protocol": "freedom"},
+            # UseIPv4: адрес для прямого соединения берётся у DNS движка
+            # (то есть из его кэша), и берётся именно v4. Без этого имя
+            # разрешалось второй раз, системным резолвером, и российский
+            # сайт с записью AAAA уезжал в IPv6 — которого в туннеле нет.
+            {"tag": "direct", "protocol": "freedom", "settings": {"domainStrategy": "UseIPv4"}},
             {"tag": "block", "protocol": "blackhole"},
         ],
         "routing": {
+            # AsIs, пока разделения нет: сравнивать домен с geoip незачем,
+            # а разрешение имён стоило бы запроса на каждое соединение.
+            #
+            # Именно IPOnDemand, а не IPIfNonMatch: последний разрешает имя
+            # только если НИ ОДНО правило не совпало, а у нас есть правило
+            # «всё остальное» — оно совпадает на первом же проходе, по тегу
+            # входа, и до geoip дело не доходит никогда. С этим разделение
+            # выглядело работающим, а весь трафик шёл в каскад.
+            **({"domainStrategy": "IPOnDemand"} if split_ru_direct else {}),
             "rules": [
-                {"type": "field", "inboundTag": ["api-in"], "outboundTag": "api"},
-                {"type": "field", "inboundTag": ["cascade-in"], "outboundTag": "cascade-out"},
+                {"ruleTag": "nf-api", "type": "field", "inboundTag": ["api-in"], "outboundTag": "api"},
+                *(_split_ru_rules() if split_ru_direct else []),
+                {"ruleTag": "nf-default", "type": "field", "inboundTag": ["cascade-in"], "outboundTag": "cascade-out"},
                 # Проба обязана идти тем же путём, что и клиентский трафик,
-                # иначе она проверяет не то.
-                {"type": "field", "inboundTag": ["probe-in"], "outboundTag": "cascade-out"},
+                # иначе она проверяет не то. Правил разделения она не
+                # касается: её задача — проверить именно каскад.
+                {"ruleTag": "nf-probe", "type": "field", "inboundTag": ["probe-in"], "outboundTag": "cascade-out"},
                 *dns_rules,
             ]
         },
@@ -293,7 +359,7 @@ def build_xray_config(params: dict, dns_server: str = "1.1.1.1") -> dict:
 
 
 def _stop_locked() -> None:
-    global _proc, _last_url
+    global _proc, _last_config
     if _proc is not None and _proc.poll() is None:
         _proc.terminate()
         try:
@@ -301,7 +367,7 @@ def _stop_locked() -> None:
         except subprocess.TimeoutExpired:
             _proc.kill()
     _proc = None
-    _last_url = None
+    _last_config = None
 
 
 def is_running() -> bool:
@@ -314,7 +380,7 @@ def sync(server) -> str | None:
     либо каскад просто выключен). Вызывается из config_sync.apply_current_config,
     то есть при каждом сохранении/apply/restart настроек сервера — best effort,
     как и всё остальное управление в этой панели."""
-    global _proc, _last_url
+    global _proc, _last_config
     with _lock:
         if not getattr(server, "cascade_enabled", False) or not (server.cascade_vless_url or "").strip():
             _stop_locked()
@@ -330,16 +396,28 @@ def sync(server) -> str | None:
             _stop_locked()
             return str(exc)
 
-        # Если уже работаем с той же самой ссылкой — не дёргаем процесс зря
-        # (иначе каждое сохранение любого поля сервера рвало бы уже
-        # установленное каскадное соединение).
-        if is_running() and _last_url == server.cascade_vless_url:
+        dns_server = (getattr(server, "dns", "") or "1.1.1.1").split(",")[0].strip()
+
+        # Разделение включают в панели, но работать оно может только при
+        # наличии базы geoip. Если базы нет — собираем обычный конфиг (весь
+        # трафик в каскад, как раньше) и говорим об этом вслух: молча
+        # проигнорировать включённую настройку хуже, чем не включить её.
+        split = bool(getattr(server, "split_ru_direct", False))
+        geoip_missing = split and not geoip_available()
+        if geoip_missing:
+            split = False
+
+        config = build_xray_config(params, dns_server, split_ru_direct=split)
+
+        # Ничего не поменялось — не трогаем работающий процесс: перезапуск
+        # рвёт все установленные соединения клиентов разом, а сохранение
+        # настроек сервера случается по любому поводу.
+        if is_running() and _last_config == config:
             return None
 
         _stop_locked()
         CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
-        dns_server = (getattr(server, "dns", "") or "1.1.1.1").split(",")[0].strip()
-        CONFIG_PATH.write_text(json.dumps(build_xray_config(params, dns_server), indent=2))
+        CONFIG_PATH.write_text(json.dumps(config, indent=2))
         CONFIG_PATH.chmod(0o600)
         # Запоминаем, где кончается лог, чтобы потом читать только то, что
         # написал именно этот запуск, а не жалобы прошлого.
@@ -352,13 +430,18 @@ def sync(server) -> str | None:
             )
         except OSError as exc:
             return f"Не удалось запустить xray: {exc}"
-        _last_url = server.cascade_vless_url
+        _last_config = config
         try:
             _proc.wait(timeout=0.4)
         except subprocess.TimeoutExpired:
             pass
         if not is_running():
             return "xray сразу завершился после запуска — проверьте ссылку vless:// (эндпоинт недоступен?)"
+        if geoip_missing:
+            return (
+                f"Разделение маршрутов включено, но базы geoip нет ({GEOIP_PATH}) — "
+                "весь трафик идёт через каскад. Обновите образ панели: база кладётся в него при сборке."
+            )
         return _tproxy_sockopt_error(log_offset)
 
 

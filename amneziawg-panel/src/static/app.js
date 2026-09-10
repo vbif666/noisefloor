@@ -271,6 +271,7 @@ function fillServerForm(s) {
   $("f-egress").value = s.egress_interface || "";
   $("f-mtu").value = s.mtu || "";
   $("f-cascade-enabled").checked = !!s.cascade_enabled;
+  $("f-split-ru-direct").checked = !!s.split_ru_direct;
   $("f-cascade-sync-url").value = s.cascade_sync_url || "";
   $("f-cascade-sync-token").value = s.cascade_sync_token || "";
   $("f-jc").value = s.jc;
@@ -316,6 +317,7 @@ $("server-form").addEventListener("submit", async (e) => {
     egress_interface: $("f-egress").value.trim(),
     mtu: $("f-mtu").value ? Number($("f-mtu").value) : null,
     cascade_enabled: $("f-cascade-enabled").checked,
+    split_ru_direct: $("f-split-ru-direct").checked,
     cascade_sync_url: $("f-cascade-sync-url").value.trim(),
     cascade_sync_token: $("f-cascade-sync-token").value.trim(),
     jc: Number($("f-jc").value),

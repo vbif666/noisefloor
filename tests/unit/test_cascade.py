@@ -283,5 +283,105 @@ class TrafficStatsCacheTests(unittest.TestCase):
         self.assertEqual(self.calls, 1)
 
 
+class SplitRuRoutingTests(unittest.TestCase):
+    """Разделение маршрутов: российские адреса напрямую, остальное в каскад.
+
+    Порядок правил здесь — не косметика. Выученные исключения обязаны
+    стоять выше geoip:ru, иначе фоллбек не работает: адрес числится
+    российским, не отвечает — и клиент продолжает долбиться в него
+    напрямую вместо того, чтобы уйти через каскад."""
+
+    def _config(self, split):
+        return cascade.build_xray_config(cascade.parse_vless_url(VALID_URL), "1.1.1.1", split_ru_direct=split)
+
+    def _tags(self, config):
+        return [r.get("ruleTag") for r in config["routing"]["rules"]]
+
+    def test_off_by_default_keeps_everything_in_cascade(self):
+        config = self._config(False)
+        self.assertNotIn("nf-ru", self._tags(config))
+        # Разрешение имён включать незачем, пока сравнивать не с чем.
+        self.assertNotIn("domainStrategy", config["routing"])
+        self.assertNotIn("dns", config)
+
+    def test_exceptions_are_checked_before_geoip(self):
+        tags = self._tags(self._config(True))
+        self.assertLess(tags.index("nf-fallback"), tags.index("nf-ru"))
+
+    def test_geoip_rule_goes_direct_and_default_goes_to_cascade(self):
+        rules = {r.get("ruleTag"): r for r in self._config(True)["routing"]["rules"]}
+        self.assertEqual(rules["nf-ru"]["ip"], ["geoip:ru"])
+        self.assertEqual(rules["nf-ru"]["outboundTag"], "direct")
+        self.assertEqual(rules["nf-fallback"]["outboundTag"], "cascade-out")
+        self.assertEqual(rules["nf-default"]["outboundTag"], "cascade-out")
+
+    def test_default_rule_is_last_among_client_rules(self):
+        tags = self._tags(self._config(True))
+        for tag in ("nf-private", "nf-fallback", "nf-ru"):
+            self.assertLess(tags.index(tag), tags.index("nf-default"))
+
+    def test_names_are_resolved_on_demand_not_only_on_no_match(self):
+        """Регрессия, найденная на живом трафике 2026-09-10.
+
+        С IPIfNonMatch разделение выглядело рабочим, а весь трафик шёл в
+        каскад: этот режим разрешает имя только когда НИ ОДНО правило не
+        совпало, — а правило «всё остальное» совпадает на первом же
+        проходе, по тегу входа. До geoip очередь не доходила никогда."""
+        self.assertEqual(self._config(True)["routing"]["domainStrategy"], "IPOnDemand")
+
+    def test_engine_dns_does_not_go_through_the_cascade(self):
+        """Тоже с живого сервера: с явным адресом DNS-сервера служебные
+        запросы движка попадали под «всё остальное» и уезжали в каскад —
+        каждое определение «российский адрес или нет» стоило похода в
+        Амстердам. localhost уходит мимо маршрутизации."""
+        self.assertEqual(self._config(True)["dns"]["servers"], ["localhost"])
+
+    def test_direct_outbound_resolves_to_ipv4(self):
+        # Иначе российский сайт с записью AAAA уезжает в IPv6, которого в
+        # туннеле нет.
+        direct = {o["tag"]: o for o in self._config(True)["outbounds"]}["direct"]
+        self.assertEqual(direct["settings"]["domainStrategy"], "UseIPv4")
+
+    def test_probe_still_goes_through_cascade(self):
+        # Проба проверяет каскад, а не разделение: её маршрут неизменен.
+        rules = [r for r in self._config(True)["routing"]["rules"] if "probe-in" in r.get("inboundTag", [])]
+        self.assertEqual(rules[0]["outboundTag"], "cascade-out")
+
+    def test_routing_api_is_enabled(self):
+        # Без RoutingService таблицу исключений нельзя менять на ходу —
+        # только перезапуском движка, то есть обрывом всех соединений.
+        self.assertIn("RoutingService", self._config(True)["api"]["services"])
+
+
+class ConfigChangeDetectionTests(unittest.TestCase):
+    """Решение «перезапускать движок или нет» принимается по конфигу
+    целиком. Раньше сравнивалась только ссылка vless://, и смена любой
+    другой настройки — режима перехвата, разделения маршрутов, DNS — до
+    движка молча не доезжала."""
+
+    def _config(self, **kwargs):
+        return cascade.build_xray_config(cascade.parse_vless_url(VALID_URL), **kwargs)
+
+    def test_split_toggle_changes_config(self):
+        self.assertNotEqual(self._config(split_ru_direct=False), self._config(split_ru_direct=True))
+
+    def test_dns_change_changes_config(self):
+        with mock.patch.object(cascade.settings, "cascade_dns_via_cascade", True, create=True), \
+                mock.patch.object(cascade.settings, "cascade_intercept_mode", "redirect"):
+            self.assertNotEqual(self._config(dns_server="1.1.1.1"), self._config(dns_server="9.9.9.9"))
+
+    def test_same_input_gives_identical_config(self):
+        self.assertEqual(self._config(), self._config())
+
+
+class GeoipGuardTests(unittest.TestCase):
+    """Разделение без базы geoip — это молча уехавший в каскад трафик при
+    включённой настройке. Панель обязана заметить и сказать."""
+
+    def test_missing_database_is_detectable(self):
+        with mock.patch.object(cascade, "GEOIP_PATH", pathlib.Path("/nonexistent/geoip.dat")):
+            self.assertFalse(cascade.geoip_available())
+
+
 if __name__ == "__main__":
     unittest.main()

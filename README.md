@@ -219,6 +219,7 @@ docker exec NOISEFLOOR-amneziawg-panel cat /opt/panel/data/INITIAL_ADMIN_PASSWOR
 | `DEFAULT_LISTEN_PORT` | `443` | UDP-порт приёма клиентов |
 | `DEFAULT_DNS` | `1.1.1.1` | DNS, который получают клиенты |
 | `CASCADE_INTERCEPT_MODE` | `tproxy` | `tproxy` — TCP и UDP через каскад; `redirect` — только TCP (откат) |
+| `GEOIP_REF` (сборка) | `202609092346` | Версия базы geoip в образе — по ней работает разделение маршрутов |
 | `CASCADE_BLOCK_QUIC` | `true` | В режиме `redirect` закрывать клиентам QUIC (UDP/443): иначе браузер уводит основную часть трафика мимо каскада и с другим IP |
 | `CASCADE_DNS_VIA_CASCADE` | `false` | В режиме `redirect` заворачивать DNS клиентов в каскад (запрос уходит по TCP через релей) |
 | `CASCADE_SYNC_URL` | пусто | Адрес панели релея. Задан — параметры каскада берутся оттуда автоматически |
@@ -266,7 +267,7 @@ vless-reality/            релей: FastAPI + xray, одно приложен�
   src/app.py
 
 tests/
-  unit/                   96 тестов, stdlib unittest, без зависимостей
+  unit/                   109 тестов, stdlib unittest, без зависимостей
   smoke.sh                приёмочный: поднимает оба сервиса с нуля
 
 docs/                     DEPLOY, ARCHITECTURE, OPERATIONS

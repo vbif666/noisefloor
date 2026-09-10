@@ -171,6 +171,19 @@
               </label>
             </div>
             <div class="field-group">
+              <label for="f-split-ru-direct" style="display:flex; align-items:center; gap:8px;">
+                <input id="f-split-ru-direct" type="checkbox" style="width:auto;" /> Российские адреса — напрямую, мимо каскада
+              </label>
+              <p class="field-hint">
+                До российского сайта незачем ходить через релей: это лишние два хопа
+                и заметная задержка, а часть таких сайтов зарубежные адреса и вовсе
+                не пускает. Российский адрес определяется по базе geoip, всё
+                остальное продолжает уходить в каскад.
+                <strong>Обратная сторона:</strong> такие сайты увидят настоящий адрес
+                этого сервера, а не адрес релея.
+              </p>
+            </div>
+            <div class="field-group">
               <span class="eyebrow">Синхронизация с релеем</span>
               <p class="field-hint" style="margin-top:6px;">
                 Укажите адрес релея и его токен — панель будет сама забирать оттуда
