@@ -136,6 +136,7 @@ class CascadeStatus(BaseModel):
     sync_enabled: bool = False
     sync_error: str | None = None
     synced_at: UtcDatetime | None = None
+    relay_rotation_at: UtcDatetime | None = None
     # Куда и подо что настроен каскад — без uuid и ключей: панель показывает
     # это администратору, а держать перед глазами готовый доступ к релею
     # незачем, тем более что панель работает без TLS.

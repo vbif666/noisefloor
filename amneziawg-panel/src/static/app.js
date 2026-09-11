@@ -399,6 +399,12 @@ function renderCascadeSync(c) {
   if (c.synced_at) {
     const at = new Date(c.synced_at);
     status.textContent = `параметры получены ${timeAgo(at)}`;
+    if (c.relay_rotation_at) {
+      // Релей меняет SNI по расписанию; панель придёт за новыми
+      // параметрами сразу после этого момента.
+      const rot = new Date(c.relay_rotation_at);
+      status.textContent += ` · релей сменит SNI в ${rot.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}`;
+    }
     // Точный момент — подсказкой: относительное время удобно читать, но
     // сразу после нажатия кнопки хочется убедиться, что это именно оно.
     status.title = at.toLocaleString();

@@ -9,6 +9,7 @@
 разойдутся хоть в одном поле, каскад сломается молча.
 """
 import unittest
+from datetime import datetime, timedelta, timezone
 from unittest import mock
 
 from app import cascade, cascade_sync
@@ -108,3 +109,44 @@ class HostOfTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class RotationTimingTests(unittest.TestCase):
+    """Релей меняет SNI по расписанию и объявляет момент заранее. Панель
+    обязана прийти за новыми параметрами сразу после него: иначе каскад
+    лежит до очередного пятиминутного опроса — ровно та тихая поломка,
+    ради которой синхронизация и появилась."""
+
+    NOW = datetime(2026, 9, 11, 12, 0, tzinfo=timezone.utc)
+
+    def test_no_rotation_means_regular_interval(self):
+        self.assertIsNone(cascade_sync.parse_next_rotation(RELAY_ANSWER))
+        self.assertEqual(cascade_sync.wait_seconds(None, self.NOW),
+                         cascade_sync.SYNC_INTERVAL_SECONDS)
+
+    def test_disabled_rotation_is_ignored_even_with_a_time(self):
+        answer = dict(RELAY_ANSWER, rotation={"enabled": False, "next_at": "2026-09-11T16:00:00+00:00"})
+        self.assertIsNone(cascade_sync.parse_next_rotation(answer))
+
+    def test_parses_announced_time(self):
+        answer = dict(RELAY_ANSWER, rotation={"enabled": True, "next_at": "2026-09-11T16:00:00+00:00"})
+        self.assertEqual(cascade_sync.parse_next_rotation(answer),
+                         datetime(2026, 9, 11, 16, 0, tzinfo=timezone.utc))
+
+    def test_garbage_time_does_not_break_sync(self):
+        answer = dict(RELAY_ANSWER, rotation={"enabled": True, "next_at": "скоро"})
+        self.assertIsNone(cascade_sync.parse_next_rotation(answer))
+
+    def test_far_rotation_keeps_regular_interval(self):
+        at = self.NOW + timedelta(hours=3)
+        self.assertEqual(cascade_sync.wait_seconds(at, self.NOW), cascade_sync.SYNC_INTERVAL_SECONDS)
+
+    def test_near_rotation_wakes_just_after_it(self):
+        at = self.NOW + timedelta(seconds=60)
+        self.assertEqual(cascade_sync.wait_seconds(at, self.NOW),
+                         60 + cascade_sync.ROTATION_GRACE_SECONDS)
+
+    def test_overdue_rotation_polls_at_floor_not_busily(self):
+        # Релей объявил, но ещё не переключился: ждём, а не долбим.
+        at = self.NOW - timedelta(seconds=30)
+        self.assertEqual(cascade_sync.wait_seconds(at, self.NOW), cascade_sync.MIN_WAIT_SECONDS)

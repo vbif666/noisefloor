@@ -1,7 +1,7 @@
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 
-from .. import cascade, config_sync
+from .. import cascade, cascade_sync, config_sync
 from ..database import get_db
 from ..obfuscation import random_obfuscation_profile
 from ..schemas import ApplyResult, CascadeStatus, ServerRead, ServerUpdate
@@ -96,8 +96,6 @@ def restart_server_interface(db: Session = Depends(get_db), _admin: str = Depend
 def cascade_sync_now(db: Session = Depends(get_db), _admin: str = Depends(get_current_admin)):
     """Синхронизация по кнопке: не ждать фонового цикла, когда только что
     поменяли настройки на релее."""
-    from .. import cascade_sync
-
     cascade_sync.sync_once(db)
     return cascade_status(db=db, _admin=_admin)
 
@@ -128,6 +126,7 @@ def cascade_status(db: Session = Depends(get_db), _admin: str = Depends(get_curr
         sync_enabled=bool((server.cascade_sync_url or "").strip()),
         sync_error=server.cascade_sync_error,
         synced_at=server.cascade_synced_at,
+        relay_rotation_at=cascade_sync.next_rotation_at,
         verified_ok=health.get("verified_ok"),
         verified_at=health.get("verified_at"),
         verify_error=health.get("verify_error"),

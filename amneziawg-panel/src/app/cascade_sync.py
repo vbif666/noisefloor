@@ -28,6 +28,16 @@ from . import cascade
 SYNC_INTERVAL_SECONDS = 300
 REQUEST_TIMEOUT_SECONDS = 10
 ALLOWED_SCHEMES = ("http", "https")
+# Релей умеет менять SNI по расписанию и объявляет момент смены заранее.
+# Приходим за новыми параметрами чуть позже объявленного времени — релею
+# нужно несколько секунд, чтобы перезапустить свой xray. Если пришли, а он
+# ещё не переключился, повторяем не реже чем раз в MIN_WAIT.
+ROTATION_GRACE_SECONDS = 5
+MIN_WAIT_SECONDS = 10
+
+# Когда релей сменит SNI в следующий раз (по его последнему ответу). Только
+# в памяти: после перезапуска панели узнаем заново на первом же опросе.
+next_rotation_at: datetime | None = None
 
 
 class SyncError(Exception):
@@ -103,6 +113,31 @@ def build_url(params: dict, fallback_host: str = "") -> str:
     return f"vless://{params['uuid']}@{host}:{params['port']}?{encoded}#{label}"
 
 
+def parse_next_rotation(params: dict) -> datetime | None:
+    """Момент следующей смены SNI из ответа релея; None, если ротация
+    выключена или релей старый и про неё не знает."""
+    rotation = params.get("rotation") or {}
+    if not rotation.get("enabled") or not rotation.get("next_at"):
+        return None
+    try:
+        at = datetime.fromisoformat(str(rotation["next_at"]))
+    except ValueError:
+        return None
+    if at.tzinfo is None:
+        at = at.replace(tzinfo=timezone.utc)
+    return at
+
+
+def wait_seconds(next_at: datetime | None, now: datetime | None = None) -> float:
+    """Сколько спать до следующего опроса: обычный интервал, но не позже
+    чем через несколько секунд после объявленной смены SNI."""
+    if next_at is None:
+        return SYNC_INTERVAL_SECONDS
+    now = now or datetime.now(timezone.utc)
+    until = (next_at - now).total_seconds() + ROTATION_GRACE_SECONDS
+    return max(MIN_WAIT_SECONDS, min(SYNC_INTERVAL_SECONDS, until))
+
+
 def host_of(base_url: str) -> str:
     base = (base_url or "").strip()
     if "://" not in base:
@@ -123,6 +158,7 @@ def sync_once(db) -> tuple[bool, str | None]:
     if not (server.cascade_sync_url or "").strip():
         return False, None  # синхронизация не настроена — работаем по ручной ссылке
 
+    global next_rotation_at
     try:
         params = fetch_params(server.cascade_sync_url, server.cascade_sync_token or "")
         new_url = build_url(params, fallback_host=host_of(server.cascade_sync_url))
@@ -132,6 +168,7 @@ def sync_once(db) -> tuple[bool, str | None]:
         db.commit()
         return False, str(exc)
 
+    next_rotation_at = parse_next_rotation(params)
     changed = new_url != (server.cascade_vless_url or "")
     server.cascade_sync_error = None
     server.cascade_synced_at = datetime.now(timezone.utc)
@@ -155,7 +192,7 @@ def sync_once(db) -> tuple[bool, str | None]:
 def run(stop_event: threading.Event) -> None:
     from .database import SessionLocal
 
-    while not stop_event.wait(SYNC_INTERVAL_SECONDS):
+    while not stop_event.wait(wait_seconds(next_rotation_at)):
         db = SessionLocal()
         try:
             sync_once(db)

@@ -42,6 +42,18 @@ docker run --rm \
 Третий том — не лишний: часть тестов читает сам скрипт правил, и без него
 проверялась бы копия из образа, а не та, которую вы только что поправили.
 
+У релея свои тесты (`tests/relay/`) — в его образе, потому что там свой
+`app.py` и свои зависимости. `DATA_DIR` временный: модуль при импорте создаёт
+каталоги и файл пароля.
+
+```bash
+docker run --rm \
+    -v "$PWD/tests/relay:/tests:ro" -v "$PWD/vless-reality/src:/src:ro" \
+    -e PYTHONPATH=/src -e DATA_DIR=/tmp/relay-test -e ADMIN_PASSWORD=test \
+    --entrypoint python3 noisefloor-relay:dev \
+    -m unittest discover -s /tests -p 'test_*.py' -v
+```
+
 ### Приёмочный тест
 
 Разворачивает оба сервиса с нуля на портах `291xx` и проверяет, что через них
