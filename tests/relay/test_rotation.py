@@ -134,6 +134,59 @@ class RotationTests(unittest.TestCase):
         self.assertEqual(app.rotation_tick(NOW), "off")
 
 
+class SniGraceTests(unittest.TestCase):
+    """Прежний SNI живёт ещё окно после смены — иначе каскад на первом
+    сервере лежит до его опроса. Проверено на живом xray: клиент со старым
+    SNI из serverNames проходит при новом dest."""
+
+    def setUp(self):
+        self.creds = {
+            "uuid": "u", "short_id": "s", "private_key": "p", "public_key": "P",
+            "dest": "dl.google.com:443", "sni": "dl.google.com", "vless_port": 8443,
+            "sync_token": "t", "rotation": app.rotation_defaults(),
+        }
+        app.save_creds(self.creds)
+        mock.patch.object(app, "restart_xray").start()
+        self.addCleanup(mock.patch.stopall)
+
+    def rendered_names(self):
+        cfg = json.loads(app.CONFIG_FILE.read_text())
+        return cfg["inbounds"][0]["streamSettings"]["realitySettings"]["serverNames"]
+
+    def test_previous_sni_stays_accepted_for_the_grace_window(self):
+        app.apply_camouflage(self.creds, "www.amd.com:443", "www.amd.com", now=NOW)
+        self.assertEqual(self.rendered_names(), ["www.amd.com", "dl.google.com"])
+        self.assertEqual(app.active_server_names(self.creds, NOW + timedelta(minutes=14)),
+                         ["www.amd.com", "dl.google.com"])
+        self.assertEqual(app.active_server_names(self.creds, NOW + timedelta(minutes=16)),
+                         ["www.amd.com"])
+
+    def test_quick_double_switch_keeps_both_previous(self):
+        # Два нажатия «Сменить сейчас» за минуту: панель может сидеть на
+        # любом из трёх — все должны проходить.
+        app.apply_camouflage(self.creds, "www.amd.com:443", "www.amd.com", now=NOW)
+        app.apply_camouflage(self.creds, "www.dell.com:443", "www.dell.com", now=NOW + timedelta(minutes=1))
+        self.assertEqual(self.rendered_names(), ["www.dell.com", "dl.google.com", "www.amd.com"])
+
+    def test_switching_back_does_not_duplicate(self):
+        app.apply_camouflage(self.creds, "www.amd.com:443", "www.amd.com", now=NOW)
+        app.apply_camouflage(self.creds, "dl.google.com:443", "dl.google.com", now=NOW + timedelta(minutes=1))
+        self.assertEqual(self.rendered_names(), ["dl.google.com", "www.amd.com"])
+
+    def test_expired_entries_are_dropped_at_next_switch(self):
+        app.apply_camouflage(self.creds, "www.amd.com:443", "www.amd.com", now=NOW)
+        app.apply_camouflage(self.creds, "www.dell.com:443", "www.dell.com", now=NOW + timedelta(hours=4))
+        self.assertEqual(self.rendered_names(), ["www.dell.com", "www.amd.com"])
+        self.assertEqual([g["sni"] for g in self.creds["sni_grace"]], ["www.amd.com"])
+
+    def test_sync_lists_accepted_snis(self):
+        app.apply_camouflage(self.creds, "www.amd.com:443", "www.amd.com", now=datetime.now(timezone.utc))
+        with mock.patch.object(app, "current_host", return_value="203.0.113.10"):
+            payload = json.loads(app.api_sync().body)
+        self.assertEqual(payload["sni"], "www.amd.com")
+        self.assertEqual(payload["accepted_snis"], ["www.amd.com", "dl.google.com"])
+
+
 class SyncPayloadTests(unittest.TestCase):
     def test_sync_announces_rotation_only_when_enabled(self):
         creds = {"uuid": "u", "short_id": "s", "private_key": "p", "public_key": "P",

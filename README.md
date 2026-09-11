@@ -285,8 +285,9 @@ docker exec NOISEFLOOR-amneziawg-panel cat /opt/panel/data/INITIAL_ADMIN_PASSWOR
 смен. Пул по умолчанию — десять проверенных хостов (`dl.google.com`,
 `gateway.icloud.com`, `www.samsung.com`, `www.amd.com`, `www.cloudflare.com`,
 `www.mozilla.org`, `www.speedtest.net`, `www.dell.com`, `www.lenovo.com`,
-`www.asus.com`). Подробности и оговорка про ручную смену — в
-[`docs/OPERATIONS.md`](docs/OPERATIONS.md).
+`www.asus.com`). Прежний SNI принимается ещё 15 минут после смены, поэтому
+каскад с первого сервера не рвётся ни по расписанию, ни по кнопке.
+Подробности — в [`docs/OPERATIONS.md`](docs/OPERATIONS.md).
 
 ---
 

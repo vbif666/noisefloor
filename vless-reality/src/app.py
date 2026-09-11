@@ -102,6 +102,12 @@ ROTATION_MISSED_SECONDS = 120
 # отдавал то 7.9, то 8.3 КБ в зависимости от того, куда попал запрос.
 CERT_RECORD_LIMIT = 7600
 DEST_CHECK_TIMEOUT = 6.0
+# После смены прежний SNI ещё принимается: панель на первом сервере узнаёт
+# о смене не мгновенно (опрос раз в пять минут, а ручная смена и вовсе не
+# объявляется), и без этого окна каскад лежал бы до её опроса. Проверено
+# на живом xray: авторизованный клиент со старым SNI из serverNames
+# проходит при новом dest, без него — нет.
+SNI_GRACE_SECONDS = 15 * 60
 PUBLIC_HOST = os.environ.get("PUBLIC_HOST", "")
 LABEL = os.environ.get("LABEL", "vless-reality")
 # Имя переменной единое с панелью — ADMIN_USERNAME. Прежнее ADMIN_USER
@@ -259,7 +265,31 @@ def save_creds(creds: dict) -> None:
     CREDS_FILE.write_text(json.dumps(creds, indent=2))
 
 
-def render_config(creds: dict) -> None:
+def _grace_entries(creds: dict, now: datetime) -> list[dict]:
+    """Прежние SNI, окно которых ещё не истекло."""
+    alive = []
+    for item in creds.get("sni_grace") or []:
+        try:
+            until = datetime.fromisoformat(item["until"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if until > now and item.get("sni"):
+            alive.append(item)
+    return alive
+
+
+def active_server_names(creds: dict, now: datetime | None = None) -> list[str]:
+    """Текущий SNI плюс прежние, пока их окно не истекло. Порядок важен:
+    первым идёт текущий — его отдаёт /api/sync и ссылка."""
+    now = now or datetime.now(timezone.utc)
+    names = [creds["sni"]]
+    for item in _grace_entries(creds, now):
+        if item["sni"] not in names:
+            names.append(item["sni"])
+    return names
+
+
+def render_config(creds: dict, now: datetime | None = None) -> None:
     config = {
         "log": {"loglevel": "warning", "access": str(ACCESS_LOG)},
         "stats": {},
@@ -301,7 +331,7 @@ def render_config(creds: dict) -> None:
                         "show": False,
                         "dest": creds["dest"],
                         "xver": 0,
-                        "serverNames": [creds["sni"]],
+                        "serverNames": active_server_names(creds, now),
                         "privateKey": creds["private_key"],
                         "shortIds": [creds["short_id"]],
                     },
@@ -472,11 +502,20 @@ def plan_next(creds: dict, now: datetime | None = None) -> dict:
     return rot
 
 
-def apply_camouflage(creds: dict, dest: str, sni: str) -> None:
+def apply_camouflage(creds: dict, dest: str, sni: str, now: datetime | None = None) -> None:
+    now = now or datetime.now(timezone.utc)
+    previous = creds.get("sni")
+    # Истёкшие окна вычищаются здесь же, при следующей смене: отдельный
+    # перезапуск xray ради уборки списка рвал бы соединения клиентов.
+    grace = [g for g in _grace_entries(creds, now) if g["sni"] != sni]
+    if previous and previous != sni:
+        grace = [g for g in grace if g["sni"] != previous]
+        grace.append({"sni": previous, "until": (now + timedelta(seconds=SNI_GRACE_SECONDS)).isoformat()})
+    creds["sni_grace"] = grace
     creds["dest"] = dest
     creds["sni"] = sni
     save_creds(creds)
-    render_config(creds)
+    render_config(creds, now)
     restart_xray()
 
 
@@ -498,7 +537,7 @@ def rotate_now(creds: dict, reason: str = "по расписанию", now: date
             creds["rotation"] = rot
             return plan_next(creds, now)
     previous = creds.get("sni")
-    apply_camouflage(creds, f"{host}:443", host)
+    apply_camouflage(creds, f"{host}:443", host, now=now)
     _record(rot, {"at": now.isoformat(), "ok": True, "reason": reason,
                   "from": previous, "sni": host, "note": note})
     creds["rotation"] = rot
@@ -720,6 +759,7 @@ def api_status():
     s["dest"] = creds.get("dest")
     s["port"] = creds.get("vless_port")
     s["rotation"] = get_rotation(creds) if creds else None
+    s["accepted_snis"] = active_server_names(creds) if creds else []
     return JSONResponse(s)
 
 
@@ -781,6 +821,9 @@ def api_sync():
         "short_id": creds["short_id"],
         "sni": creds["sni"],
         "dest": creds["dest"],
+        # Прежние SNI, которые релей пока ещё принимает, — чтобы панель
+        # (и человек в ней) понимали, почему каскад не упал после смены.
+        "accepted_snis": active_server_names(creds),
         "flow": "xtls-rprx-vision",
         "fp": "chrome",
         # Когда SNI сменится в следующий раз: панель приходит за новыми
@@ -1103,7 +1146,7 @@ canvas.chart-canvas { width: 100%; height: 140px; display: block; }
     <div class="panel-body">
       <div class="overview-row">
         <div class="stat-grid">
-          <div class="stat-item"><span class="eyebrow">SNI</span><div class="stat-value mono">@@SNI@@</div></div>
+          <div class="stat-item"><span class="eyebrow">SNI</span><div class="stat-value mono">@@SNI@@</div>@@SNI_GRACE@@</div>
           <div class="stat-item"><span class="eyebrow">Camouflage dest</span><div class="stat-value mono">@@DEST@@</div></div>
           <div class="stat-item"><span class="eyebrow">Порт</span><div class="stat-value mono">@@PORT@@</div></div>
           <div class="stat-item"><span class="eyebrow">xray</span><div class="stat-value" id="stat-xray">@@XRAY_STATUS@@</div></div>
@@ -1193,9 +1236,9 @@ canvas.chart-canvas { width: 100%; height: 140px; display: block; }
           <p class="field-hint">
             Перед каждой сменой хост проверяется отсюда: TLS 1.3, h2 и цепочка
             сертификатов короче лимита REALITY (8 КБ). Не прошедший пропускается.
-            «Сменить сейчас» переключает немедленно, без объявления: каскад на
-            первом сервере подхватит смену на ближайшем опросе (до пяти минут)
-            или сразу — по кнопке синхронизации в его панели.
+            После смены прежний SNI принимается ещё 15 минут, поэтому каскад
+            не рвётся: панель первого сервера переходит на новый на ближайшем
+            опросе, а «Сменить сейчас» безопасно нажимать в любой момент.
           </p>
         </div>
         <div class="btn-row">
@@ -1425,6 +1468,14 @@ def _when(iso: str | None) -> str:
     return f'<span data-iso="{html.escape(iso, quote=True)}">{html.escape(iso[:16].replace("T", " "))} UTC</span>'
 
 
+def sni_grace_html(creds: dict) -> str:
+    now = datetime.now(timezone.utc)
+    parts = [f'{html.escape(g["sni"])} до {_when(g["until"])}' for g in _grace_entries(creds, now)]
+    if not parts:
+        return ""
+    return f'<div class="field-hint">ещё принимается: {"; ".join(parts)}</div>'
+
+
 def rotation_headline(rot: dict) -> str:
     if not rot["enabled"]:
         return "выключена"
@@ -1476,6 +1527,7 @@ def index(response: Response):
         "@@APP_CODENAME@@": APP_CODENAME,
         "@@STATUS_TEXT@@": status_text,
         "@@SNI@@": html.escape(creds.get("sni", "-")),
+        "@@SNI_GRACE@@": sni_grace_html(creds),
         "@@DEST@@": html.escape(creds.get("dest", "-")),
         "@@PORT@@": str(creds.get("vless_port", "-")),
         "@@XRAY_STATUS@@": "работает" if s["xray_running"] else "остановлен",
