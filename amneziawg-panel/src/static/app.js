@@ -175,78 +175,169 @@ async function afterLogin() {
   showApp();
   await loadEverything();
   startStatusPolling();
-  checkForAwgUpdate();
+  loadSelfUpdate(false);
 }
 
 /* ==========================================================================
-   Обновление бинарников AmneziaWG (официальные исходники amnezia-vpn)
+   Обновление самой панели
    ========================================================================== */
 
-const UPDATE_CHECK_INTERVAL_MS = 6 * 60 * 60 * 1000; // раз в 6 часов, пока открыта вкладка
+const UPDATE_CHECK_INTERVAL_MS = 60 * 60 * 1000; // раз в час, пока открыта вкладка
 let updateCheckTimer = null;
+let selfUpdateState = null;
 
-async function checkForAwgUpdate() {
-  clearTimeout(updateCheckTimer);
-  updateCheckTimer = setTimeout(checkForAwgUpdate, UPDATE_CHECK_INTERVAL_MS);
+function fmtDate(iso) {
+  if (!iso || iso === "unknown") return "?";
+  const d = new Date(iso);
+  return isNaN(d) ? iso : d.toLocaleString();
+}
 
-  const btn = $("update-btn");
-  try {
-    const result = await api("/updates/check");
-    if (!result.checked_ok) {
-      btn.hidden = true;
-      return;
-    }
-    if (result.update_available) {
-      const parts = result.components
-        .filter((c) => c.update_available)
-        .map((c) => `${c.name}: ${c.current || "?"} → ${c.latest}`);
-      btn.title = `Доступна новая версия из официального репозитория amnezia-vpn:\n${parts.join("\n")}`;
-      btn.hidden = false;
+function renderSelfUpdate(state) {
+  selfUpdateState = state;
+  const cur = state.current || {};
+  const comp = state.components || {};
+  const relay = currentServer && currentServer.cascade_relay_version;
+
+  $("version-chip").textContent = cur.version || "dev";
+  const lines = [
+    `NOISEFLOOR ${cur.version || "dev"}  (коммит ${cur.sha || "?"}, собрано ${fmtDate(cur.date)})`,
+    `amneziawg-go ${comp["amneziawg-go"]}  ·  amneziawg-tools ${comp["amneziawg-tools"]}  ·  xray ${comp.xray}  ·  geoip ${comp.geoip}`,
+  ];
+  if (relay) {
+    const same = relay === cur.version;
+    lines.push(`релей ${relay}${same ? "" : "  — версии узлов разошлись, обновите и релей"}`);
+  }
+  $("version-summary").textContent = lines.join("\n");
+
+  const box = $("update-available-box");
+  const topBtn = $("update-btn");
+  const applyBtn = $("self-update-btn");
+  const hint = $("update-hint");
+  const status = $("self-update-status");
+  status.classList.remove("is-error", "is-ok");
+
+  if (state.available && state.latest) {
+    const l = state.latest;
+    $("update-available-text").textContent =
+      `${l.version}${l.date ? " от " + fmtDate(l.date) : ""} — канал «${state.channel}». ` +
+      `Подробности: ${l.url}`;
+    const notes = $("update-notes");
+    notes.textContent = l.notes || "";
+    notes.hidden = !l.notes;
+    box.hidden = false;
+    topBtn.hidden = false;
+    topBtn.title = `Доступна версия ${l.version}`;
+    applyBtn.hidden = !state.agent_available;
+    hint.textContent = state.agent_available
+      ? ""
+      : "На хосте нет агента обновлений: запустите установщик заново или выполните на сервере  docker compose pull && docker compose up -d";
+  } else {
+    box.hidden = true;
+    topBtn.hidden = true;
+    applyBtn.hidden = true;
+    hint.textContent = state.check_error
+      ? ""
+      : `Обновлений нет — канал «${state.channel}»${state.checked_at ? ", проверено " + fmtDate(state.checked_at) : ""}.`;
+  }
+
+  if (state.pending) {
+    status.textContent = "агент обновляет — панель перезапустится через полминуты";
+    applyBtn.disabled = true;
+  } else if (state.check_error) {
+    status.textContent = state.check_error;
+    status.classList.add("is-error");
+    applyBtn.disabled = false;
+  } else if (state.last_result) {
+    const r = state.last_result;
+    const when = r.finished_at ? fmtDate(r.finished_at) : "";
+    if (r.ok) {
+      status.textContent = `последнее обновление прошло успешно ${when}`;
+      status.classList.add("is-ok");
     } else {
-      btn.hidden = true;
+      status.textContent = `последнее обновление не удалось ${when}: ${r.message || ""}${r.rolled_back ? " (возвращена прежняя версия)" : ""}`;
+      status.classList.add("is-error");
     }
-  } catch (_) {
-    /* тихо: проверка обновлений не должна мешать основной работе панели */
-    btn.hidden = true;
+    applyBtn.disabled = false;
+  } else {
+    status.textContent = "";
+    applyBtn.disabled = false;
   }
 }
 
-$("update-btn").addEventListener("click", async () => {
-  const btn = $("update-btn");
-  if (btn.disabled) return;
-  btn.disabled = true;
-  const originalText = btn.textContent;
-  btn.textContent = "Собираю из исходников…";
+async function loadSelfUpdate(force) {
+  clearTimeout(updateCheckTimer);
+  updateCheckTimer = setTimeout(() => loadSelfUpdate(false), UPDATE_CHECK_INTERVAL_MS);
   try {
-    const result = await api("/updates/apply", { method: "POST" });
-    if (result.ok) {
-      showToast("AmneziaWG обновлён и переприменён");
-      btn.hidden = true;
-    } else {
-      showToast(result.output || "Не удалось обновить — смотрите docker logs", true);
-    }
+    const state = force
+      ? await api("/updates/self/check", { method: "POST" })
+      : await api("/updates/self");
+    renderSelfUpdate(state);
+  } catch (_) {
+    /* тихо: проверка обновлений не должна мешать основной работе панели */
+  }
+}
+
+async function requestSelfUpdate() {
+  const btn = $("self-update-btn");
+  btn.disabled = true;
+  try {
+    const result = await api("/updates/self/apply", { method: "POST" });
+    showToast(result.message);
+    // Панель сейчас перезапустится; опрашиваем, пока не вернётся новая.
+    pollUntilBack();
   } catch (err) {
     showToast(err.message, true);
-  } finally {
     btn.disabled = false;
-    btn.textContent = originalText;
-    await loadServer();
-    checkForAwgUpdate();
   }
+  await loadSelfUpdate(false);
+}
+
+function pollUntilBack() {
+  const started = Date.now();
+  const tick = async () => {
+    if (Date.now() - started > 4 * 60 * 1000) return;
+    try {
+      const state = await api("/updates/self");
+      if (!state.pending) {
+        renderSelfUpdate(state);
+        await loadServer();
+        showToast(state.last_result && state.last_result.ok === false
+          ? "Обновление не удалось, возвращена прежняя версия"
+          : "Панель обновлена");
+        return;
+      }
+    } catch (_) { /* панель перезапускается */ }
+    setTimeout(tick, 5000);
+  };
+  setTimeout(tick, 8000);
+}
+
+$("update-btn").addEventListener("click", () => {
+  switchTab("server");
+  $("update-available-box").scrollIntoView({ behavior: "smooth", block: "center" });
+});
+$("self-check-btn").addEventListener("click", () => loadSelfUpdate(true));
+$("self-update-btn").addEventListener("click", () => {
+  const l = selfUpdateState && selfUpdateState.latest;
+  openConfirm(
+    "Обновить NOISEFLOOR?",
+    `Будет установлена версия ${l ? l.version : "latest"}. Панель и интерфейс туннеля перезапустятся — клиенты отвалятся примерно на десять секунд. При неудаче агент вернёт прежнюю версию.`,
+    requestSelfUpdate,
+  );
 });
 
 /* ==========================================================================
    Вкладки
    ========================================================================== */
 
+function switchTab(tab) {
+  document.querySelectorAll(".tab-btn").forEach((b) => b.classList.toggle("is-active", b.dataset.tab === tab));
+  $("tab-peers").hidden = tab !== "peers";
+  $("tab-server").hidden = tab !== "server";
+}
+
 document.querySelectorAll(".tab-btn").forEach((btn) => {
-  btn.addEventListener("click", () => {
-    document.querySelectorAll(".tab-btn").forEach((b) => b.classList.remove("is-active"));
-    btn.classList.add("is-active");
-    const tab = btn.dataset.tab;
-    $("tab-peers").hidden = tab !== "peers";
-    $("tab-server").hidden = tab !== "server";
-  });
+  btn.addEventListener("click", () => switchTab(btn.dataset.tab));
 });
 
 /* ==========================================================================
@@ -286,6 +377,8 @@ function fillServerForm(s) {
   $("f-h3").value = s.h3;
   $("f-h4").value = s.h4;
   renderApplyStatus(s);
+  // Версия релея приходит вместе с настройками сервера — обновляем блок версий.
+  if (selfUpdateState) renderSelfUpdate(selfUpdateState);
 }
 
 function renderApplyStatus(s) {

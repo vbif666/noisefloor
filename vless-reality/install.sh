@@ -257,6 +257,23 @@ curl -fsS -o /dev/null -u "admin:$ADMIN_PASSWORD" "http://127.0.0.1:$PANEL_PORT/
 SYNC_TOKEN="$(docker exec "$CONTAINER" python3 -c \
     'import json;print(json.load(open("/data/creds.json")).get("sync_token",""))' 2>/dev/null | tr -d '\r\n' || true)"
 
+# --- Команда noisefloor и агент обновлений ----------------------------------
+#
+# `noisefloor update` на хосте и кнопка «Обновить» в панели — одно и то же
+# действие: скачать образ, перезапустить, дождаться здоровья, при неудаче
+# вернуть прежнюю версию. Кнопке нужен systemd-юнит, который ждёт запроса
+# от панели; ставит его `noisefloor install-agent`.
+log "ставлю команду noisefloor"
+if curl -fsSL "https://raw.githubusercontent.com/vbif666/noisefloor/master/tools/noisefloor" -o /usr/local/bin/noisefloor.tmp; then
+    mv /usr/local/bin/noisefloor.tmp /usr/local/bin/noisefloor
+    chmod +x /usr/local/bin/noisefloor
+    mkdir -p /etc/noisefloor
+    grep -qs "^relay=" /etc/noisefloor/services 2>/dev/null && sed -i "/^relay=/d" /etc/noisefloor/services
+    echo "relay=$INSTALL_DIR" >> /etc/noisefloor/services
+else
+    warn "не удалось скачать tools/noisefloor — обновлять придётся вручную: docker compose pull && docker compose up -d"
+fi
+
 # --- Итог -------------------------------------------------------------------
 
 echo
@@ -284,4 +301,6 @@ printf '    curl -s -u admin:ПАРОЛЬ http://127.0.0.1:%s/api/status | pytho
 echo
 printf '\033[1;33m  Страница релея открыта в интернет по HTTP без шифрования.\033[0m Закройте её\n'
 printf '  фаерволом — снаружи нужен только порт %s (VLESS).\n' "$VLESS_PORT"
+echo
+printf '  Обновления: noisefloor check / noisefloor update / noisefloor rollback на этом сервере.\n'
 echo

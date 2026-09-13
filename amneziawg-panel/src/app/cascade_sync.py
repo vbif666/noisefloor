@@ -172,6 +172,9 @@ def sync_once(db) -> tuple[bool, str | None]:
     changed = new_url != (server.cascade_vless_url or "")
     server.cascade_sync_error = None
     server.cascade_synced_at = datetime.now(timezone.utc)
+    relay_build = params.get("version") if isinstance(params, dict) else None
+    if isinstance(relay_build, dict):
+        server.cascade_relay_version = str(relay_build.get("version") or "")[:64] or None
     if changed:
         server.cascade_vless_url = new_url
     db.add(server)

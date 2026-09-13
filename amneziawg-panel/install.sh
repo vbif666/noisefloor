@@ -354,6 +354,25 @@ print(json.dumps(u))' "$update" "$RELAY_URL" "$RELAY_TOKEN")"
     fi
 fi
 
+# --- Команда noisefloor и агент обновлений ----------------------------------
+#
+# `noisefloor update` на хосте и кнопка «Обновить» в панели — одно и то же
+# действие: скачать образ, перезапустить, дождаться здоровья, при неудаче
+# вернуть прежнюю версию. Кнопке нужен systemd-юнит, который ждёт запроса
+# от панели; ставит его `noisefloor install-agent`.
+log "ставлю команду noisefloor"
+if curl -fsSL "https://raw.githubusercontent.com/vbif666/noisefloor/master/tools/noisefloor" -o /usr/local/bin/noisefloor.tmp; then
+    mv /usr/local/bin/noisefloor.tmp /usr/local/bin/noisefloor
+    chmod +x /usr/local/bin/noisefloor
+    mkdir -p /etc/noisefloor
+    grep -qs "^panel=" /etc/noisefloor/services 2>/dev/null && sed -i "/^panel=/d" /etc/noisefloor/services
+    echo "panel=$INSTALL_DIR" >> /etc/noisefloor/services
+    noisefloor install-agent >/dev/null 2>&1 \
+        || warn "агент обновлений не установился — кнопка в панели работать не будет, остаётся noisefloor update"
+else
+    warn "не удалось скачать tools/noisefloor — обновлять придётся вручную: docker compose pull && docker compose up -d"
+fi
+
 # --- Итог -------------------------------------------------------------------
 
 echo
@@ -379,6 +398,8 @@ elif [ -z "$RELAY_URL" ]; then
     printf '  Каскад: вкладка «Сервер» → блок «Каскад» → адрес релея и токен с его страницы.\n'
 fi
 printf '  Устройства: вкладка «Пиры» → «+ Добавить пира» → QR-код в приложение AmneziaWG.\n'
+printf '  Обновления: панель сама скажет, когда выйдет новая версия; кнопка «Обновить»\n'
+printf '  там же, либо на сервере: noisefloor check / noisefloor update / noisefloor rollback.\n'
 echo
 printf '\033[1;33m  Панель открыта в интернет по HTTP без шифрования.\033[0m Закройте её фаерволом\n'
 printf '  или обратным прокси с сертификатом — см. docs/DEPLOY.md, «Закройте панель от посторонних».\n'

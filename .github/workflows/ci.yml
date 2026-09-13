@@ -1,0 +1,151 @@
+# Сборка по коммиту.
+#
+# Каждый push в master: тесты → образы → приёмочный → публикация в Docker Hub
+# как latest и sha-XXXXXXX. Push тега vX.Y.Z: то же самое, но образы уходят
+# под этим номером и как stable, а на GitHub появляется релиз с верхним
+# разделом CHANGELOG в качестве заметок. Именно релизы видит панель в
+# канале stable — «доступно обновление» появляется у людей только тогда,
+# когда автор сознательно поставил тег.
+#
+# Pull request собирается и тестируется, но никуда не публикуется.
+name: CI
+
+on:
+  push:
+    branches: [master]
+    tags: ["v*"]
+  pull_request:
+
+permissions:
+  contents: write   # создать релиз по тегу
+  packages: read
+
+env:
+  PANEL_IMAGE: vbif666/noisefloor-amneziawg-panel
+  RELAY_IMAGE: vbif666/noisefloor-vless-reality
+  # Секреты в условиях шага напрямую не читаются — только через env.
+  # Пока их нет в настройках репозитория, публикация просто пропускается,
+  # а тесты и сборка всё равно идут.
+  DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+  DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # git describe нужна вся история тегов
+
+      - name: Версия сборки
+        id: meta
+        run: |
+          sha=$(git rev-parse --short HEAD)
+          date=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            version="${GITHUB_REF#refs/tags/}"
+          else
+            version=$(git describe --tags --always)
+          fi
+          echo "sha=$sha"         >> "$GITHUB_OUTPUT"
+          echo "date=$date"       >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "собираем $version ($sha, $date)"
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Сборка панели
+        uses: docker/build-push-action@v6
+        with:
+          context: amneziawg-panel
+          load: true
+          tags: ${{ env.PANEL_IMAGE }}:ci
+          build-args: |
+            BUILD_VERSION=${{ steps.meta.outputs.version }}
+            BUILD_SHA=${{ steps.meta.outputs.sha }}
+            BUILD_DATE=${{ steps.meta.outputs.date }}
+          cache-from: type=gha,scope=panel
+          cache-to: type=gha,scope=panel,mode=max
+
+      - name: Сборка релея
+        uses: docker/build-push-action@v6
+        with:
+          context: vless-reality
+          load: true
+          tags: ${{ env.RELAY_IMAGE }}:ci
+          build-args: |
+            BUILD_VERSION=${{ steps.meta.outputs.version }}
+            BUILD_SHA=${{ steps.meta.outputs.sha }}
+            BUILD_DATE=${{ steps.meta.outputs.date }}
+          cache-from: type=gha,scope=relay
+          cache-to: type=gha,scope=relay,mode=max
+
+      # Тесты гоняются в собранном образе: зависимости и бинарники в нём те
+      # же, с которыми код поедет на сервер.
+      - name: Юнит-тесты
+        run: |
+          docker run --rm \
+            -v "$PWD/tests/unit:/tests:ro" \
+            -v "$PWD/amneziawg-panel/noisefloor-rules:/usr/local/bin/noisefloor-rules:ro" \
+            --entrypoint python3 "$PANEL_IMAGE:ci" \
+            -m unittest discover -s /tests -p 'test_*.py'
+
+      # Приёмочный поднимает оба сервиса с нуля и проверяет, что через них
+      # идёт настоящий трафик — до REALITY-рукопожатия включительно. Проверке
+      # правил нужен dummy-интерфейс внутри контейнера, модуль грузим на хосте.
+      - name: Приёмочный тест
+        run: |
+          sudo modprobe dummy || true
+          PANEL_IMAGE="$PANEL_IMAGE:ci" RELAY_IMAGE="$RELAY_IMAGE:ci" bash tests/smoke.sh
+
+      - name: Вход в Docker Hub
+        if: github.event_name == 'push' && env.DOCKERHUB_TOKEN != ''
+        uses: docker/login-action@v3
+        with:
+          username: ${{ env.DOCKERHUB_USERNAME }}
+          password: ${{ env.DOCKERHUB_TOKEN }}
+
+      - name: Секретов нет — публикация пропущена
+        if: github.event_name == 'push' && env.DOCKERHUB_TOKEN == ''
+        run: echo "::warning::DOCKERHUB_USERNAME / DOCKERHUB_TOKEN не заданы в секретах репозитория — образы не опубликованы"
+
+      - name: Публикация (master → latest + sha)
+        if: github.event_name == 'push' && github.ref == 'refs/heads/master' && env.DOCKERHUB_TOKEN != ''
+        run: |
+          for img in "$PANEL_IMAGE" "$RELAY_IMAGE"; do
+            docker tag "$img:ci" "$img:latest"
+            docker tag "$img:ci" "$img:sha-${{ steps.meta.outputs.sha }}"
+            docker push -q "$img:latest"
+            docker push -q "$img:sha-${{ steps.meta.outputs.sha }}"
+          done
+
+      - name: Публикация (тег → версия + stable)
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') && env.DOCKERHUB_TOKEN != ''
+        run: |
+          for img in "$PANEL_IMAGE" "$RELAY_IMAGE"; do
+            docker tag "$img:ci" "$img:${{ steps.meta.outputs.version }}"
+            docker tag "$img:ci" "$img:stable"
+            docker push -q "$img:${{ steps.meta.outputs.version }}"
+            docker push -q "$img:stable"
+          done
+
+      # Заметки к релизу — верхний раздел CHANGELOG: то, что автор написал
+      # для людей, а не список коммитов.
+      - name: Заметки к релизу
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+        run: |
+          awk 'BEGIN{n=0} /^## /{n++} n==1' CHANGELOG.md | tail -n +2 > /tmp/notes.md
+          [ -s /tmp/notes.md ] || echo "Версия ${{ steps.meta.outputs.version }}." > /tmp/notes.md
+          {
+            echo
+            echo "Образы: \`$PANEL_IMAGE:${{ steps.meta.outputs.version }}\`, \`$RELAY_IMAGE:${{ steps.meta.outputs.version }}\` (коммит ${{ steps.meta.outputs.sha }})."
+            echo
+            echo "Обновиться: кнопка «Обновить» в панели или \`noisefloor update\` на сервере."
+          } >> /tmp/notes.md
+
+      - name: Релиз на GitHub
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          name: ${{ steps.meta.outputs.version }}
+          body_path: /tmp/notes.md

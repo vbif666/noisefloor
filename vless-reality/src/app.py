@@ -56,6 +56,16 @@ ADMIN_PW_FILE = DATA_DIR / "INITIAL_ADMIN_PASSWORD.txt"
 # в резервные копии.
 LOG_DIR = DATA_DIR / "logs"
 ACCESS_LOG = LOG_DIR / "xray-access.log"
+
+
+def build_info() -> dict:
+    """Кто этот образ: версия, коммит и дата зашиты при сборке
+    (см. Dockerfile). Без штампа — «dev»."""
+    return {
+        "version": os.environ.get("NOISEFLOOR_VERSION") or "dev",
+        "sha": os.environ.get("NOISEFLOOR_BUILD_SHA") or "unknown",
+        "date": os.environ.get("NOISEFLOOR_BUILD_DATE") or "unknown",
+    }
 # Ротации у xray нет, а пишет он строку на каждое соединение — без
 # ограничения файл со временем съедает диск.
 ACCESS_LOG_MAX_BYTES = 20 * 1024 * 1024
@@ -160,6 +170,9 @@ ADMIN_PASSWORD = get_admin_password()
 security = HTTPBasic(auto_error=False)
 
 SYNC_PATH = "/api/sync"
+# Здоровье без авторизации: его спрашивают Docker (HEALTHCHECK) и хостовый
+# агент обновлений, у которых пароля нет. Ничего секретного не отдаёт.
+HEALTH_PATH = "/api/health"
 
 
 def _sync_token() -> str:
@@ -191,6 +204,8 @@ def _authorise_sync(request) -> str:
 def check_auth(request: Request, credentials: HTTPBasicCredentials | None = Depends(security)):
     if request.url.path == SYNC_PATH:
         return _authorise_sync(request)
+    if request.url.path == HEALTH_PATH:
+        return "health"
 
     if credentials is None:
         raise HTTPException(
@@ -763,6 +778,16 @@ def api_status():
     return JSONResponse(s)
 
 
+@app.get(HEALTH_PATH)
+def api_health():
+    """Живо ли: процесс xray запущен. 503, если нет, — так Docker и агент
+    обновлений видят состояние без пароля."""
+    with state_lock:
+        running = bool(state["xray_running"])
+    return JSONResponse({"ok": running, "xray_running": running, "version": build_info()},
+                        status_code=200 if running else 503)
+
+
 @app.get("/api/metrics", response_class=Response)
 def api_metrics():
     """Метрики в формате Prometheus — те же, что отдаёт панель, чтобы за
@@ -836,6 +861,9 @@ def api_sync():
         # Готовая ссылка: собирает её тот, кто знает свои настройки, —
         # меньше шансов, что стороны разойдутся в мелочах.
         "vless_url": build_vless_url(creds, host),
+        # Версия релея — панель сравнивает со своей и показывает, если
+        # узлы разъехались: обновлять их нужно оба, а забыть второй легко.
+        "version": build_info(),
     })
 
 
@@ -1154,6 +1182,7 @@ canvas.chart-canvas { width: 100%; height: 140px; display: block; }
           <div class="stat-item"><span class="eyebrow">Последнее</span><div class="stat-value mono" id="stat-last-connect">@@LAST_CONNECT@@</div></div>
           <div class="stat-item"><span class="eyebrow">IP клиента</span><div class="stat-value mono" id="stat-client-ip">@@CLIENT_IP@@</div></div>
           <div class="stat-item"><span class="eyebrow">Всего трафика</span><div class="stat-value mono" id="stat-traffic-total">@@TRAFFIC_TOTAL@@</div></div>
+          <div class="stat-item"><span class="eyebrow">Версия</span><div class="stat-value mono" title="@@BUILD_TITLE@@">@@BUILD_VERSION@@</div></div>
         </div>
       </div>
       <div class="field" style="margin-top:20px; margin-bottom:0;">
@@ -1531,6 +1560,8 @@ def index(response: Response):
         "@@DEST@@": html.escape(creds.get("dest", "-")),
         "@@PORT@@": str(creds.get("vless_port", "-")),
         "@@XRAY_STATUS@@": "работает" if s["xray_running"] else "остановлен",
+        "@@BUILD_VERSION@@": html.escape(build_info()["version"]),
+        "@@BUILD_TITLE@@": html.escape(f"коммит {build_info()['sha']}, собрано {build_info()['date']}", quote=True),
         "@@CONNECT_COUNT@@": str(s["connect_count"]),
         "@@LAST_CONNECT@@": html.escape(last),
         "@@CLIENT_IP@@": html.escape(ip),

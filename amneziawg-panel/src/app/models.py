@@ -65,6 +65,9 @@ class ServerConfig(Base):
     cascade_sync_token = Column(Text, default="")
     cascade_sync_error = Column(Text, nullable=True)
     cascade_synced_at = Column(DateTime, nullable=True)
+    # Версия релея из его /api/sync: обновлять узлы нужно оба, а забыть
+    # второй легко — панель показывает, если они разъехались.
+    cascade_relay_version = Column(String(64), nullable=True)
 
     # --- Параметры обфускации AmneziaWG 2.0 ---
     jc = Column(Integer, default=6)

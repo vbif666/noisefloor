@@ -61,6 +61,7 @@ class ServerRead(BaseModel):
     cascade_sync_token: str = ""
     cascade_sync_error: str | None = None
     cascade_synced_at: UtcDatetime | None = None
+    cascade_relay_version: str | None = None
     jc: int
     jmin: int
     jmax: int
@@ -252,3 +253,8 @@ class UpdateCheckResponse(BaseModel):
 class UpdateApplyResponse(BaseModel):
     ok: bool
     output: str
+
+
+class SelfUpdateApply(BaseModel):
+    ok: bool
+    message: str

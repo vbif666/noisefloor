@@ -31,6 +31,7 @@ _SERVER_CONFIG_MIGRATIONS = [
     ("cascade_sync_error", "ALTER TABLE server_config ADD COLUMN cascade_sync_error TEXT"),
     ("cascade_synced_at", "ALTER TABLE server_config ADD COLUMN cascade_synced_at DATETIME"),
     ("split_ru_direct", "ALTER TABLE server_config ADD COLUMN split_ru_direct BOOLEAN NOT NULL DEFAULT 0"),
+    ("cascade_relay_version", "ALTER TABLE server_config ADD COLUMN cascade_relay_version VARCHAR(64)"),
 ]
 
 

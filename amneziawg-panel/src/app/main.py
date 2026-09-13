@@ -5,7 +5,7 @@ from pathlib import Path
 from fastapi import FastAPI
 from fastapi.staticfiles import StaticFiles
 
-from . import backup, bootstrap, cascade, cascade_sync, config_sync, traffic_history
+from . import backup, bootstrap, cascade, cascade_sync, config_sync, self_update, traffic_history
 from .config import settings
 from .database import Base, SessionLocal, engine, run_migrations
 from .routers import auth, backup as backup_router, peers, server, status, updates
@@ -34,6 +34,7 @@ _traffic_history_stop = threading.Event()
 _cascade_supervisor_stop = threading.Event()
 _backup_stop = threading.Event()
 _cascade_sync_stop = threading.Event()
+_self_update_stop = threading.Event()
 
 
 @asynccontextmanager
@@ -62,6 +63,10 @@ async def lifespan(app: FastAPI):
     # Синхронизация с релеем: подтягивает его SNI и camouflage dest, чтобы
     # их не приходилось держать одинаковыми на двух серверах руками.
     threading.Thread(target=cascade_sync.run, args=(_cascade_sync_stop,), daemon=True).start()
+    # Проверка собственных обновлений: раз в шесть часов спрашивает, не
+    # вышла ли новая версия, и показывает это в панели. Само обновление
+    # делает хостовый агент по запросу администратора.
+    threading.Thread(target=self_update.run, args=(_self_update_stop,), daemon=True).start()
     try:
         yield
     finally:
@@ -69,6 +74,7 @@ async def lifespan(app: FastAPI):
         _cascade_supervisor_stop.set()
         _backup_stop.set()
         _cascade_sync_stop.set()
+        _self_update_stop.set()
 
 
 app = FastAPI(title="AmneziaWG Panel", version="1.0.0", lifespan=lifespan)

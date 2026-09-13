@@ -41,7 +41,7 @@
     <div class="wordmark"><span class="dot"></span><span>NOISEFLOOR</span></div>
     <div class="topbar-right">
       <span id="status-pill" class="status-pill"><span class="indicator"></span><span id="status-pill-text">проверка…</span></span>
-      <button id="update-btn" class="btn btn-primary btn-sm" hidden title="Пересобрать awg/amneziawg-go из официальных исходников amnezia-vpn">Доступно обновление AWG</button>
+      <button id="update-btn" class="btn btn-primary btn-sm" hidden>Доступно обновление</button>
       <span id="username-chip" class="username-chip"></span>
       <button id="logout-btn" class="btn btn-ghost btn-sm">Выйти</button>
     </div>
@@ -273,6 +273,32 @@
             <div class="server-actions" style="margin-top:14px;">
               <button type="button" id="backup-download-btn" class="btn btn-primary btn-sm">Скачать копию</button>
               <span id="backup-list" class="apply-status"></span>
+            </div>
+          </div>
+        </div>
+
+        <div class="panel" style="margin-bottom:16px;">
+          <div class="panel-header">
+            <h2>Версия и обновления</h2>
+            <span id="version-chip" class="eyebrow">—</span>
+          </div>
+          <div class="panel-body">
+            <div class="key-display" id="version-summary" style="margin-bottom:10px;">—</div>
+            <div id="update-available-box" class="empty-state" hidden style="text-align:left; margin-bottom:12px;">
+              <span class="eyebrow">Доступно обновление</span>
+              <p id="update-available-text" style="margin:6px 0 8px;"></p>
+              <pre id="update-notes" class="config-text" style="max-height:180px; overflow:auto; margin:0 0 10px;" hidden></pre>
+              <p class="field-hint" style="margin:0;">
+                Обновление — это перезапуск панели и интерфейса туннеля: клиенты
+                отвалятся секунд на десять и переподключатся сами. Если что-то
+                пойдёт не так, агент вернёт прежнюю версию.
+              </p>
+            </div>
+            <p class="field-hint" id="update-hint" style="margin:0 0 10px;"></p>
+            <div class="server-actions">
+              <button type="button" id="self-update-btn" class="btn btn-primary btn-sm" hidden>Обновить сейчас</button>
+              <button type="button" id="self-check-btn" class="btn btn-sm">Проверить обновления</button>
+              <span id="self-update-status" class="apply-status"></span>
             </div>
           </div>
         </div>

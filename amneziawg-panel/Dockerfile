@@ -17,6 +17,13 @@ ARG XRAY_VERSION=v26.7.28
 # базы это осознанная пересборка, а не «что там сегодня в latest».
 ARG GEOIP_REF=202609092346
 
+# Кто этот образ. Заполняет сборка (CI или build-скрипт); без аргументов
+# получается «dev» — так панель понимает, что сравнивать себя с
+# опубликованными версиями бессмысленно.
+ARG BUILD_VERSION=dev
+ARG BUILD_SHA=unknown
+ARG BUILD_DATE=unknown
+
 # ------------------------ сборка: amneziawg-go + amneziawg-tools ----------
 FROM debian:bookworm-slim AS awg-build
 ARG GO_VERSION
@@ -92,6 +99,9 @@ ARG AWG_GO_REF
 ARG AWG_TOOLS_REF
 ARG XRAY_VERSION
 ARG GEOIP_REF
+ARG BUILD_VERSION
+ARG BUILD_SHA
+ARG BUILD_DATE
 
 # bash — awg-quick это bash-скрипт; iproute2/iptables/nftables — поднятие
 # интерфейса и правила; curl — проверка обновлений и HEALTHCHECK.
@@ -115,6 +125,9 @@ ENV AWG_GO_BUILT_REF=${AWG_GO_REF} \
     AWG_TOOLS_BUILT_REF=${AWG_TOOLS_REF} \
     XRAY_BUILT_REF=${XRAY_VERSION} \
     GEOIP_BUILT_REF=${GEOIP_REF} \
+    NOISEFLOOR_VERSION=${BUILD_VERSION} \
+    NOISEFLOOR_BUILD_SHA=${BUILD_SHA} \
+    NOISEFLOOR_BUILD_DATE=${BUILD_DATE} \
     PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1
 
@@ -130,6 +143,12 @@ RUN mkdir -p /opt/panel/data /etc/amnezia/amneziawg
 COPY entrypoint.sh /entrypoint.sh
 COPY noisefloor-rules /usr/local/bin/noisefloor-rules
 RUN chmod +x /entrypoint.sh /usr/local/bin/noisefloor-rules
+
+# Стандартные OCI-метки: их читает docker inspect и любой реестр.
+LABEL org.opencontainers.image.source="https://github.com/vbif666/noisefloor" \
+      org.opencontainers.image.version="${BUILD_VERSION}" \
+      org.opencontainers.image.revision="${BUILD_SHA}" \
+      org.opencontainers.image.created="${BUILD_DATE}"
 
 EXPOSE 8000
 VOLUME ["/opt/panel/data", "/etc/amnezia/amneziawg"]

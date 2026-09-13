@@ -24,6 +24,11 @@ RUN set -eux; \
     echo "$TAG" > /tmp/xray-out/VERSION
 
 FROM python:3.12-slim
+# Кто этот образ. Заполняет сборка (CI или build-скрипт); без аргументов
+# получается «dev».
+ARG BUILD_VERSION=dev
+ARG BUILD_SHA=unknown
+ARG BUILD_DATE=unknown
 RUN apt-get update && apt-get install -y --no-install-recommends curl ca-certificates dumb-init && rm -rf /var/lib/apt/lists/*
 COPY --from=xray-fetch /tmp/xray-out/xray /usr/local/bin/xray
 COPY --from=xray-fetch /tmp/xray-out/VERSION /opt/XRAY_VERSION
@@ -41,9 +46,22 @@ ENV DATA_DIR=/data \
     PANEL_PORT=8001 \
     VLESS_PORT=8443 \
     REALITY_DEST=dl.google.com:443 \
-    LABEL=vless-reality
+    LABEL=vless-reality \
+    NOISEFLOOR_VERSION=${BUILD_VERSION} \
+    NOISEFLOOR_BUILD_SHA=${BUILD_SHA} \
+    NOISEFLOOR_BUILD_DATE=${BUILD_DATE}
+
+LABEL org.opencontainers.image.source="https://github.com/vbif666/noisefloor" \
+      org.opencontainers.image.version="${BUILD_VERSION}" \
+      org.opencontainers.image.revision="${BUILD_SHA}" \
+      org.opencontainers.image.created="${BUILD_DATE}"
 
 EXPOSE 8001 8443
+
+# Здоровье = xray запущен. По нему хостовый агент обновлений решает,
+# удалось ли обновление или пора откатываться.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
+    CMD curl -fsS -o /dev/null "http://127.0.0.1:${PANEL_PORT}/api/health" || exit 1
 
 ENTRYPOINT ["dumb-init", "--"]
 CMD ["sh", "-c", "uvicorn app:app --host 0.0.0.0 --port ${PANEL_PORT}"]

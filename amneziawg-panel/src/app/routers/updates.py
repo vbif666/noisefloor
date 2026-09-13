@@ -1,12 +1,38 @@
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, HTTPException
 
-from .. import awg_update
-from ..schemas import UpdateApplyResponse, UpdateCheckResponse, UpdateComponent
+from .. import awg_update, self_update
+from ..schemas import SelfUpdateApply, UpdateApplyResponse, UpdateCheckResponse, UpdateComponent
 from ..security import get_current_admin
 
 router = APIRouter()
+
+
+# --- Обновление самой панели -----------------------------------------------
+
+@router.get("/self")
+def self_update_status(_admin: str = Depends(get_current_admin)):
+    """Что за версия стоит, что опубликовано, есть ли агент и чем кончилось
+    прошлое обновление. Сеть не трогает — отдаёт последний результат
+    фоновой проверки."""
+    return self_update.status().as_dict()
+
+
+@router.post("/self/check")
+def self_update_check(_admin: str = Depends(get_current_admin)):
+    return self_update.check().as_dict()
+
+
+@router.post("/self/apply", response_model=SelfUpdateApply)
+def self_update_apply(_admin: str = Depends(get_current_admin)):
+    ok, message = self_update.request_update()
+    if not ok:
+        raise HTTPException(status_code=409, detail=message)
+    return SelfUpdateApply(ok=True, message=message)
+
+
+# --- Компоненты движка (только информация) ---------------------------------
 
 
 @router.get("/check", response_model=UpdateCheckResponse)
