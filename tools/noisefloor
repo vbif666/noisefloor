@@ -13,7 +13,7 @@
 #
 #   noisefloor status              версии и здоровье сервисов на этом хосте
 #   noisefloor check               есть ли обновления
-#   noisefloor update [panel|relay] обновить (по умолчанию — всё, что есть)
+#   noisefloor update [panel|relay] [тег]  обновить (по умолчанию всё; тег — например v1.2.0)
 #   noisefloor rollback [panel|relay] вернуть предыдущую версию
 #   noisefloor install-agent       поставить systemd-юнит для кнопки в панели
 #   noisefloor watch               (для systemd) обработать запрос от панели
@@ -24,6 +24,7 @@ set -euo pipefail
 
 AGENT_VERSION=1
 SERVICES_FILE=/etc/noisefloor/services
+REQUEST_TARGET=""
 REPO=vbif666/noisefloor
 PANEL_IMAGE=vbif666/noisefloor-amneziawg-panel
 RELAY_IMAGE=vbif666/noisefloor-vless-reality
@@ -134,7 +135,11 @@ update_one() { # имя каталог образ
         fi
     fi
 
-    (cd "$dir" && docker compose pull -q) || { write_result "$dir" 0 "docker compose pull не удался" 0 "$version_before" "?"; die "$name: не удалось скачать образ"; }
+    local repo tag; repo=$(image_repo "$dir"); tag=$(channel_tag "$dir" "${REQUEST_TARGET:-}")
+    log "$name: скачиваю $repo:$tag"
+    docker pull -q "$repo:$tag" >/dev/null \
+        || { write_result "$dir" 0 "не удалось скачать $repo:$tag" 0 "$version_before" "?"; die "$name: не удалось скачать $repo:$tag"; }
+    docker tag "$repo:$tag" "$ref"
     after=$(docker image inspect "$ref" --format '{{.Id}}')
 
     if [ -n "$before" ] && [ "$before" = "$after" ]; then
@@ -161,6 +166,21 @@ update_one() { # имя каталог образ
     write_result "$dir" 0 "новая версия не поднялась, откат тоже не удался" 0 "$version_before" "?"
     die "$name: обновление не удалось И откат не удался — нужны руки: cd $dir && docker compose logs"
 }
+
+# Какой тег скачивать. Явный (v1.2.0 из запроса панели или аргумента) —
+# его; иначе по каналу из .env панели: latest — каждый коммит, stable
+# (по умолчанию) — последний релиз. Compose при этом продолжает смотреть на
+# :latest — скачанный образ подставляется под этот тег локально. Так у
+# канала stable на сервере оказывается именно релиз, а не «что там сейчас
+# собралось из master».
+channel_tag() { # каталог [явный тег]
+    local dir="$1" explicit="${2:-}" channel
+    case "$explicit" in v[0-9]*) echo "$explicit"; return ;; esac
+    channel=$(grep -s '^UPDATE_CHANNEL=' "$dir/.env" | tail -1 | cut -d= -f2- | tr -d '[:space:]"'"'"'')
+    [ "$channel" = latest ] && echo latest || echo stable
+}
+
+image_repo() { (cd "$1" && docker compose config --images | head -1 | sed 's/:[^:/]*$//'); }
 
 # Тег, под которым лежит прежняя версия: vbif666/…-panel:previous.
 previous_ref() {
@@ -202,10 +222,11 @@ check_one() { # имя каталог образ
     local version sha local_digest remote_digest
     version=$(container_env "$dir" NOISEFLOOR_VERSION 2>/dev/null || echo "?")
     sha=$(container_env "$dir" NOISEFLOOR_BUILD_SHA 2>/dev/null || echo "?")
-    local_digest=$(docker image inspect "$image:latest" --format '{{index .RepoDigests 0}}' 2>/dev/null | cut -d@ -f2 || true)
-    remote_digest=$(curl -fsS --max-time 10 "https://hub.docker.com/v2/repositories/$image/tags/latest" 2>/dev/null \
+    local tag; tag=$(channel_tag "$dir")
+    local_digest=$(docker image inspect "$(cd "$dir" && docker compose config --images | head -1)" --format '{{index .RepoDigests 0}}' 2>/dev/null | cut -d@ -f2 || true)
+    remote_digest=$(curl -fsS --max-time 10 "https://hub.docker.com/v2/repositories/$image/tags/$tag" 2>/dev/null \
         | python3 -c 'import sys,json; print(json.load(sys.stdin).get("digest",""))' 2>/dev/null || true)
-    printf '%-6s %-28s коммит %-8s ' "$name" "$version" "$sha"
+    printf '%-6s %-28s коммит %-8s канал %-7s' "$name" "$version" "$sha" "$tag"
     if [ -z "$remote_digest" ]; then
         echo "— реестр недоступен"
     elif [ -z "$local_digest" ]; then
@@ -281,7 +302,8 @@ cmd_watch() {
     # Переменная нарочно глобальная: trap выполняется уже вне функции, и
     # local к тому моменту не существует — первый прогон на этом и попался.
     trap 'rm -f "$REQUEST_PATH"' EXIT
-    log "запрос из панели — обновляю всё, что есть на хосте"
+    REQUEST_TARGET=$(python3 -c 'import sys,json; print(json.load(open(sys.argv[1])).get("target",""))' "$REQUEST_PATH" 2>/dev/null || true)
+    log "запрос из панели (${REQUEST_TARGET:-по каналу}) — обновляю всё, что есть на хосте"
     # Панель — последней: её перезапуск рвёт соединение с самим оператором.
     # Релея на этом хосте может и не быть — это не ошибка.
     (for_each update_one relay) 2>/dev/null || true
@@ -293,7 +315,7 @@ cmd_watch() {
 case "${1:-}" in
     status)        cmd_status "${2:-}" ;;
     check)         cmd_check "${2:-}" ;;
-    update)        for_each update_one "${2:-}" ;;
+    update)        REQUEST_TARGET="${3:-}"; for_each update_one "${2:-}" ;;
     rollback)      for_each rollback_one "${2:-}" ;;
     install-agent) cmd_install_agent ;;
     watch)         cmd_watch ;;
