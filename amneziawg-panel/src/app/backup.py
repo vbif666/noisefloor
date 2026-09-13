@@ -55,6 +55,13 @@ def create() -> Path:
         encrypted = bool(_passphrase())
         suffix = ".tar.gz.enc" if encrypted else ".tar.gz"
         target = BACKUP_DIR / f"noisefloor-{_timestamp()}{suffix}"
+        # Миллисекунд тоже бывает мало: на быстрой машине две копии подряд
+        # укладываются в одну (поймано в CI). Имя обязано быть новым при
+        # любых часах — досчитываем суффикс, пока не станет.
+        counter = 1
+        while target.exists():
+            target = BACKUP_DIR / f"noisefloor-{_timestamp()}-{counter}{suffix}"
+            counter += 1
 
         with tempfile.NamedTemporaryFile(suffix=".tar.gz", delete=False) as tmp:
             tmp_path = Path(tmp.name)

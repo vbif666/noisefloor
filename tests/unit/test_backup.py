@@ -57,6 +57,14 @@ class BackupTests(unittest.TestCase):
         first = self.backup.create()
         second = self.backup.create()
         self.assertNotEqual(first.name, second.name)
+        self.assertTrue(first.exists(), "первая копия должна остаться на месте")
+
+    def test_same_millisecond_still_gives_distinct_names(self):
+        # На быстрой машине (CI) две копии подряд укладываются в одну
+        # миллисекунду — имя не может опираться только на часы.
+        with mock.patch.object(self.backup, "_timestamp", return_value="20260913-081116-618"):
+            names = {self.backup.create().name for _ in range(3)}
+        self.assertEqual(len(names), 3)
         with tarfile.open(second) as tar:
             self.assertNotIn("backups", tar.getnames())
 
