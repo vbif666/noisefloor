@@ -93,10 +93,13 @@ jobs:
       # Приёмочный поднимает оба сервиса с нуля и проверяет, что через них
       # идёт настоящий трафик — до REALITY-рукопожатия включительно. Проверке
       # правил нужен dummy-интерфейс внутри контейнера, модуль грузим на хосте.
+      # Под sudo, потому что контейнеры пишут в примонтированные каталоги от
+      # root, а раннер работает от обычного пользователя — иначе тест не
+      # может прочитать сгенерированный пароль и убрать за собой.
       - name: Приёмочный тест
         run: |
           sudo modprobe dummy || true
-          PANEL_IMAGE="$PANEL_IMAGE:ci" RELAY_IMAGE="$RELAY_IMAGE:ci" bash tests/smoke.sh
+          sudo -E env PATH="$PATH" PANEL_IMAGE="$PANEL_IMAGE:ci" RELAY_IMAGE="$RELAY_IMAGE:ci" bash tests/smoke.sh
 
       - name: Вход в Docker Hub
         if: github.event_name == 'push' && env.DOCKERHUB_TOKEN != ''
