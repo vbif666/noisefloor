@@ -295,6 +295,7 @@ GitHub, `latest` — каждый коммит в master. Подробности
 | `PANEL_PORT` | `8001` | HTTP-порт страницы статуса |
 | `REALITY_DEST` | `dl.google.com:443` | Камуфляжный сайт на старте. **Не меняйте на `www.microsoft.com`** — см. ниже |
 | `REALITY_SNI` | из `REALITY_DEST` | Домен, под который маскируемся, на старте |
+| `DEST_MAX_HANDSHAKE_MS` | `50` | Бюджет TCP+TLS от релея до camouflage-хоста; хост дальше в ротацию не берётся — его задержку платит каждое соединение клиента |
 | `ADMIN_USERNAME` | `admin` | Логин на страницу статуса (Basic-авторизация) |
 | `ADMIN_PASSWORD` | генерируется | Пароль; попадёт в `data/INITIAL_ADMIN_PASSWORD.txt` |
 | `APP_NAME`, `APP_CODENAME` | `NOISEFLOOR`, `Relay-01` | Косметика заголовка страницы |

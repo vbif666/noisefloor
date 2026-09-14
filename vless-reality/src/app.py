@@ -85,20 +85,26 @@ DEFAULT_REALITY_SNI = os.environ.get("REALITY_SNI") or DEFAULT_REALITY_DEST.spli
 # Ротация маскировки. Один и тот же SNI на одном и том же адресе месяцами —
 # устойчивая примета; пул хостов и смена по расписанию её размывают. Пул
 # по умолчанию собран из хостов, которые прошли check_dest() с этого же
-# сервера (TLS 1.3, h2, короткая цепочка сертификатов) и выглядят
-# естественно в трафике обычного пользователя: магазины техники, CDN,
-# сервисы Apple/Google.
+# сервера (TLS 1.3, h2, короткая цепочка сертификатов, БЛИЗКО к серверу —
+# см. DEST_MAX_HANDSHAKE_MS) и выглядят естественно в трафике обычного
+# пользователя: CDN, магазины техники, облака.
+#
+# Близость — не косметика. REALITY-сервер на КАЖДЫЙ ClientHello сам идёт к
+# dest за настоящим ответом сервера, и клиент ждёт этот поход целиком:
+# рукопожатие клиента стоит 2 RTT до релея плюс TCP+TLS от релея до dest.
+# Замер на живом каскаде (RTT 43 мс до релея): с www.samsung.com (127 мс от
+# релея) рукопожатие занимало 239 мс, с dl.google.com (7 мс) — 130 мс. Это
+# платится на каждое новое TCP-соединение браузера, а не один раз.
 ROTATION_DEFAULT_POOL = [
     "dl.google.com",
-    "gateway.icloud.com",
-    "www.samsung.com",
-    "www.amd.com",
-    "www.cloudflare.com",
-    "www.mozilla.org",
-    "www.speedtest.net",
-    "www.dell.com",
-    "www.lenovo.com",
+    "www.gstatic.com",
+    "www.google.com",
+    "aws.amazon.com",
     "www.asus.com",
+    "www.logitech.com",
+    "www.nikon.com",
+    "www.canon.com",
+    "www.kpn.com",
 ]
 ROTATION_DEFAULT_HOURS = 4
 ROTATION_CHECK_SECONDS = 15
@@ -112,6 +118,15 @@ ROTATION_MISSED_SECONDS = 120
 # отдавал то 7.9, то 8.3 КБ в зависимости от того, куда попал запрос.
 CERT_RECORD_LIMIT = 7600
 DEST_CHECK_TIMEOUT = 6.0
+# Бюджет на TCP+TLS от релея до dest (без DNS). Хост дальше этого в
+# ротацию не берётся, даже если формально годен: его задержку получает
+# каждое соединение каждого клиента (см. комментарий к пулу). 50 мс —
+# в два с лишним раза больше, чем у хостов пула по умолчанию из
+# Амстердама, и заведомо меньше, чем у «далёких» CDN-узлов (90-130 мс).
+DEST_MAX_HANDSHAKE_MS = int(os.environ.get("DEST_MAX_HANDSHAKE_MS", "50"))
+# Замер делается дважды, берётся лучший: одиночный всплеск на пути не
+# должен выбрасывать хороший хост из ротации.
+DEST_CHECK_ATTEMPTS = 2
 # После смены прежний SNI ещё принимается: панель на первом сервере узнаёт
 # о смене не мгновенно (опрос раз в пять минут, а ручная смена и вовсе не
 # объявляется), и без этого окна каскад лежал бы до её опроса. Проверено
@@ -427,6 +442,26 @@ def parse_pool(text: str) -> list[str]:
     return hosts
 
 
+def dest_problems(version: str | None, alpn: str | None, cert_bytes: int, chain_len: int,
+                  ms: int, max_ms: int | None = None) -> list[str]:
+    """Чем хост не годится в dest; пустой список — годится. Вынесено из
+    check_dest, чтобы критерии проверялись без сети."""
+    max_ms = DEST_MAX_HANDSHAKE_MS if max_ms is None else max_ms
+    problems = []
+    if version != "TLSv1.3":
+        problems.append(f"{version} вместо TLS 1.3")
+    if alpn != "h2":
+        problems.append("нет h2 в ALPN")
+    if not chain_len:
+        problems.append("не удалось прочитать цепочку сертификатов")
+    elif cert_bytes > CERT_RECORD_LIMIT:
+        problems.append(f"цепочка сертификатов {cert_bytes} байт — больше лимита REALITY")
+    if ms > max_ms:
+        problems.append(f"рукопожатие {ms} мс — дальше бюджета {max_ms} мс, "
+                        "это платит каждое соединение клиента")
+    return problems
+
+
 def check_dest(dest: str, timeout: float = DEST_CHECK_TIMEOUT) -> dict:
     """Годится ли хост в camouflage dest.
 
@@ -434,7 +469,13 @@ def check_dest(dest: str, timeout: float = DEST_CHECK_TIMEOUT) -> dict:
     xray. Требования — те, без которых REALITY не поднимет рукопожатие:
     TLS 1.3, h2 в ALPN и цепочка сертификатов короче лимита. Последнее —
     не теория: www.microsoft.com с раздутым Certificate однажды уложил
-    каскад на несколько дней, при том что обе стороны выглядели живыми."""
+    каскад на несколько дней, при том что обе стороны выглядели живыми.
+
+    Четвёртое требование — задержка: TCP+TLS до dest должны укладываться
+    в DEST_MAX_HANDSHAKE_MS, потому что REALITY повторяет этот поход на
+    каждое рукопожатие клиента. Имя разрешается до запуска секундомера:
+    xray резолвит dest один раз и дальше держит в кэше, а нам важен
+    именно путь до хоста, а не скорость DNS."""
     host, _, port_text = dest.partition(":")
     try:
         port = int(port_text or 443)
@@ -442,37 +483,41 @@ def check_dest(dest: str, timeout: float = DEST_CHECK_TIMEOUT) -> dict:
         return {"host": host, "ok": False, "error": f"непонятный порт «{port_text}»"}
     ctx = ssl.create_default_context()
     ctx.set_alpn_protocols(["h2", "http/1.1"])
-    started = time.monotonic()
     try:
-        with socket.create_connection((host, port), timeout=timeout) as raw:
-            with ctx.wrap_socket(raw, server_hostname=host) as tls:
-                version = tls.version()
-                alpn = tls.selected_alpn_protocol()
-                # Публичного метода до 3.13 нет; private-имя стабильно
-                # с 3.10, и другого способа увидеть всю цепочку у ssl нет.
-                getter = getattr(tls, "get_unverified_chain", None) or tls._sslobj.get_unverified_chain
-                chain = getter() or []
+        family, _, _, _, sockaddr = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)[0]
     except Exception as exc:
         return {"host": host, "ok": False, "error": f"{type(exc).__name__}: {exc}"[:140]}
+    best_ms = None
+    version = alpn = None
+    chain = []
+    for _ in range(DEST_CHECK_ATTEMPTS):
+        started = time.monotonic()
+        try:
+            with socket.socket(family, socket.SOCK_STREAM) as raw:
+                raw.settimeout(timeout)
+                raw.connect(sockaddr)
+                with ctx.wrap_socket(raw, server_hostname=host) as tls:
+                    elapsed = int((time.monotonic() - started) * 1000)
+                    version = tls.version()
+                    alpn = tls.selected_alpn_protocol()
+                    # Публичного метода до 3.13 нет; private-имя стабильно
+                    # с 3.10, и другого способа увидеть всю цепочку у ssl нет.
+                    getter = getattr(tls, "get_unverified_chain", None) or tls._sslobj.get_unverified_chain
+                    chain = getter() or []
+        except Exception as exc:
+            return {"host": host, "ok": False, "error": f"{type(exc).__name__}: {exc}"[:140]}
+        best_ms = elapsed if best_ms is None else min(best_ms, elapsed)
     # Размер Certificate-сообщения TLS: 4 байта заголовка, затем на каждый
     # сертификат 3 байта длины, сам DER и 2 байта пустых расширений.
     cert_bytes = 4 + sum(len(c.public_bytes(ssl._ssl.ENCODING_DER)) + 5 for c in chain)
-    problems = []
-    if version != "TLSv1.3":
-        problems.append(f"{version} вместо TLS 1.3")
-    if alpn != "h2":
-        problems.append("нет h2 в ALPN")
-    if not chain:
-        problems.append("не удалось прочитать цепочку сертификатов")
-    elif cert_bytes > CERT_RECORD_LIMIT:
-        problems.append(f"цепочка сертификатов {cert_bytes} байт — больше лимита REALITY")
+    problems = dest_problems(version, alpn, cert_bytes, len(chain), best_ms)
     return {
         "host": host,
         "ok": not problems,
         "tls": version,
         "alpn": alpn,
         "cert_bytes": cert_bytes,
-        "ms": int((time.monotonic() - started) * 1000),
+        "ms": best_ms,
         "error": "; ".join(problems) or None,
     }
 
@@ -597,32 +642,62 @@ xray_proc: subprocess.Popen | None = None
 xray_lock = threading.Lock()
 
 
-def start_xray():
+def _start_xray_locked():
     global xray_proc
-    with xray_lock:
-        xray_proc = subprocess.Popen([XRAY_BIN, "run", "-config", str(CONFIG_FILE)])
+    xray_proc = subprocess.Popen([XRAY_BIN, "run", "-config", str(CONFIG_FILE)])
     with state_lock:
         state["xray_running"] = True
 
 
-def stop_xray():
-    global xray_proc
+def _stop_xray_locked():
+    if xray_proc and xray_proc.poll() is None:
+        xray_proc.terminate()
+        try:
+            xray_proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            xray_proc.kill()
+    with state_lock:
+        state["xray_running"] = False
+
+
+def start_xray():
     with xray_lock:
-        if xray_proc and xray_proc.poll() is None:
-            xray_proc.terminate()
-            try:
-                xray_proc.wait(timeout=10)
-            except subprocess.TimeoutExpired:
-                xray_proc.kill()
-        with state_lock:
-            state["xray_running"] = False
+        _start_xray_locked()
+
+
+def stop_xray():
+    with xray_lock:
+        _stop_xray_locked()
 
 
 def restart_xray():
-    """Apply a config change without restarting the whole container."""
-    stop_xray()
-    time.sleep(0.5)
-    start_xray()
+    """Apply a config change without restarting the whole container.
+
+    Остановка, пауза и запуск — под одним замком. Раньше замок брался на
+    каждый шаг отдельно, и в паузу между ними влезал watchdog: видел
+    завершённый процесс и поднимал свой, после чего restart поднимал
+    второй. Оба слушали 8443 (SO_REUSEPORT), первый терялся навсегда —
+    его никто не останавливал, статистика делилась надвое, а смена dest
+    к нему не доезжала."""
+    with xray_lock:
+        _stop_xray_locked()
+        time.sleep(0.5)
+        _start_xray_locked()
+
+
+def watchdog_tick(stop_event: threading.Event) -> bool:
+    """Один такт сторожа: поднять xray, если он упал. Возвращает, был ли
+    запуск. Под тем же замком, что и restart_xray, — иначе сторож
+    считает штатную перезагрузку падением."""
+    with xray_lock:
+        if xray_proc is None or xray_proc.poll() is None:
+            return False
+        with state_lock:
+            state["xray_running"] = False
+        if stop_event.is_set():
+            return False
+        _start_xray_locked()
+        return True
 
 
 IP_RE = re.compile(r"(\d{1,3}(?:\.\d{1,3}){3}|\[[0-9a-fA-F:]+\]):\d+ accepted")
@@ -703,11 +778,7 @@ def rotate_access_log(stop_event: threading.Event):
 def watchdog(stop_event: threading.Event):
     while not stop_event.is_set():
         time.sleep(5)
-        if xray_proc is not None and xray_proc.poll() is not None:
-            with state_lock:
-                state["xray_running"] = False
-            if not stop_event.is_set():
-                start_xray()
+        watchdog_tick(stop_event)
 
 
 _stop_event = threading.Event()
@@ -1263,8 +1334,11 @@ canvas.chart-canvas { width: 100%; height: 140px; display: block; }
           <label for="f-pool">Пул хостов — по одному в строке</label>
           <textarea id="f-pool" name="pool" rows="6">@@ROT_POOL@@</textarea>
           <p class="field-hint">
-            Перед каждой сменой хост проверяется отсюда: TLS 1.3, h2 и цепочка
-            сертификатов короче лимита REALITY (8 КБ). Не прошедший пропускается.
+            Перед каждой сменой хост проверяется отсюда: TLS 1.3, h2, цепочка
+            сертификатов короче лимита REALITY (8 КБ) и рукопожатие до хоста не
+            дольше @@DEST_MAX_MS@@ мс — эту задержку релей повторяет на каждое
+            соединение клиента, поэтому далёкий хост замедляет всех. Не прошедший
+            пропускается.
             После смены прежний SNI принимается ещё 15 минут, поэтому каскад
             не рвётся: панель первого сервера переходит на новый на ближайшем
             опросе, а «Сменить сейчас» безопасно нажимать в любой момент.
@@ -1573,6 +1647,7 @@ def index(response: Response):
         "@@ROT_ENABLED@@": "checked" if rot["enabled"] else "",
         "@@ROT_HOURS@@": str(rot["interval_hours"]),
         "@@ROT_POOL@@": html.escape("\n".join(rot["pool"])),
+        "@@DEST_MAX_MS@@": str(DEST_MAX_HANDSHAKE_MS),
         "@@ROT_ERROR@@": html.escape(rot["last_error"] or ""),
         "@@ROT_HISTORY@@": rotation_history_html(rot),
     }

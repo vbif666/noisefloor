@@ -9,6 +9,8 @@ CONTRIBUTING.
 import json
 import os
 import tempfile
+import threading
+import time
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -201,6 +203,122 @@ class SyncPayloadTests(unittest.TestCase):
         self.assertIsNone(off["rotation"]["next_at"])
         self.assertEqual(on["rotation"]["next_at"], "2026-09-11T16:00:00+00:00")
         self.assertEqual(on["rotation"]["next_sni"], "www.amd.com")
+
+
+
+class DestCriteriaTests(unittest.TestCase):
+    """Критерии годности хоста — чистая функция, проверяется без сети."""
+
+    def test_good_host_passes(self):
+        self.assertEqual(app.dest_problems("TLSv1.3", "h2", 3000, 2, ms=12), [])
+
+    def test_slow_host_is_rejected_even_if_otherwise_fine(self):
+        problems = app.dest_problems("TLSv1.3", "h2", 3000, 2, ms=127, max_ms=50)
+        self.assertEqual(len(problems), 1)
+        self.assertIn("127 мс", problems[0])
+        self.assertIn("50 мс", problems[0])
+
+    def test_budget_is_inclusive(self):
+        self.assertEqual(app.dest_problems("TLSv1.3", "h2", 3000, 2, ms=50, max_ms=50), [])
+
+    def test_default_budget_comes_from_setting(self):
+        with mock.patch.object(app, "DEST_MAX_HANDSHAKE_MS", 20):
+            self.assertTrue(app.dest_problems("TLSv1.3", "h2", 3000, 2, ms=21))
+            self.assertFalse(app.dest_problems("TLSv1.3", "h2", 3000, 2, ms=20))
+
+    def test_protocol_problems_are_still_reported(self):
+        problems = app.dest_problems("TLSv1.2", "http/1.1", 9000, 3, ms=5)
+        self.assertEqual(len(problems), 3)
+
+    def test_default_pool_is_fast_from_amsterdam_relay(self):
+        # Пул по умолчанию проверен с релея в Амстердаме: все хосты ≤ 10 мс.
+        # Тест защищает от возвращения «далёких» хостов при правке списка.
+        for slow in ("www.samsung.com", "www.amd.com", "www.dell.com", "www.lenovo.com",
+                     "www.cloudflare.com", "www.mozilla.org", "gateway.icloud.com"):
+            self.assertNotIn(slow, app.ROTATION_DEFAULT_POOL)
+        self.assertGreaterEqual(len(app.ROTATION_DEFAULT_POOL), 5)
+
+
+class FakeProc:
+    """Процесс, который завершается по terminate() — как настоящий xray."""
+    started = []
+
+    def __init__(self, *args, **kwargs):
+        self.alive = True
+        FakeProc.started.append(self)
+
+    def poll(self):
+        return None if self.alive else 0
+
+    def terminate(self):
+        self.alive = False
+
+    def wait(self, timeout=None):
+        return 0
+
+    def kill(self):
+        self.alive = False
+
+
+class RestartRaceTests(unittest.TestCase):
+    """restart_xray и watchdog не должны поднимать два процесса.
+
+    Воспроизводит гонку с боевого сервера: в паузу между остановкой и
+    запуском внутри restart_xray сторож видел завершённый процесс и
+    запускал свой; итог — два xray на одном порту, один из них сирота."""
+
+    def setUp(self):
+        FakeProc.started = []
+        mock.patch.object(app.subprocess, "Popen", FakeProc).start()
+        self.addCleanup(mock.patch.stopall)
+        app.xray_proc = None
+        self.stop = app.threading.Event()
+
+    def tearDown(self):
+        app.xray_proc = None
+
+    def test_watchdog_tick_during_restart_pause_does_not_spawn_second_process(self):
+        app.start_xray()
+        self.assertEqual(len(FakeProc.started), 1)
+        pause_reached = app.threading.Event()
+        ticks = []
+        real_sleep = time.sleep
+
+        def sleep_then_tick(seconds):
+            # Пауза restart_xray: именно здесь раньше вклинивался сторож.
+            # Даём ему реальный шанс вклиниться, прежде чем продолжить.
+            pause_reached.set()
+            real_sleep(0.2)
+
+        def watchdog_side():
+            pause_reached.wait(5)
+            ticks.append(app.watchdog_tick(self.stop))
+
+        t = threading.Thread(target=watchdog_side)
+        t.start()
+        with mock.patch.object(app.time, "sleep", side_effect=sleep_then_tick):
+            app.restart_xray()
+        t.join(5)
+        # Сторож дождался конца перезапуска, увидел живой процесс и ничего
+        # не поднял: ровно два Popen за всю историю — первый старт и перезапуск.
+        self.assertEqual(ticks, [False])
+        self.assertEqual(len(FakeProc.started), 2)
+        self.assertIs(app.xray_proc, FakeProc.started[-1])
+        self.assertTrue(app.xray_proc.alive)
+
+    def test_watchdog_restarts_a_really_dead_process(self):
+        app.start_xray()
+        app.xray_proc.alive = False
+        self.assertTrue(app.watchdog_tick(self.stop))
+        self.assertEqual(len(FakeProc.started), 2)
+        self.assertTrue(app.xray_proc.alive)
+
+    def test_watchdog_does_nothing_when_stopping(self):
+        app.start_xray()
+        app.xray_proc.alive = False
+        self.stop.set()
+        self.assertFalse(app.watchdog_tick(self.stop))
+        self.assertEqual(len(FakeProc.started), 1)
 
 
 if __name__ == "__main__":
