@@ -337,5 +337,32 @@ class RenderedPolicyTests(unittest.TestCase):
         self.assertGreater(level["connIdle"], 300)
 
 
+class PortProvisioningTests(unittest.TestCase):
+    """VLESS_PORT из окружения действует и на уже развёрнутом релее."""
+
+    def _creds_file(self, port):
+        creds = {"uuid": "u", "short_id": "s", "private_key": "p", "public_key": "P",
+                 "dest": "dl.google.com:443", "sni": "dl.google.com", "vless_port": port,
+                 "sync_token": "t", "rotation": app.rotation_defaults()}
+        app.save_creds(creds)
+
+    def test_explicit_env_port_overrides_stored_one(self):
+        self._creds_file(8443)
+        with mock.patch.object(app, "VLESS_PORT", 443), mock.patch.object(app, "VLESS_PORT_EXPLICIT", True):
+            self.assertEqual(app.provision()["vless_port"], 443)
+        self.assertEqual(json.loads(app.CREDS_FILE.read_text())["vless_port"], 443)
+
+    def test_default_port_does_not_touch_existing_install(self):
+        self._creds_file(8443)
+        with mock.patch.object(app, "VLESS_PORT", 443), mock.patch.object(app, "VLESS_PORT_EXPLICIT", False):
+            self.assertEqual(app.provision()["vless_port"], 8443)
+
+    def test_fresh_install_gets_443(self):
+        if app.CREDS_FILE.exists():
+            app.CREDS_FILE.unlink()
+        with mock.patch.object(app, "VLESS_PORT", 443), mock.patch.object(app, "run_x25519", return_value={"private_key": "p", "public_key": "P"}):
+            self.assertEqual(app.provision()["vless_port"], 443)
+
+
 if __name__ == "__main__":
     unittest.main()

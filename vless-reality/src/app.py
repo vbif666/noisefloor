@@ -80,6 +80,11 @@ STATS_API_ADDR = "127.0.0.1:10085"
 # «браузерный ClientHello на нестандартном порту». Движок предупреждает
 # о том же при старте. Если 443 занят — освобождайте 443, а не релей.
 VLESS_PORT = int(os.environ.get("VLESS_PORT", "443"))
+# Порт из окружения — воля оператора и действует на уже развёрнутом релее
+# тоже, а не только при первом запуске: иначе установки с прежним
+# умолчанием 8443 остались бы на нём навсегда, и переезд на 443 требовал бы
+# ручной правки creds.json.
+VLESS_PORT_EXPLICIT = "VLESS_PORT" in os.environ
 PANEL_PORT = int(os.environ.get("PANEL_PORT", "8001"))
 # dl.google.com, not www.microsoft.com: REALITY has a known upstream bug
 # (XTLS/Xray-core #6356) where a stolen Certificate record >8192 bytes gets
@@ -269,6 +274,9 @@ def provision() -> dict:
         creds.setdefault("dest", DEFAULT_REALITY_DEST)
         creds.setdefault("sni", DEFAULT_REALITY_SNI)
         creds.setdefault("vless_port", VLESS_PORT)
+        if VLESS_PORT_EXPLICIT and creds["vless_port"] != VLESS_PORT:
+            creds["vless_port"] = VLESS_PORT
+            save_creds(creds)
         creds.setdefault("rotation", rotation_defaults())
         # Токен появился позже — дописываем его уже развёрнутым релеям,
         # чтобы синхронизация заработала без пересоздания ключей.
