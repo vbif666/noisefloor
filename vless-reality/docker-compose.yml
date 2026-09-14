@@ -17,7 +17,7 @@ services:
         max-file: "3"
     network_mode: host
     environment:
-      VLESS_PORT: "${VLESS_PORT:-8443}"
+      VLESS_PORT: "${VLESS_PORT:-443}"
       PANEL_PORT: "${PANEL_PORT:-8001}"
       REALITY_DEST: "${REALITY_DEST:-dl.google.com:443}"
       REALITY_SNI: "${REALITY_SNI:-}"

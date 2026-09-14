@@ -184,10 +184,11 @@ class LogAndTimeoutTests(unittest.TestCase):
     файл, куда идут ошибки, — на проде это 23 МБ за четыре дня и 138 тысяч
     строк, которые никто не читает.
 
-    Таймауты: умолчания рассчитаны не на прокси. connIdle 300 закрывает
-    молчащее пять минут соединение (ssh, imap, вебсокет мессенджера), а
-    uplinkOnly/downlinkOnly добивают вторую половину соединения через
-    считанные секунды после закрытия первой."""
+    Таймауты: connIdle 300 по умолчанию закрывает молчащее пять минут
+    соединение (ssh, imap, вебсокет мессенджера). uplinkOnly/downlinkOnly
+    обязаны быть больше нуля: 0 в движке значит «закрыть немедленно», а не
+    «ждать» — с таким значением каждый FIN от сайта превращался в RST
+    клиенту и обрезанный ответ (ERR_SOCKET_NOT_CONNECTED в браузере)."""
 
     def setUp(self):
         self.config = cascade.build_xray_config(cascade.parse_vless_url(VALID_URL))
@@ -203,10 +204,11 @@ class LogAndTimeoutTests(unittest.TestCase):
         level = self.config["policy"]["levels"]["0"]
         self.assertGreater(level["connIdle"], 300)
 
-    def test_half_closed_connections_are_not_cut_short(self):
+    def test_half_closed_connections_get_a_real_grace_period(self):
         level = self.config["policy"]["levels"]["0"]
-        self.assertEqual(level["uplinkOnly"], 0)
-        self.assertEqual(level["downlinkOnly"], 0)
+        # Не 0 (немедленное закрытие) и не меньше умолчаний движка (2/5).
+        self.assertGreaterEqual(level["uplinkOnly"], 2)
+        self.assertGreaterEqual(level["downlinkOnly"], 5)
 
 
 class SniffingByModeTests(unittest.TestCase):

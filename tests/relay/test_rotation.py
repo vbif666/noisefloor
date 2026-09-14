@@ -321,5 +321,21 @@ class RestartRaceTests(unittest.TestCase):
         self.assertEqual(len(FakeProc.started), 1)
 
 
+class RenderedPolicyTests(unittest.TestCase):
+    """Таймауты в отрендеренном конфиге релея."""
+
+    def test_half_close_timeouts_are_never_zero(self):
+        # 0 для uplinkOnly/downlinkOnly в движке значит «закрыть немедленно»
+        # (SetTimeout(0) -> finish()), а не «ждать»: каждый FIN от сайта
+        # превращался в RST клиенту. Не меньше умолчаний движка (2/5).
+        creds = {"uuid": "u", "short_id": "s", "private_key": "p", "public_key": "P",
+                 "dest": "dl.google.com:443", "sni": "dl.google.com", "vless_port": 8443}
+        app.render_config(creds, now=NOW)
+        level = json.loads(app.CONFIG_FILE.read_text())["policy"]["levels"]["0"]
+        self.assertGreaterEqual(level["uplinkOnly"], 2)
+        self.assertGreaterEqual(level["downlinkOnly"], 5)
+        self.assertGreater(level["connIdle"], 300)
+
+
 if __name__ == "__main__":
     unittest.main()

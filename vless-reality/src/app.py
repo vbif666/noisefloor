@@ -73,7 +73,13 @@ ACCESS_LOG_CHECK_SECONDS = 60
 XRAY_BIN = os.environ.get("XRAY_BIN", "/usr/local/bin/xray")
 STATS_API_ADDR = "127.0.0.1:10085"
 
-VLESS_PORT = int(os.environ.get("VLESS_PORT", "8443"))
+# Только 443. Замерено на живом плече RU -> NL (2026-09-14): REALITY на
+# 8443 — от 4 до 20 % соединений молча закапывались DPI после первого
+# сегмента ClientHello (в обе стороны, без RST), тот же клиент на 443 —
+# 0 из 150. Обычный curl-TLS на 8443 проходил: триггер именно
+# «браузерный ClientHello на нестандартном порту». Движок предупреждает
+# о том же при старте. Если 443 занят — освобождайте 443, а не релей.
+VLESS_PORT = int(os.environ.get("VLESS_PORT", "443"))
 PANEL_PORT = int(os.environ.get("PANEL_PORT", "8001"))
 # dl.google.com, not www.microsoft.com: REALITY has a known upstream bug
 # (XTLS/Xray-core #6356) where a stolen Certificate record >8192 bytes gets
@@ -325,20 +331,26 @@ def render_config(creds: dict, now: datetime | None = None) -> None:
         "stats": {},
         "api": {"tag": "api", "services": ["StatsService"]},
         "policy": {
-            # Таймауты выставлены явно, потому что умолчания движка рвут
-            # длинные соединения: connIdle 300 закрывает всё, что молчит
-            # пять минут (ssh, imap, вебсокеты мессенджеров), а uplinkOnly 2
-            # и downlinkOnly 5 добивают вторую половину соединения сразу
-            # после закрытия первой, обрезая хвост больших ответов. Те же
-            # значения стоят на входе каскада в панели — плечо одно, и
-            # таймауты на его концах расходиться не должны.
+            # Таймауты выставлены явно: connIdle 300 по умолчанию закрывает
+            # всё, что молчит пять минут (ssh, imap, вебсокеты мессенджеров).
+            # uplinkOnly / downlinkOnly — таймеры БЕЗДЕЙСТВИЯ второй половины
+            # соединения после закрытия первой; пока данные идут, они
+            # продлеваются. Щедрее умолчаний (2/5), потому что плечо двойное.
+            #
+            # 0 здесь ЗАПРЕЩЁН: SetTimeout(0) в движке — это finish()
+            # немедленно, соединение убивается по первому же FIN от сайта,
+            # недоставленный хвост ответа выбрасывается, клиент получает RST
+            # (в браузере на macOS — ERR_SOCKET_NOT_CONNECTED). Так и было
+            # с 2026-09-10 по 2026-09-14. Те же значения стоят на входе
+            # каскада в панели — плечо одно, и таймауты на его концах
+            # расходиться не должны.
             "levels": {"0": {
                 "statsUserUplink": True,
                 "statsUserDownlink": True,
                 "handshake": 8,
                 "connIdle": 900,
-                "uplinkOnly": 0,
-                "downlinkOnly": 0,
+                "uplinkOnly": 5,
+                "downlinkOnly": 10,
             }},
             "system": {"statsInboundUplink": True, "statsInboundDownlink": True},
         },

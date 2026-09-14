@@ -72,7 +72,7 @@ services:
     container_name: $c
     restart: "no"
     ports:
-      - "127.0.0.1:$RELAY_VLESS_PORT:8443"
+      - "127.0.0.1:$RELAY_VLESS_PORT:443"
       - "127.0.0.1:$RELAY_PANEL_PORT:8001"
     environment:
       LABEL: "smoke-test"
