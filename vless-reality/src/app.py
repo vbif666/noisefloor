@@ -42,6 +42,8 @@ from pathlib import Path
 from urllib.parse import quote
 
 from fastapi import Depends, FastAPI, Form, HTTPException, Request, status
+
+import self_update
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 import qrcode
@@ -815,6 +817,7 @@ async def lifespan(app: FastAPI):
         threading.Thread(target=poll_stats, args=(_stop_event,), daemon=True),
         threading.Thread(target=rotate_access_log, args=(_stop_event,), daemon=True),
         threading.Thread(target=rotation_loop, args=(_stop_event,), daemon=True),
+        threading.Thread(target=self_update.run, args=(_stop_event,), daemon=True),
     ]
     for t in threads:
         t.start()
@@ -1045,6 +1048,27 @@ def api_rotation_check():
     хостов отвалится, а не узнавать об этом из журнала смен."""
     pool = get_rotation(load_creds())["pool"]
     return JSONResponse([check_dest(f"{host}:443") for host in pool])
+
+
+@app.get("/api/update")
+def api_update_status():
+    """Какая версия стоит, что опубликовано, есть ли агент, чем кончилось
+    прошлое обновление. Сеть не трогает — последний результат фоновой
+    проверки."""
+    return JSONResponse(self_update.status().as_dict())
+
+
+@app.post("/api/update/check")
+def api_update_check():
+    return JSONResponse(self_update.check().as_dict())
+
+
+@app.post("/api/update/apply")
+def api_update_apply():
+    ok, message = self_update.request_update()
+    if not ok:
+        raise HTTPException(status_code=409, detail=message)
+    return JSONResponse({"ok": True, "message": message})
 
 
 @app.post("/api/restart")
@@ -1377,6 +1401,30 @@ canvas.chart-canvas { width: 100%; height: 140px; display: block; }
   </div>
 
   <div class="panel">
+    <div class="panel-header">
+      <h2>Версия и обновления</h2>
+      <span class="eyebrow" id="upd-version-chip">—</span>
+    </div>
+    <div class="panel-body">
+      <div class="key-display" id="upd-summary" style="display:block;white-space:pre-wrap">—</div>
+      <div id="upd-box" class="field-hint" hidden style="margin-top:10px">
+        <span class="eyebrow">Доступно обновление</span>
+        <div id="upd-text" style="margin:6px 0 8px"></div>
+        <pre id="upd-notes" class="key-display" style="display:block;white-space:pre-wrap;max-height:180px;overflow:auto;margin:0 0 10px" hidden></pre>
+        Обновление — это перезапуск релея: каскад с первого сервера и его
+        клиенты отвалятся на полминуты и переподключатся сами. Если новая
+        версия не поднимется, агент вернёт прежнюю.
+      </div>
+      <p class="field-hint" id="upd-hint" style="margin:10px 0"></p>
+      <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+        <button type="button" class="btn btn-sm" id="upd-apply-btn" hidden onclick="applyUpdate()">Обновить сейчас</button>
+        <button type="button" class="btn btn-sm" id="upd-check-btn" onclick="checkUpdate()">Проверить обновления</button>
+        <span id="upd-status" class="field-hint"></span>
+      </div>
+    </div>
+  </div>
+
+  <div class="panel">
     <div class="panel-header"><h2>Управление</h2></div>
     <div class="panel-body">
       <button class="btn btn-danger btn-sm" onclick="if(confirm('Перезапустить контейнер?')){fetch('/api/restart',{method:'POST'}).then(()=>setTimeout(()=>location.reload(),4000))}">Перезапустить контейнер</button>
@@ -1389,6 +1437,7 @@ canvas.chart-canvas { width: 100%; height: 140px; display: block; }
 function fmtWhen(iso) {
   if (!iso) return "—";
   const d = new Date(iso);
+  if (isNaN(d)) return iso;  // штамп сборки бывает «unknown»
   return d.toLocaleString([], { day: "2-digit", month: "2-digit", hour: "2-digit", minute: "2-digit" });
 }
 function localizeTimes() {
@@ -1575,8 +1624,66 @@ function drawChart() {
   drawSeries(upRates, "#ff9f45", "rgba(255, 159, 69, 0.14)");
 }
 
-pollStatus(); pollHistory();
+// ------------------------------------------------------------- update ----
+function renderUpdate(st) {
+  const cur = st.current || {};
+  document.getElementById("upd-version-chip").textContent = cur.version || "dev";
+  document.getElementById("upd-summary").textContent =
+    `NOISEFLOOR ${cur.version || "dev"}  (коммит ${cur.sha || "?"}, собрано ${fmtWhen(cur.date)})\n` +
+    `xray ${(st.components || {}).xray || "?"}`;
+  const box = document.getElementById("upd-box");
+  const apply = document.getElementById("upd-apply-btn");
+  const hint = document.getElementById("upd-hint");
+  const status = document.getElementById("upd-status");
+  if (st.available && st.latest) {
+    const l = st.latest;
+    document.getElementById("upd-text").textContent =
+      `${l.version}${l.date ? " от " + fmtWhen(l.date) : ""} — канал «${st.channel}». Подробности: ${l.url}`;
+    const notes = document.getElementById("upd-notes");
+    notes.textContent = l.notes || ""; notes.hidden = !l.notes;
+    box.hidden = false;
+    apply.hidden = !st.agent_available;
+    hint.textContent = st.agent_available ? "" :
+      "На хосте нет агента обновлений: выполните на сервере  noisefloor install-agent  " +
+      "(или вручную: docker compose pull && docker compose up -d).";
+  } else {
+    box.hidden = true; apply.hidden = true;
+    hint.textContent = st.check_error ? "" :
+      `Обновлений нет — канал «${st.channel}»${st.checked_at ? ", проверено " + fmtWhen(st.checked_at) : ""}.`;
+  }
+  if (st.check_error) status.textContent = st.check_error;
+  else if (st.pending) status.textContent = "агент обновляет…";
+  else if (st.last_result) {
+    const r = st.last_result;
+    status.textContent = `${r.ok ? "✓" : "✗"} ${r.message}${r.finished_at ? " (" + fmtWhen(r.finished_at) + ")" : ""}`;
+  } else status.textContent = "";
+}
+async function pollUpdate() {
+  try { renderUpdate(await (await fetch("/api/update", { cache: "no-store" })).json()); } catch (e) {}
+}
+async function checkUpdate() {
+  const btn = document.getElementById("upd-check-btn");
+  btn.disabled = true; btn.textContent = "Проверяю…";
+  try { renderUpdate(await (await fetch("/api/update/check", { method: "POST" })).json()); }
+  catch (e) { document.getElementById("upd-status").textContent = "не удалось проверить: " + e.message; }
+  finally { btn.disabled = false; btn.textContent = "Проверить обновления"; }
+}
+async function applyUpdate() {
+  if (!confirm("Обновить релей? Каскад прервётся на полминуты.")) return;
+  const btn = document.getElementById("upd-apply-btn");
+  btn.disabled = true;
+  try {
+    const r = await fetch("/api/update/apply", { method: "POST" });
+    const d = await r.json();
+    document.getElementById("upd-status").textContent = r.ok ? d.message : (d.detail || "ошибка");
+    if (r.ok) setTimeout(pollUpdate, 45000);
+  } catch (e) { document.getElementById("upd-status").textContent = "ошибка: " + e.message; }
+  finally { btn.disabled = false; }
+}
+
+pollStatus(); pollHistory(); pollUpdate();
 setInterval(pollStatus, 4000);
+setInterval(pollUpdate, 30000);
 setInterval(pollHistory, 5000);
 window.addEventListener("resize", drawChart);
 </script>

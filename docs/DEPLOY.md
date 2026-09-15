@@ -121,6 +121,8 @@ services:
       ADMIN_USERNAME: "${ADMIN_USERNAME:-admin}"
       ADMIN_PASSWORD: "${ADMIN_PASSWORD:-}"
       APP_CODENAME: "${APP_CODENAME:-Relay-01}"
+      UPDATE_CHANNEL: "${UPDATE_CHANNEL:-stable}"
+      DEST_MAX_HANDSHAKE_MS: "${DEST_MAX_HANDSHAKE_MS:-50}"
     volumes:
       - ./data:/data
 EOF

@@ -262,7 +262,7 @@ SYNC_TOKEN="$(docker exec "$CONTAINER" python3 -c \
 # `noisefloor update` на хосте и кнопка «Обновить» в панели — одно и то же
 # действие: скачать образ, перезапустить, дождаться здоровья, при неудаче
 # вернуть прежнюю версию. Кнопке нужен systemd-юнит, который ждёт запроса
-# от панели; ставит его `noisefloor install-agent`.
+# от релея (тот же агент обслуживает и панель); ставит его `noisefloor install-agent`.
 log "ставлю команду noisefloor"
 if curl -fsSL "https://raw.githubusercontent.com/vbif666/noisefloor/master/tools/noisefloor" -o /usr/local/bin/noisefloor.tmp; then
     mv /usr/local/bin/noisefloor.tmp /usr/local/bin/noisefloor
@@ -270,6 +270,8 @@ if curl -fsSL "https://raw.githubusercontent.com/vbif666/noisefloor/master/tools
     mkdir -p /etc/noisefloor
     grep -qs "^relay=" /etc/noisefloor/services 2>/dev/null && sed -i "/^relay=/d" /etc/noisefloor/services
     echo "relay=$INSTALL_DIR" >> /etc/noisefloor/services
+    noisefloor install-agent >/dev/null 2>&1 \
+        || warn "агент обновлений не установился — кнопка «Обновить» на странице релея работать не будет, остаётся noisefloor update"
 else
     warn "не удалось скачать tools/noisefloor — обновлять придётся вручную: docker compose pull && docker compose up -d"
 fi

@@ -15,14 +15,14 @@
 #   noisefloor check               есть ли обновления
 #   noisefloor update [panel|relay] [тег]  обновить (по умолчанию всё; тег — например v1.2.0)
 #   noisefloor rollback [panel|relay] вернуть предыдущую версию
-#   noisefloor install-agent       поставить systemd-юнит для кнопки в панели
-#   noisefloor watch               (для systemd) обработать запрос от панели
+#   noisefloor install-agent       поставить systemd-юнит для кнопки «Обновить» (панель и релей)
+#   noisefloor watch               (для systemd) обработать запрос от панели или релея
 #
 # Где искать сервисы: /etc/noisefloor/services (пишет установщик), строки
 # вида panel=/opt/noisefloor-panel. Если файла нет — обход /opt/*/.
 set -euo pipefail
 
-AGENT_VERSION=1
+AGENT_VERSION=2
 SERVICES_FILE=/etc/noisefloor/services
 REQUEST_TARGET=""
 REPO=vbif666/noisefloor
@@ -259,14 +259,23 @@ cmd_status() { printf '%-6s %-28s %-10s %s\n' "сервис" "версия" "з�
 
 # ---------------------------------------------------------- агент/systemd ---
 
+# Агент один на хост и обслуживает оба сервиса: и панель, и релей кладут
+# запрос в свой каталог данных, path-юнит ждёт любой из них. До версии 2
+# агент ставился только рядом с панелью, и у релея кнопки «Обновить»
+# не было вовсе.
 cmd_install_agent() {
-    local panel_dir; panel_dir=$(service_dir panel)
-    [ -n "$panel_dir" ] || die "панель на этом хосте не найдена — агент нужен только ей"
-    command -v systemctl >/dev/null || die "нет systemd — кнопка в панели работать не будет, остаётся noisefloor update"
+    local found=0 paths=""
+    while IFS=$'\t' read -r name dir image; do
+        found=1
+        paths="$paths
+PathExists=$dir/data/update-request.json"
+    done < <(services)
+    [ "$found" = 1 ] || die "на этом хосте не найдено ни панели, ни релея"
+    command -v systemctl >/dev/null || die "нет systemd — кнопка «Обновить» работать не будет, остаётся noisefloor update"
 
     cat > /etc/systemd/system/noisefloor-updater.service <<EOF
 [Unit]
-Description=NOISEFLOOR: обновление по запросу из панели
+Description=NOISEFLOOR: обновление по запросу из панели или релея
 After=docker.service
 Requires=docker.service
 
@@ -276,38 +285,52 @@ ExecStart=/usr/local/bin/noisefloor watch
 EOF
     cat > /etc/systemd/system/noisefloor-updater.path <<EOF
 [Unit]
-Description=NOISEFLOOR: ждать запроса на обновление из панели
+Description=NOISEFLOOR: ждать запроса на обновление
 
-[Path]
-PathExists=$panel_dir/data/update-request.json
+[Path]$paths
 
 [Install]
 WantedBy=multi-user.target
 EOF
     systemctl daemon-reload
-    systemctl enable --now noisefloor-updater.path >/dev/null 2>&1
-    mkdir -p "$panel_dir/data"
-    printf '{"installed_at": "%s", "agent_version": %s}\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$AGENT_VERSION" > "$panel_dir/data/agent.json"
-    log "агент установлен: кнопка «Обновить» в панели теперь работает"
+    # Юнит мог быть уже включён старой версией с другим списком путей —
+    # перезапуск заставляет systemd перечитать [Path].
+    systemctl enable noisefloor-updater.path >/dev/null 2>&1
+    systemctl restart noisefloor-updater.path >/dev/null 2>&1
+    while IFS=$'\t' read -r name dir image; do
+        mkdir -p "$dir/data"
+        printf '{"installed_at": "%s", "agent_version": %s}\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$AGENT_VERSION" > "$dir/data/agent.json"
+        log "$name: кнопка «Обновить» теперь работает"
+    done < <(services)
 }
 
+# Убрать файлы-запросы в самом конце, что бы ни случилось: path-юнит
+# срабатывает заново, пока файл существует, и без этого неудачное
+# обновление зациклилось бы. Список глобальный: trap выполняется уже вне
+# функции, и local к тому моменту не существует — первый прогон агента
+# на этом и попался.
+REQUEST_FILES=""
+cleanup_requests() { for f in $REQUEST_FILES; do rm -f "$f"; done; }
+
 cmd_watch() {
-    local panel_dir; panel_dir=$(service_dir panel)
-    [ -n "$panel_dir" ] || exit 0
-    REQUEST_PATH="$panel_dir/data/update-request.json"
-    [ -f "$REQUEST_PATH" ] || exit 0
-    # Пока файл лежит, панель показывает «агент обновляет». Убираем его в
-    # самом конце, что бы ни случилось: path-юнит срабатывает заново, пока
-    # файл существует, и без trap неудачное обновление зациклилось бы.
-    # Переменная нарочно глобальная: trap выполняется уже вне функции, и
-    # local к тому моменту не существует — первый прогон на этом и попался.
-    trap 'rm -f "$REQUEST_PATH"' EXIT
-    REQUEST_TARGET=$(python3 -c 'import sys,json; print(json.load(open(sys.argv[1])).get("target",""))' "$REQUEST_PATH" 2>/dev/null || true)
-    log "запрос из панели (${REQUEST_TARGET:-по каналу}) — обновляю всё, что есть на хосте"
-    # Панель — последней: её перезапуск рвёт соединение с самим оператором.
-    # Релея на этом хосте может и не быть — это не ошибка.
-    (for_each update_one relay) 2>/dev/null || true
-    for_each update_one panel
+    local want_relay=0 want_panel=0 target=""
+    while IFS=$'\t' read -r name dir image; do
+        local req="$dir/data/update-request.json"
+        [ -f "$req" ] || continue
+        REQUEST_FILES="$REQUEST_FILES $req"
+        [ "$name" = relay ] && want_relay=1
+        [ "$name" = panel ] && want_panel=1
+        [ -n "$target" ] || target=$(python3 -c 'import sys,json; print(json.load(open(sys.argv[1])).get("target",""))' "$req" 2>/dev/null || true)
+    done < <(services)
+    [ -n "$REQUEST_FILES" ] || exit 0
+    trap cleanup_requests EXIT
+    REQUEST_TARGET="$target"
+    log "запрос на обновление (${REQUEST_TARGET:-по каналу})"
+    # Обновляется только то, что попросило. Если просили оба — панель
+    # последней: её перезапуск рвёт соединение с самим оператором.
+    [ "$want_relay" = 1 ] && for_each update_one relay
+    [ "$want_panel" = 1 ] && for_each update_one panel
+    return 0
 }
 
 # ----------------------------------------------------------------- main ---
