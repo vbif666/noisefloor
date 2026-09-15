@@ -85,9 +85,40 @@ class RotationTests(unittest.TestCase):
             rot = app.plan_next(self.creds, NOW)
         self.assertIsNone(rot["next_sni"])
         self.assertIn("ни один хост", rot["last_error"])
-        # Время следующей попытки всё равно назначено — иначе ротация
-        # застряла бы навсегда после одного сбоя.
-        self.assertIsNotNone(rot["next_at"])
+        # Следующая попытка — скоро, а не через полный интервал: причина
+        # отказа обычно минутная, а без этого ротация застряла бы на часы.
+        self.assertEqual(datetime.fromisoformat(rot["next_at"]),
+                         NOW + timedelta(seconds=app.ROTATION_RETRY_SECONDS))
+
+    def test_slow_hosts_are_taken_when_nothing_is_within_budget(self):
+        # Все хосты дальше бюджета (сеть моргнула) — берём самый быстрый из
+        # годных по TLS, а не отказываемся от смены вовсе.
+        def slow(dest, timeout=None):
+            host = dest.split(":")[0]
+            ms = {"www.samsung.com": 196, "www.amd.com": 59}.get(host, 80)
+            return {"host": host, "ok": False, "slow": True, "ms": ms,
+                    "error": f"рукопожатие {ms} мс — дальше бюджета 50 мс"}
+        with mock.patch.object(app, "check_dest", side_effect=slow):
+            rot = app.plan_next(self.creds, NOW)
+        self.assertEqual(rot["next_sni"], "www.amd.com")
+        self.assertIsNone(rot["last_error"])
+
+    def test_within_budget_beats_faster_looking_but_slow_flags(self):
+        def mixed(dest, timeout=None):
+            host = dest.split(":")[0]
+            if host == "www.amd.com":
+                return good(dest)
+            return {"host": host, "ok": False, "slow": True, "ms": 1,
+                    "error": "рукопожатие 1 мс — дальше бюджета 0 мс"}
+        with mock.patch.object(app, "check_dest", side_effect=mixed):
+            rot = app.plan_next(self.creds, NOW)
+        self.assertEqual(rot["next_sni"], "www.amd.com")
+
+    def test_protocol_failures_are_never_taken(self):
+        with mock.patch.object(app, "check_dest", side_effect=bad_for("www.samsung.com", "www.amd.com")):
+            host, failures = app.pick_candidate(["www.samsung.com", "www.amd.com"], exclude="dl.google.com")
+        self.assertIsNone(host)
+        self.assertEqual(len(failures), 2)
 
     def test_rotate_applies_announced_host_and_plans_the_next(self):
         with mock.patch.object(app, "check_dest", side_effect=good):

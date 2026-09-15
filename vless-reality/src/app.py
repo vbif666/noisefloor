@@ -126,6 +126,11 @@ ROTATION_HISTORY_MAX = 30
 # не переключаемся задним числом, а объявляем новый момент: панель на
 # первом сервере ждёт смену в объявленное время, а не когда придётся.
 ROTATION_MISSED_SECONDS = 120
+# Если смена не удалась (ни один хост не прошёл проверку), следующую
+# попытку назначаем не через полный интервал, а скоро: причина обычно
+# минутная — сеть или сама машина моргнули, и через четыре часа об этом
+# уже никто не вспомнит, а релей всё это время сидит на случайном хосте.
+ROTATION_RETRY_SECONDS = 10 * 60
 # REALITY отвергает Certificate длиннее 8192 байт (XTLS/Xray-core #6356).
 # Берём запас: у CDN размер плавает от узла к узлу — www.microsoft.com
 # отдавал то 7.9, то 8.3 КБ в зависимости от того, куда попал запрос.
@@ -139,7 +144,7 @@ DEST_CHECK_TIMEOUT = 6.0
 DEST_MAX_HANDSHAKE_MS = int(os.environ.get("DEST_MAX_HANDSHAKE_MS", "50"))
 # Замер делается дважды, берётся лучший: одиночный всплеск на пути не
 # должен выбрасывать хороший хост из ротации.
-DEST_CHECK_ATTEMPTS = 2
+DEST_CHECK_ATTEMPTS = 3
 # После смены прежний SNI ещё принимается: панель на первом сервере узнаёт
 # о смене не мгновенно (опрос раз в пять минут, а ручная смена и вовсе не
 # объявляется), и без этого окна каскад лежал бы до её опроса. Проверено
@@ -533,9 +538,13 @@ def check_dest(dest: str, timeout: float = DEST_CHECK_TIMEOUT) -> dict:
     # сертификат 3 байта длины, сам DER и 2 байта пустых расширений.
     cert_bytes = 4 + sum(len(c.public_bytes(ssl._ssl.ENCODING_DER)) + 5 for c in chain)
     problems = dest_problems(version, alpn, cert_bytes, len(chain), best_ms)
+    # «Годен, но далеко» — отдельный признак: такой хост всё ещё лучше,
+    # чем не менять маскировку вовсе, если ближе никого нет.
+    protocol_ok = not dest_problems(version, alpn, cert_bytes, len(chain), best_ms, max_ms=10**9)
     return {
         "host": host,
         "ok": not problems,
+        "slow": protocol_ok and bool(problems),
         "tls": version,
         "alpn": alpn,
         "cert_bytes": cert_bytes,
@@ -545,16 +554,35 @@ def check_dest(dest: str, timeout: float = DEST_CHECK_TIMEOUT) -> dict:
 
 
 def pick_candidate(pool: list[str], exclude: str | None) -> tuple[str | None, list[str]]:
-    """Случайный хост пула, прошедший проверку; текущий не берём, чтобы
-    смена была сменой. Возвращает (хост, список отказов)."""
+    """Хост пула для следующей смены; текущий не берём, чтобы смена была
+    сменой. Возвращает (хост, список отказов).
+
+    Проверяются все кандидаты. Из уложившихся в бюджет задержки берётся
+    случайный — так у маскировки нет любимчика. Если в бюджет не уложился
+    никто, а по TLS-критериям годные есть — берётся самый быстрый из них:
+    отказаться от смены значило бы остаться на текущем хосте, который в
+    ту же минуту ничуть не ближе (в 07:55 15.09 так и вышло: сеть моргнула,
+    все восемь хостов показали 60-200 мс, ротация отказалась целиком).
+    Ничего годного нет — None."""
     candidates = [h for h in pool if h and h != exclude] or list(pool)
     random.shuffle(candidates)
     failures = []
+    within: list[str] = []
+    slow: list[tuple[int, str]] = []
     for host in candidates:
         result = check_dest(f"{host}:443")
         if result["ok"]:
-            return host, failures
-        failures.append(f"{host}: {result['error']}")
+            within.append(host)
+        elif result.get("slow"):
+            slow.append((result["ms"], host))
+            failures.append(f"{host}: {result['error']}")
+        else:
+            failures.append(f"{host}: {result['error']}")
+    if within:
+        return within[0], failures
+    if slow:
+        slow.sort()
+        return slow[0][1], failures
     return None, failures
 
 
@@ -573,12 +601,15 @@ def plan_next(creds: dict, now: datetime | None = None) -> dict:
     rot = get_rotation(creds)
     now = now or datetime.now(timezone.utc)
     host, failures = pick_candidate(rot["pool"], exclude=creds.get("sni"))
-    rot["next_at"] = (now + timedelta(hours=rot["interval_hours"])).isoformat()
     if host:
+        rot["next_at"] = (now + timedelta(hours=rot["interval_hours"])).isoformat()
         rot["next_dest"], rot["next_sni"], rot["last_error"] = f"{host}:443", host, None
     else:
+        # Не через полный интервал, а скоро — см. ROTATION_RETRY_SECONDS.
+        rot["next_at"] = (now + timedelta(seconds=ROTATION_RETRY_SECONDS)).isoformat()
         rot["next_dest"] = rot["next_sni"] = None
-        rot["last_error"] = "ни один хост пула не прошёл проверку — " + "; ".join(failures)
+        rot["last_error"] = ("ни один хост пула не прошёл проверку, повторю через "
+                             f"{ROTATION_RETRY_SECONDS // 60} мин — " + "; ".join(failures))
     creds["rotation"] = rot
     save_creds(creds)
     return rot
