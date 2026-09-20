@@ -104,6 +104,7 @@ class SuperviseTests(unittest.TestCase):
         health = awg_supervisor.health()
         self.assertEqual(health["restarts"], 1)
         self.assertTrue(health["ok"])
+        self.assertIsNone(health["last_error"], "после успешного подъёма ошибка не должна висеть")
 
     def test_does_nothing_when_interface_is_up(self):
         apply = self._run_one_pass([True])

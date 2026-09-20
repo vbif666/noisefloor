@@ -60,6 +60,9 @@ def _record(server, up: bool | None, error: str | None = None) -> None:
         _health["checked_at"] = datetime.now(timezone.utc).isoformat()
         if error is not None:
             _health["last_error"] = error
+        elif up:
+            # Интерфейс снова есть — старая ошибка больше не описывает состояние.
+            _health["last_error"] = None
 
 
 def check(server) -> bool:
