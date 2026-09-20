@@ -3,11 +3,13 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI
+from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 
-from . import backup, bootstrap, cascade, cascade_sync, config_sync, self_update, traffic_history
+from . import awg_supervisor, backup, bootstrap, cascade, cascade_sync, config_sync, self_update, traffic_history
 from .config import settings
 from .database import Base, SessionLocal, engine, run_migrations
+from .models import ServerConfig
 from .routers import auth, backup as backup_router, peers, server, status, updates
 
 STATIC_DIR = Path(__file__).resolve().parent.parent / "static"
@@ -32,6 +34,7 @@ class RevalidatingStaticFiles(StaticFiles):
 
 _traffic_history_stop = threading.Event()
 _cascade_supervisor_stop = threading.Event()
+_awg_supervisor_stop = threading.Event()
 _backup_stop = threading.Event()
 _cascade_sync_stop = threading.Event()
 _self_update_stop = threading.Event()
@@ -51,12 +54,19 @@ async def lifespan(app: FastAPI):
             # панель всё равно останется рабочей как генератор конфигов.
             result = config_sync.apply_current_config(db)
             print(f"[startup] auto-apply awg0: ok={result.ok} {result.output}")
+        # Первая отметка здоровья сразу, чтобы /api/health не ждал 30 секунд
+        # до первого прохода надзора.
+        awg_supervisor.check(db.query(ServerConfig).first())
     finally:
         db.close()
     threading.Thread(target=traffic_history.run, args=(_traffic_history_stop,), daemon=True).start()
     # Надзор за каскадом: перезапускает упавший xray и регулярно проверяет
     # реальной пробой, что через каскад вообще идёт трафик.
     threading.Thread(target=cascade.supervise, args=(_cascade_supervisor_stop,), daemon=True).start()
+    # Надзор за самим туннелем: если amneziawg-go убит (OOM, 2026-09-20) и
+    # awg0 исчез — поднимает его заново. Без этого панель жива, VPN мёртв,
+    # и HEALTHCHECK этого не видит.
+    threading.Thread(target=awg_supervisor.supervise, args=(_awg_supervisor_stop,), daemon=True).start()
     # Резервные копии: одна сразу при старте, дальше раз в сутки. В data
     # лежат ключи всех клиентов — без копий их потеря невосстановима.
     threading.Thread(target=backup.run, args=(_backup_stop,), daemon=True).start()
@@ -72,12 +82,24 @@ async def lifespan(app: FastAPI):
     finally:
         _traffic_history_stop.set()
         _cascade_supervisor_stop.set()
+        _awg_supervisor_stop.set()
         _backup_stop.set()
         _cascade_sync_stop.set()
         _self_update_stop.set()
 
 
 app = FastAPI(title="AmneziaWG Panel", version="1.0.0", lifespan=lifespan)
+
+
+
+@app.get("/api/health")
+def api_health():
+    """Здоровье без пароля — для HEALTHCHECK и хостового агента обновлений.
+    503, если туннель должен быть поднят, а его нет. Ничего секретного."""
+    data = awg_supervisor.health()
+    data["version"] = self_update.current_build().version
+    return JSONResponse(data, status_code=200 if data["ok"] else 503)
+
 
 app.include_router(auth.router, prefix="/api/auth", tags=["auth"])
 app.include_router(server.router, prefix="/api/server", tags=["server"])

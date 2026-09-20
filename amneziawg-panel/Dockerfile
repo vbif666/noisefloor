@@ -104,9 +104,10 @@ ARG BUILD_SHA
 ARG BUILD_DATE
 
 # bash — awg-quick это bash-скрипт; iproute2/iptables/nftables — поднятие
-# интерфейса и правила; curl — проверка обновлений и HEALTHCHECK.
+# интерфейса и правила; curl — проверка обновлений и HEALTHCHECK; tini — PID 1,
+# пожинает зомби: убитый OOM amneziawg-go иначе висит <defunct> под uvicorn.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        bash ca-certificates curl iproute2 iptables nftables procps \
+        bash ca-certificates curl iproute2 iptables nftables procps tini \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=awg-build  /build/awg-go/amneziawg-go              /usr/local/bin/amneziawg-go
@@ -153,8 +154,10 @@ LABEL org.opencontainers.image.source="https://github.com/vbif666/noisefloor" \
 EXPOSE 8000
 VOLUME ["/opt/panel/data", "/etc/amnezia/amneziawg"]
 
+# /api/health отвечает 503, если туннель должен быть поднят, а awg0 нет —
+# раньше проверялась только веб-панель, и мёртвый VPN выглядел «healthy».
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
-    CMD curl -fsS -o /dev/null http://127.0.0.1:8000/ || exit 1
+    CMD curl -fsS -o /dev/null http://127.0.0.1:8000/api/health || exit 1
 
-ENTRYPOINT ["/entrypoint.sh"]
+ENTRYPOINT ["/usr/bin/tini", "--", "/entrypoint.sh"]
 CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]

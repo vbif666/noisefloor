@@ -6,7 +6,7 @@ from fastapi import APIRouter, Depends
 from fastapi.responses import PlainTextResponse
 from sqlalchemy.orm import Session
 
-from .. import awg_manager, cascade, config_sync, traffic_history
+from .. import awg_manager, awg_supervisor, cascade, config_sync, traffic_history
 from ..database import get_db
 from ..models import Peer
 from ..schemas import LivePeerStatus, StatusResponse, TrafficHistoryPoint
@@ -92,6 +92,9 @@ def metrics(db: Session = Depends(get_db), _admin: str = Depends(get_current_adm
         "# HELP noisefloor_interface_up Поднят ли интерфейс туннеля",
         "# TYPE noisefloor_interface_up gauge",
         f"noisefloor_interface_up {int(awg_manager.interface_is_up(server.interface_name))}",
+        "# HELP noisefloor_interface_restarts_total Сколько раз надзор поднимал пропавший интерфейс",
+        "# TYPE noisefloor_interface_restarts_total counter",
+        f"noisefloor_interface_restarts_total {awg_supervisor.health().get('restarts', 0)}",
         "# HELP noisefloor_peers_total Всего клиентов в панели",
         "# TYPE noisefloor_peers_total gauge",
         f"noisefloor_peers_total {len(peers)}",

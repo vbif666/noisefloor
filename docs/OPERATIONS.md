@@ -10,7 +10,15 @@
 ```bash
 docker ps                                  # оба контейнера — Up (healthy)
 docker logs NOISEFLOOR-amneziawg-panel --tail 30
+curl -s http://127.0.0.1:8000/api/health   # без пароля: ok, interface_up, restarts
 ```
+
+`(healthy)` у панели означает, что поднят сам туннель, а не только веб-
+интерфейс: `/api/health` отвечает `503`, когда интерфейс `awg0` должен быть,
+а его нет. Если он пропал (например, OOM-killer убил `amneziawg-go`), панель
+поднимает его сама в течение полуминуты; счётчик `restarts` в ответе растёт —
+значит, это уже случалось, и стоит посмотреть `dmesg -T | grep -i "out of
+memory"` и добавить машине swap.
 
 Дальше — через API панели. Токен получается один раз и живёт 12 часов:
 
@@ -49,6 +57,7 @@ scrape_configs:
 | Метрика | Когда тревожно |
 |---|---|
 | `noisefloor_interface_up` | `0` — VPN-сервер лежит |
+| `noisefloor_interface_restarts_total` | растёт — интерфейс пропадает и его поднимает надзор; ищите OOM |
 | `noisefloor_cascade_verified` | `0` при включённом каскаде — данные через него не идут |
 | `noisefloor_cascade_restarts_total` | быстро растёт — каскад в цикле падений |
 | `noisefloor_peers_online` | ноль дольше обычного |
