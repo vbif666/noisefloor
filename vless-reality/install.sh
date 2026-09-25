@@ -199,7 +199,7 @@ pick_public_ipv4() {
         external=""
     done
     if [ -n "$external" ]; then
-        addrs+=("$external"); notes+=("внешний, так сервер видит интернет")
+        addrs+=("$external"); notes+=("внешний — рекомендуется")
     fi
 
     while read -r iface addr; do
@@ -218,11 +218,22 @@ pick_public_ipv4() {
     [ "$n" -gt 0 ] || return 0
 
     if [ "$n" -gt 1 ] && { : </dev/tty; } 2>/dev/null; then
-        printf '\nНайдено несколько IPv4-адресов. Какой отдавать клиентам?\n' >/dev/tty
-        for ((i = 0; i < n; i++)); do
-            printf '  %d) %-15s  (%s)\n' "$((i + 1))" "${addrs[$i]}" "${notes[$i]}" >/dev/tty
-        done
-        printf 'Номер [1]: ' >/dev/tty
+        {
+            printf '\nНа сервере несколько IPv4-адресов. Нужен ВНЕШНИЙ (публичный) —\n'
+            printf 'тот, по которому сервер доступен из интернета. Его получат\n'
+            printf 'устройства в конфигах и второй сервер связки; с частным адресом\n'
+            printf '(10.x, 172.16–31.x, 192.168.x, 100.64–127.x) никто не подключится.\n'
+            if [ -n "$external" ]; then
+                printf 'Внешний определён автоматически — это пункт 1, обычно выбирать его.\n\n'
+            else
+                printf 'Внешний адрес через интернет узнать не удалось — посмотрите его в\n'
+                printf 'личном кабинете хостинга (или прервите и укажите --public-host).\n\n'
+            fi
+            for ((i = 0; i < n; i++)); do
+                printf '  %d) %-15s  (%s)\n' "$((i + 1))" "${addrs[$i]}" "${notes[$i]}"
+            done
+            printf 'Номер [1]: '
+        } >/dev/tty
         choice=""
         read -r -t 60 choice </dev/tty || true
         choice="${choice:-1}"
@@ -238,6 +249,9 @@ pick_public_ipv4() {
 if [ -z "$PUBLIC_HOST" ]; then
     pick_public_ipv4
     [ -n "$PUBLIC_HOST" ] && log "публичный адрес (IPv4): $PUBLIC_HOST"
+    if [ -n "$PUBLIC_HOST" ] && is_private_ipv4 "$PUBLIC_HOST"; then
+        warn "$PUBLIC_HOST — частный адрес, из интернета к нему не подключиться; перезапустите с --public-host ВНЕШНИЙ_IP"
+    fi
 elif ! is_ipv4 "$PUBLIC_HOST" && [[ "$PUBLIC_HOST" == *:* ]]; then
     warn "--public-host задан как IPv6 ($PUBLIC_HOST) — клиенты без IPv6 не подключатся"
 fi
