@@ -55,6 +55,20 @@ class BuildUrlTests(unittest.TestCase):
         with self.assertRaises(cascade_sync.SyncError):
             cascade_sync.build_url(dict(RELAY_ANSWER, host=""), fallback_host="")
 
+    def test_ipv6_host_goes_in_brackets(self):
+        # Без скобок "2a01::1:443" не разбирается обратно, и страница
+        # каскада на панели падала с ошибкой 500.
+        url = cascade_sync.build_url(dict(RELAY_ANSWER, host="2a03:6f02::261e"))
+        self.assertIn("@[2a03:6f02::261e]:", url)
+        parsed = cascade.parse_vless_url(url)
+        self.assertEqual(parsed["host"], "2a03:6f02::261e")
+        self.assertEqual(parsed["port"], RELAY_ANSWER["port"])
+
+    def test_bare_ipv6_link_is_a_parse_error_not_a_crash(self):
+        with self.assertRaises(cascade.VlessParseError):
+            cascade.parse_vless_url(
+                "vless://u@2a03:6f02::261e:443?security=reality&pbk=k&sni=dl.google.com")
+
     def test_label_with_spaces_survives(self):
         url = cascade_sync.build_url(dict(RELAY_ANSWER, label="Париж, выход"))
         self.assertEqual(cascade.parse_vless_url(url)["label"], "Париж, выход")

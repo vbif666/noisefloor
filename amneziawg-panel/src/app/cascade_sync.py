@@ -110,6 +110,10 @@ def build_url(params: dict, fallback_host: str = "") -> str:
     }
     encoded = "&".join(f"{k}={urllib.parse.quote(str(v))}" for k, v in query.items())
     label = urllib.parse.quote(params.get("label") or "relay")
+    # IPv6 в ссылке обязан стоять в скобках: без них "2a01::1:443" не
+    # разобрать на адрес и порт, и страница каскада падала с ошибкой 500.
+    if ":" in host and not host.startswith("["):
+        host = f"[{host}]"
     return f"vless://{params['uuid']}@{host}:{params['port']}?{encoded}#{label}"
 
 

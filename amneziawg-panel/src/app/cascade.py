@@ -111,7 +111,13 @@ def parse_vless_url(url: str) -> dict:
     parsed = urlparse(url)
     uuid = parsed.username
     host = parsed.hostname
-    port = parsed.port
+    try:
+        port = parsed.port
+    except ValueError as exc:
+        # Например, IPv6 без квадратных скобок: urlparse не понимает, где
+        # кончается адрес, и бросает ValueError — а наверху ждут только
+        # VlessParseError, так что пользователь видел голую ошибку 500.
+        raise VlessParseError("Не удалось разобрать порт из ссылки (IPv6-адрес пишется в [квадратных скобках])") from exc
     if not uuid or not host or not port:
         raise VlessParseError("Не удалось разобрать uuid/адрес/порт из ссылки")
     q = {k: v[0] for k, v in parse_qs(parsed.query).items()}

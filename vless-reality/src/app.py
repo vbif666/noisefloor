@@ -427,6 +427,8 @@ def build_vless_url(creds: dict, host: str) -> str:
         "flow": "xtls-rprx-vision",
     }
     query = "&".join(f"{k}={quote(str(v))}" for k, v in params.items())
+    if ":" in host and not host.startswith("["):
+        host = f"[{host}]"  # IPv6 в URL — только в скобках
     return f"vless://{creds['uuid']}@{host}:{creds['vless_port']}?{query}#{quote(LABEL)}"
 
 
@@ -867,7 +869,9 @@ def current_host() -> str:
         return PUBLIC_HOST
     try:
         return subprocess.run(
-            ["sh", "-c", "curl -s --max-time 3 https://ifconfig.me || true"],
+            # -4: на сервере с IPv6 ifconfig.me иначе отвечает IPv6-адресом,
+            # а каскад и клиенты ходят к релею по IPv4.
+            ["sh", "-c", "curl -4 -s --max-time 3 https://ifconfig.me || true"],
             capture_output=True, text=True,
         ).stdout.strip() or "YOUR-SERVER-IP"
     except Exception:

@@ -42,7 +42,7 @@ usage() {
     cat <<'EOF'
 Установка панели NOISEFLOOR на чистый сервер.
 
-  --public-host АДРЕС      IP или домен этого сервера (по умолчанию определяется сам)
+  --public-host АДРЕС      IP или домен этого сервера (по умолчанию IPv4, при нескольких — спросит)
   --relay URL              адрес панели релея, например http://203.0.113.10:8001
   --relay-token ТОКЕН      токен синхронизации со страницы релея
   --intercept-mode РЕЖИМ   tproxy | redirect (по умолчанию выбирается по ядру)
@@ -209,12 +209,80 @@ case "$INTERCEPT_MODE" in
 esac
 
 # --- Публичный адрес --------------------------------------------------------
+#
+# Берём только IPv4. Раньше адрес спрашивали у ifconfig.me без -4, и на
+# сервере с IPv6 он отвечал IPv6-адресом: клиентские конфиги и ссылка каскада
+# получались с IPv6, которого у клиентов часто нет, а ссылка vless:// с голым
+# IPv6 ещё и не разбиралась на панели (ошибка 500 при подключении релея).
+#
+# Кандидаты: внешний адрес (как нас видит интернет) и IPv4 на интерфейсах.
+# Если их несколько и есть терминал — даём выбрать; без терминала (установка
+# из CI, через pipe без tty) берём внешний. --public-host отменяет всё это.
+
+is_ipv4() {
+    printf '%s' "$1" | grep -Eq '^([0-9]{1,3}\.){3}[0-9]{1,3}$'
+}
+
+is_private_ipv4() {
+    case "$1" in
+        10.*|192.168.*|127.*|169.254.*) return 0 ;;
+        172.1[6-9].*|172.2[0-9].*|172.3[01].*) return 0 ;;
+        100.6[4-9].*|100.[7-9][0-9].*|100.1[01][0-9].*|100.12[0-7].*) return 0 ;;
+    esac
+    return 1
+}
+
+pick_public_ipv4() {
+    local external="" url addr iface n i choice
+    local -a addrs=() notes=()
+
+    for url in https://api.ipify.org https://ifconfig.me https://ipv4.icanhazip.com; do
+        external="$(curl -4 -fsS --max-time 10 "$url" 2>/dev/null | tr -d '[:space:]' || true)"
+        is_ipv4 "$external" && break
+        external=""
+    done
+    if [ -n "$external" ]; then
+        addrs+=("$external"); notes+=("внешний, так сервер видит интернет")
+    fi
+
+    while read -r iface addr; do
+        addr="${addr%/*}"
+        is_ipv4 "$addr" || continue
+        [ "$addr" = "$external" ] && continue
+        addrs+=("$addr")
+        if is_private_ipv4 "$addr"; then
+            notes+=("на $iface, частный — снаружи недоступен")
+        else
+            notes+=("на $iface")
+        fi
+    done < <(ip -4 -o addr show scope global 2>/dev/null | awk '{print $2, $4}')
+
+    n=${#addrs[@]}
+    [ "$n" -gt 0 ] || return 0
+
+    if [ "$n" -gt 1 ] && { : </dev/tty; } 2>/dev/null; then
+        printf '\nНайдено несколько IPv4-адресов. Какой отдавать клиентам?\n' >/dev/tty
+        for ((i = 0; i < n; i++)); do
+            printf '  %d) %-15s  (%s)\n' "$((i + 1))" "${addrs[$i]}" "${notes[$i]}" >/dev/tty
+        done
+        printf 'Номер [1]: ' >/dev/tty
+        choice=""
+        read -r -t 60 choice </dev/tty || true
+        choice="${choice:-1}"
+        if [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -le "$n" ]; then
+            PUBLIC_HOST="${addrs[$((choice - 1))]}"
+            return 0
+        fi
+        warn "нет такого номера — беру первый"
+    fi
+    PUBLIC_HOST="${addrs[0]}"
+}
 
 if [ -z "$PUBLIC_HOST" ]; then
-    PUBLIC_HOST="$(curl -fsS --max-time 10 https://ifconfig.me 2>/dev/null || true)"
-    [ -n "$PUBLIC_HOST" ] || PUBLIC_HOST="$(curl -fsS --max-time 10 https://api.ipify.org 2>/dev/null || true)"
-    [ -n "$PUBLIC_HOST" ] || PUBLIC_HOST="$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{print $7; exit}')"
-    [ -n "$PUBLIC_HOST" ] && log "публичный адрес определён как $PUBLIC_HOST"
+    pick_public_ipv4
+    [ -n "$PUBLIC_HOST" ] && log "публичный адрес (IPv4): $PUBLIC_HOST"
+elif ! is_ipv4 "$PUBLIC_HOST" && [[ "$PUBLIC_HOST" == *:* ]]; then
+    warn "--public-host задан как IPv6 ($PUBLIC_HOST) — клиенты без IPv6 не подключатся"
 fi
 [ -n "$PUBLIC_HOST" ] || warn "не удалось определить публичный адрес — впишите его в панели вручную"
 
