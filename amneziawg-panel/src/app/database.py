@@ -35,12 +35,21 @@ _SERVER_CONFIG_MIGRATIONS = [
 ]
 
 
+# То же для клиентов. Все, кто был до появления протоколов, подключены к
+# основному интерфейсу AmneziaWG 2.0.
+_PEER_MIGRATIONS = [
+    ("protocol", "ALTER TABLE peers ADD COLUMN protocol VARCHAR(8) NOT NULL DEFAULT 'awg2'"),
+]
+
+
 def run_migrations() -> None:
     inspector = inspect(engine)
-    if "server_config" not in inspector.get_table_names():
-        return  # свежая БД — create_all() уже создал таблицу с полным набором столбцов
-    existing = {col["name"] for col in inspector.get_columns("server_config")}
-    with engine.begin() as conn:
-        for column_name, ddl in _SERVER_CONFIG_MIGRATIONS:
-            if column_name not in existing:
-                conn.execute(text(ddl))
+    tables = inspector.get_table_names()
+    for table, migrations in (("server_config", _SERVER_CONFIG_MIGRATIONS), ("peers", _PEER_MIGRATIONS)):
+        if table not in tables:
+            continue  # свежая БД — create_all() уже создал таблицу с полным набором столбцов
+        existing = {col["name"] for col in inspector.get_columns(table)}
+        with engine.begin() as conn:
+            for column_name, ddl in migrations:
+                if column_name not in existing:
+                    conn.execute(text(ddl))

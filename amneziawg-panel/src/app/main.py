@@ -9,8 +9,8 @@ from fastapi.staticfiles import StaticFiles
 from . import awg_supervisor, backup, bootstrap, cascade, cascade_sync, config_sync, self_update, traffic_history
 from .config import settings
 from .database import Base, SessionLocal, engine, run_migrations
-from .models import ServerConfig
-from .routers import auth, backup as backup_router, peers, server, status, updates
+from .models import ServerConfig, Tunnel
+from .routers import auth, backup as backup_router, peers, server, status, tunnels, updates
 
 STATIC_DIR = Path(__file__).resolve().parent.parent / "static"
 
@@ -56,7 +56,7 @@ async def lifespan(app: FastAPI):
             print(f"[startup] auto-apply awg0: ok={result.ok} {result.output}")
         # Первая отметка здоровья сразу, чтобы /api/health не ждал 30 секунд
         # до первого прохода надзора.
-        awg_supervisor.check(db.query(ServerConfig).first())
+        awg_supervisor.check(db.query(ServerConfig).first(), db.query(Tunnel).all())
     finally:
         db.close()
     threading.Thread(target=traffic_history.run, args=(_traffic_history_stop,), daemon=True).start()
@@ -104,6 +104,7 @@ def api_health():
 app.include_router(auth.router, prefix="/api/auth", tags=["auth"])
 app.include_router(server.router, prefix="/api/server", tags=["server"])
 app.include_router(peers.router, prefix="/api/peers", tags=["peers"])
+app.include_router(tunnels.router, prefix="/api/tunnels", tags=["tunnels"])
 app.include_router(status.router, prefix="/api/status", tags=["status"])
 app.include_router(updates.router, prefix="/api/updates", tags=["updates"])
 app.include_router(backup_router.router, prefix="/api/backup", tags=["backup"])

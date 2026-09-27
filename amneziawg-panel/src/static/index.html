@@ -256,6 +256,23 @@
 
         <div class="panel" style="margin-bottom:16px;">
           <div class="panel-header">
+            <h2>Протоколы</h2>
+          </div>
+          <div class="panel-body">
+            <p class="field-hint" style="margin-top:0;">
+              Основной протокол — AmneziaWG 2.0 (настройки выше). Для устройств, которые
+              его не понимают, можно включить ещё два. Маскировка задаётся на весь
+              интерфейс, поэтому у каждого протокола свой UDP-порт, свои ключи и своя
+              подсеть. Трафик всех протоколов идёт через каскад так же, как основной.
+              Каждый включённый протокол — отдельный процесс на сервере, примерно
+              10–20 МБ памяти.
+            </p>
+            <div id="tunnels-list"></div>
+          </div>
+        </div>
+
+        <div class="panel" style="margin-bottom:16px;">
+          <div class="panel-header">
             <h2>Резервная копия</h2>
             <span class="apply-status" id="backup-status"></span>
           </div>
@@ -334,6 +351,15 @@
         <input id="np-name" required placeholder="Ноутбук Джейкоба" />
       </div>
       <div class="field">
+        <label for="np-protocol">Протокол</label>
+        <select id="np-protocol">
+          <option value="awg2">AmneziaWG 2.0 — рекомендуется</option>
+          <option value="awg1">AmneziaWG 1.x — для старых клиентов</option>
+          <option value="wg">WireGuard — без маскировки</option>
+        </select>
+        <p class="field-hint" id="np-protocol-hint"></p>
+      </div>
+      <div class="field">
         <label for="np-allowed">Маршруты через туннель (AllowedIPs у клиента)</label>
         <input id="np-allowed" value="0.0.0.0/0, ::/0" />
         <p class="field-hint">Оставьте как есть для полного туннелирования всего трафика.</p>
@@ -366,6 +392,7 @@
     <button type="button" class="btn btn-ghost btn-icon" data-close>✕</button>
   </div>
   <div class="modal-body">
+    <p class="field-hint" id="peer-dialog-protocol" style="margin-top:0;"></p>
     <div class="qr-wrap"><img id="peer-qr-img" alt="QR-код конфигурации" width="220" height="220" /></div>
     <div class="config-actions">
       <button class="btn btn-sm" id="peer-copy-btn">Скопировать конфиг</button>

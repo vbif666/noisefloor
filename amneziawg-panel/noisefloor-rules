@@ -18,15 +18,16 @@
 # через iptables. Своя inet-таблица nftables его не переопределит (при
 # обходе всех цепочек хука выигрывает drop), и форвардинг просто ляжет.
 #
-# Использование:
-#   noisefloor-rules up --iface awg0 --egress eth0 \
+# Использование (--iface можно повторять: один вызов ставит правила для всех
+# интерфейсов туннеля — AmneziaWG 2.0, 1.x и обычного WireGuard):
+#   noisefloor-rules up --iface awg0 [--iface awg-v1 ...] --egress eth0 \
 #       [--cascade-port 12345] [--cascade-dns-port 12353] \
 #       [--mode tproxy|redirect|off] [--isolate-clients] [--block-quic]
-#   noisefloor-rules down --iface awg0 --egress eth0
+#   noisefloor-rules down --iface awg0 [--iface ...] --egress eth0
 
 set -u
 
-IFACE=""
+IFACES=""
 EGRESS=""
 CASCADE_PORT=""
 CASCADE_DNS_PORT=""
@@ -69,7 +70,7 @@ drop_chain() {
 parse_args() {
     while [ $# -gt 0 ]; do
         case "$1" in
-            --iface)         IFACE="$2"; shift 2 ;;
+            --iface)         IFACES="${IFACES:+$IFACES }$2"; shift 2 ;;
             --egress)        EGRESS="$2"; shift 2 ;;
             --cascade-port)  CASCADE_PORT="$2"; shift 2 ;;
             --cascade-dns-port) CASCADE_DNS_PORT="$2"; shift 2 ;;
@@ -79,7 +80,7 @@ parse_args() {
             *) die "неизвестный аргумент: $1" ;;
         esac
     done
-    [ -n "$IFACE" ] || die "не задан --iface"
+    [ -n "$IFACES" ] || die "не задан --iface"
 }
 
 # --------------------------------------------------------------------- up ---
@@ -93,37 +94,44 @@ cmd_up() {
     if [ "$ISOLATE" = "yes" ]; then
         # Клиенты не должны видеть друг друга: без этого пир свободно
         # сканирует соседа по туннелю. Правило идёт первым в цепочке, до
-        # разрешающих, иначе оно ничего не значит.
-        iptables -t filter -A "$FWD_CHAIN" -i "$IFACE" -o "$IFACE" -j DROP
+        # разрешающих, иначе оно ничего не значит. Соседи по другим
+        # интерфейсам (клиенты другого протокола) — тоже соседи.
+        for IFACE in $IFACES; do
+            for OTHER in $IFACES; do
+                iptables -t filter -A "$FWD_CHAIN" -i "$IFACE" -o "$OTHER" -j DROP
+            done
+        done
     fi
 
-    if [ "$BLOCK_QUIC" = "yes" ]; then
-        # QUIC (HTTP/3) — это UDP, и в режиме redirect он физически не может
-        # попасть в каскад: уходит напрямую с настоящим адресом сервера.
-        # Получается расщепление — сайт видит один IP по TCP и другой по
-        # QUIC; браузер при этом предпочитает QUIC, так что через каскад
-        # идёт меньшая часть трафика, а YouTube и прочие тяжёлые сервисы
-        # ходят мимо. Закрываем порт с icmp-port-unreachable: браузер
-        # мгновенно откатывается на TCP, а не ждёт таймаута.
-        iptables -t filter -A "$FWD_CHAIN" -i "$IFACE" -p udp --dport 443 \
-            -j REJECT --reject-with icmp-port-unreachable
-    fi
+    for IFACE in $IFACES; do
+        if [ "$BLOCK_QUIC" = "yes" ]; then
+            # QUIC (HTTP/3) — это UDP, и в режиме redirect он физически не может
+            # попасть в каскад: уходит напрямую с настоящим адресом сервера.
+            # Получается расщепление — сайт видит один IP по TCP и другой по
+            # QUIC; браузер при этом предпочитает QUIC, так что через каскад
+            # идёт меньшая часть трафика, а YouTube и прочие тяжёлые сервисы
+            # ходят мимо. Закрываем порт с icmp-port-unreachable: браузер
+            # мгновенно откатывается на TCP, а не ждёт таймаута.
+            iptables -t filter -A "$FWD_CHAIN" -i "$IFACE" -p udp --dport 443 \
+                -j REJECT --reject-with icmp-port-unreachable
+        fi
 
-    iptables -t filter -A "$FWD_CHAIN" -i "$IFACE" -j ACCEPT
-    iptables -t filter -A "$FWD_CHAIN" -o "$IFACE" -j ACCEPT
-    # Клиент не знает реального path MTU до сервера; без клэмпа крупные
-    # TCP-сегменты молча теряются на сетях с меньшим MTU (мобильный интернет,
-    # второй VPN поверх), а мелкие проходят — классическая PMTU black hole.
-    #
-    # Клэмп нужен в ОБЕ стороны: MSS объявляется каждой стороной в своём
-    # SYN, и раньше правился только клиентский SYN. SYN-ACK удалённого
-    # сервера уходил нетронутым, тот продолжал слать сегменты под свой MTU
-    # 1500 — и в туннель они не влезали. Симптом ровно тот же: мелкие
-    # страницы открываются, крупные загрузки встают.
-    iptables -t filter -A "$FWD_CHAIN" -i "$IFACE" -o "$EGRESS" \
-        -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
-    iptables -t filter -A "$FWD_CHAIN" -i "$EGRESS" -o "$IFACE" \
-        -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
+        iptables -t filter -A "$FWD_CHAIN" -i "$IFACE" -j ACCEPT
+        iptables -t filter -A "$FWD_CHAIN" -o "$IFACE" -j ACCEPT
+        # Клиент не знает реального path MTU до сервера; без клэмпа крупные
+        # TCP-сегменты молча теряются на сетях с меньшим MTU (мобильный интернет,
+        # второй VPN поверх), а мелкие проходят — классическая PMTU black hole.
+        #
+        # Клэмп нужен в ОБЕ стороны: MSS объявляется каждой стороной в своём
+        # SYN, и раньше правился только клиентский SYN. SYN-ACK удалённого
+        # сервера уходил нетронутым, тот продолжал слать сегменты под свой MTU
+        # 1500 — и в туннель они не влезали. Симптом ровно тот же: мелкие
+        # страницы открываются, крупные загрузки встают.
+        iptables -t filter -A "$FWD_CHAIN" -i "$IFACE" -o "$EGRESS" \
+            -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
+        iptables -t filter -A "$FWD_CHAIN" -i "$EGRESS" -o "$IFACE" \
+            -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
+    done
     ensure_jump filter FORWARD "$FWD_CHAIN"
 
     # --- NAT наружу ---
@@ -154,14 +162,16 @@ cmd_up() {
             # самой панели (10.13.13.1:8000) и к соседям по туннелю уезжал
             # в каскад, где релей пытался соединиться с приватным адресом
             # у себя — соединение просто умирало по таймауту.
-            for net in $LOCAL_NETS; do
-                iptables -t nat -A "$NAT_PRE_CHAIN" -i "$IFACE" -d "$net" -j RETURN
+            for IFACE in $IFACES; do
+                for net in $LOCAL_NETS; do
+                    iptables -t nat -A "$NAT_PRE_CHAIN" -i "$IFACE" -d "$net" -j RETURN
+                done
+                if [ -n "$CASCADE_DNS_PORT" ]; then
+                    iptables -t nat -A "$NAT_PRE_CHAIN" -i "$IFACE" -p udp --dport 53 \
+                        -j REDIRECT --to-ports "$CASCADE_DNS_PORT"
+                fi
+                iptables -t nat -A "$NAT_PRE_CHAIN" -i "$IFACE" -p tcp -j REDIRECT --to-ports "$CASCADE_PORT"
             done
-            if [ -n "$CASCADE_DNS_PORT" ]; then
-                iptables -t nat -A "$NAT_PRE_CHAIN" -i "$IFACE" -p udp --dport 53 \
-                    -j REDIRECT --to-ports "$CASCADE_DNS_PORT"
-            fi
-            iptables -t nat -A "$NAT_PRE_CHAIN" -i "$IFACE" -p tcp -j REDIRECT --to-ports "$CASCADE_PORT"
             ensure_jump nat PREROUTING "$NAT_PRE_CHAIN"
             if [ -n "$CASCADE_DNS_PORT" ]; then
                 log "каскад в режиме redirect (TCP порт $CASCADE_PORT, DNS порт $CASCADE_DNS_PORT)"
@@ -175,13 +185,15 @@ cmd_up() {
             ensure_chain mangle "$MANGLE_PRE_CHAIN"
             # Служебные адреса мимо каскада, иначе клиент теряет и соседей
             # по туннелю, и сам сервер.
-            for net in $LOCAL_NETS; do
-                iptables -t mangle -A "$MANGLE_PRE_CHAIN" -i "$IFACE" -d "$net" -j RETURN
+            for IFACE in $IFACES; do
+                for net in $LOCAL_NETS; do
+                    iptables -t mangle -A "$MANGLE_PRE_CHAIN" -i "$IFACE" -d "$net" -j RETURN
+                done
+                iptables -t mangle -A "$MANGLE_PRE_CHAIN" -i "$IFACE" -p tcp \
+                    -j TPROXY --on-port "$CASCADE_PORT" --tproxy-mark "$MARK"
+                iptables -t mangle -A "$MANGLE_PRE_CHAIN" -i "$IFACE" -p udp \
+                    -j TPROXY --on-port "$CASCADE_PORT" --tproxy-mark "$MARK"
             done
-            iptables -t mangle -A "$MANGLE_PRE_CHAIN" -i "$IFACE" -p tcp \
-                -j TPROXY --on-port "$CASCADE_PORT" --tproxy-mark "$MARK"
-            iptables -t mangle -A "$MANGLE_PRE_CHAIN" -i "$IFACE" -p udp \
-                -j TPROXY --on-port "$CASCADE_PORT" --tproxy-mark "$MARK"
             ensure_jump mangle PREROUTING "$MANGLE_PRE_CHAIN"
             log "каскад в режиме tproxy (TCP и UDP, включая QUIC и DNS), порт $CASCADE_PORT"
             ;;
@@ -200,7 +212,9 @@ cmd_up() {
     drop_chain filter INPUT "$IN_CHAIN"
     if [ "$MODE" != "off" ] && [ -n "$CASCADE_PORT" ]; then
         ensure_chain filter "$IN_CHAIN"
-        iptables -t filter -A "$IN_CHAIN" -i "$IFACE" -j RETURN
+        for IFACE in $IFACES; do
+            iptables -t filter -A "$IN_CHAIN" -i "$IFACE" -j RETURN
+        done
         iptables -t filter -A "$IN_CHAIN" -i lo -j RETURN
         iptables -t filter -A "$IN_CHAIN" -p tcp --dport "$CASCADE_PORT" -j DROP
         iptables -t filter -A "$IN_CHAIN" -p udp --dport "$CASCADE_PORT" -j DROP

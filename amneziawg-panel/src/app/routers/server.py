@@ -24,6 +24,17 @@ def update_server(
     server = config_sync.get_server(db)
     updates = payload.model_dump(exclude_unset=True)
 
+    # Дополнительные протоколы слушают свои порты: совпадение с ними не даст
+    # подняться одному из интерфейсов.
+    new_port = updates.get("listen_port")
+    if new_port is not None:
+        for tunnel in config_sync.get_tunnels(db):
+            if tunnel.listen_port == new_port:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Порт {new_port} уже занят протоколом на интерфейсе {tunnel.interface_name}",
+                )
+
     # Валидируем ссылку каскада ДО сохранения, чтобы в БД не осела заведомо
     # нерабочая настройка молча (cascade.sync() при apply просто выключил бы
     # каскад, ошибку админ увидел бы не сразу).

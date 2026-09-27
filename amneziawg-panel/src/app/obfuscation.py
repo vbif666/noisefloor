@@ -48,11 +48,25 @@ def random_junk() -> tuple[int, int, int]:
     return jc, jmin, jmax
 
 
+# Init-пакет WireGuard длиннее Response ровно на 56 байт. При S1 + 56 == S2
+# они становятся одного размера, и amneziawg отказывается поднимать такой
+# профиль (а старые клиенты молча не проходят рукопожатие).
+_INIT_RESPONSE_SIZE_DIFF = 56
+
+
+def _init_response_paddings() -> tuple[int, int]:
+    while True:
+        s1, s2 = random.randint(0, 64), random.randint(0, 64)
+        if s1 + _INIT_RESPONSE_SIZE_DIFF != s2:
+            return s1, s2
+
+
 def random_paddings() -> tuple[int, int, int, int]:
     """S1, S2, S3, S4."""
+    s1, s2 = _init_response_paddings()
     return (
-        random.randint(0, 64),
-        random.randint(0, 64),
+        s1,
+        s2,
         random.randint(0, 64),
         random.randint(0, 32),
     )
@@ -65,5 +79,18 @@ def random_obfuscation_profile() -> dict:
     return {
         "jc": jc, "jmin": jmin, "jmax": jmax,
         "s1": s1, "s2": s2, "s3": s3, "s4": s4,
+        "h1": h1, "h2": h2, "h3": h3, "h4": h4,
+    }
+
+
+def random_awg1_profile() -> dict:
+    """Профиль AmneziaWG 1.x: без S3/S4 и сигнатурных пакетов I1–I5, которых
+    старые клиенты не знают. H1–H4 — одиночные числа, как и в 2.0."""
+    jc, jmin, jmax = random_junk()
+    s1, s2 = _init_response_paddings()
+    h1, h2, h3, h4 = random_headers()
+    return {
+        "jc": jc, "jmin": jmin, "jmax": jmax,
+        "s1": s1, "s2": s2,
         "h1": h1, "h2": h2, "h3": h3, "h4": h4,
     }

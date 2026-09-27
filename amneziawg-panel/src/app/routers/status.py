@@ -9,7 +9,7 @@ from sqlalchemy.orm import Session
 from .. import awg_manager, awg_supervisor, cascade, config_sync, traffic_history
 from ..database import get_db
 from ..models import Peer
-from ..schemas import LivePeerStatus, StatusResponse, TrafficHistoryPoint
+from ..schemas import LivePeerStatus, StatusResponse, TrafficHistoryPoint, TunnelLiveStatus
 from ..security import get_current_admin
 from .peers import ONLINE_THRESHOLD_SECONDS
 
@@ -52,6 +52,17 @@ def get_status(db: Session = Depends(get_db), _admin: str = Depends(get_current_
         interface_mtu=awg_manager.interface_mtu(server.interface_name) if awg_manager.tools_available() else None,
         listen_port=server.listen_port,
         peers=peer_statuses,
+        tunnels=[
+            TunnelLiveStatus(
+                protocol=t.protocol,
+                interface_name=t.interface_name,
+                enabled=t.enabled,
+                interface_up=bool(t.enabled and awg_manager.tools_available()
+                                  and awg_manager.interface_is_up(t.interface_name)),
+                listen_port=t.listen_port,
+            )
+            for t in config_sync.get_tunnels(db)
+        ],
     )
 
 

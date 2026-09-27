@@ -118,6 +118,30 @@ def restart(interface_name: str, config_text: str) -> CommandResult:
     return _run([AWG_QUICK_BIN, "up", str(new_path)])
 
 
+def down(interface_name: str) -> CommandResult:
+    """Опустить интерфейс, который выключили в панели. Конфиг остаётся на
+    диске: по нему и опускаем, а если его нет — просто удаляем линк."""
+    if not tools_available():
+        return CommandResult(False, "Утилиты awg/awg-quick не найдены в PATH")
+    if not interface_is_up(interface_name):
+        return CommandResult(True, "")
+    path = _config_path(interface_name)
+    if path.exists():
+        result = _run([AWG_QUICK_BIN, "down", str(path)])
+        if result.ok or not interface_is_up(interface_name):
+            return CommandResult(True, result.output)
+    return _run(["ip", "link", "delete", "dev", interface_name])
+
+
+def run_rules(command: list[str]) -> CommandResult:
+    """Запустить noisefloor-rules напрямую — когда набор интерфейсов или
+    режим каскада поменялся, а основной интерфейс не перезапускался и его
+    PostUp не срабатывал."""
+    if not tools_available():
+        return CommandResult(False, "Живое управление выключено")
+    return _run(command)
+
+
 def show_dump(interface_name: str) -> CommandResult:
     """Эквивалент `wg show <iface> dump` — машиночитаемый статус пиров."""
     if not AWG_BIN:

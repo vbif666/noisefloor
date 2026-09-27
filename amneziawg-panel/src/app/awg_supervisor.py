@@ -34,6 +34,7 @@ BACKOFF_MAX_SECONDS = 300
 _lock = threading.Lock()
 _health: dict = {
     "interface": settings.awg_interface,
+    "missing": [],         # какие из ожидаемых интерфейсов сейчас не подняты
     "expected_up": None,   # None — ещё не проверяли
     "interface_up": None,
     "checked_at": None,
@@ -52,9 +53,19 @@ def expected_up(server) -> bool:
     return getattr(server, "last_apply_status", None) == "ok"
 
 
-def _record(server, up: bool | None, error: str | None = None) -> None:
+def _expected_interfaces(server, tunnels) -> list[str]:
+    """Основной интерфейс и включённые дополнительные (AWG 1.x, WireGuard)."""
+    return [server.interface_name] + [t.interface_name for t in tunnels or () if t.enabled]
+
+
+def _missing(server, tunnels) -> list[str]:
+    return [name for name in _expected_interfaces(server, tunnels) if not awg_manager.interface_is_up(name)]
+
+
+def _record(server, up: bool | None, error: str | None = None, missing: list[str] | None = None) -> None:
     with _lock:
         _health["interface"] = getattr(server, "interface_name", settings.awg_interface)
+        _health["missing"] = missing or []
         _health["expected_up"] = expected_up(server) if server is not None else False
         _health["interface_up"] = up
         _health["checked_at"] = datetime.now(timezone.utc).isoformat()
@@ -65,15 +76,20 @@ def _record(server, up: bool | None, error: str | None = None) -> None:
             _health["last_error"] = None
 
 
-def check(server) -> bool:
-    """Одноразовая проверка: True, если всё как ожидается (интерфейс есть, или
-    его и не должно быть). Обновляет health()."""
+def check(server, tunnels=()) -> bool:
+    """Одноразовая проверка: True, если всё как ожидается (интерфейсы есть,
+    или их и не должно быть). Обновляет health()."""
     if server is None or not expected_up(server):
         _record(server, None)
         return True
-    up = awg_manager.interface_is_up(server.interface_name)
-    _record(server, up, None if up else f"интерфейс {server.interface_name} не поднят")
-    return up
+    missing = _missing(server, tunnels)
+    # Здоровье контейнера — по основному интерфейсу. Дополнительный на
+    # занятом порту не должен делать контейнер unhealthy: агент обновлений
+    # откатил бы из-за этого ни в чём не виноватую версию. Но надзор его
+    # всё равно поднимает, поэтому возвращаем «всё ли на месте».
+    main_up = server.interface_name not in missing
+    _record(server, main_up, None if not missing else f"не поднят: {', '.join(missing)}", missing)
+    return not missing
 
 
 def health() -> dict:
@@ -89,30 +105,35 @@ def supervise(stop_event) -> None:
     """Фоновый цикл: пропал интерфейс — поднимаем заново."""
     from . import config_sync
     from .database import SessionLocal
-    from .models import ServerConfig
+    from .models import ServerConfig, Tunnel
 
     backoff = BACKOFF_START_SECONDS
     while not stop_event.wait(SUPERVISE_INTERVAL_SECONDS):
         db = SessionLocal()
         try:
             server = db.query(ServerConfig).first()
-            if check(server):
+            tunnels = list(db.query(Tunnel).all())
+            if check(server, tunnels):
                 backoff = BACKOFF_START_SECONDS
                 continue
 
-            print(f"[awg-supervisor] интерфейс {server.interface_name} пропал — поднимаю заново")
+            with _lock:
+                gone = ", ".join(_health["missing"]) or server.interface_name
+            print(f"[awg-supervisor] интерфейс {gone} пропал — поднимаю заново")
             result = config_sync.apply_current_config(db)
             with _lock:
                 _health["restarts"] += 1
                 _health["last_restart_at"] = datetime.now(timezone.utc).isoformat()
-            if not result.ok or not awg_manager.interface_is_up(server.interface_name):
-                _record(server, False, result.output or "awg-quick up не поднял интерфейс")
+            still_missing = _missing(server, tunnels)
+            if not result.ok or still_missing:
+                _record(server, server.interface_name not in still_missing,
+                        result.output or "awg-quick up не поднял интерфейс", still_missing)
                 print(f"[awg-supervisor] не удалось: {result.output}; повтор через {backoff}с")
                 stop_event.wait(backoff)
                 backoff = min(backoff * 2, BACKOFF_MAX_SECONDS)
                 continue
             _record(server, True)
-            print(f"[awg-supervisor] интерфейс {server.interface_name} снова поднят")
+            print(f"[awg-supervisor] интерфейс {gone} снова поднят")
             backoff = BACKOFF_START_SECONDS
         except Exception as exc:  # надзор не должен умирать от одной ошибки
             print(f"[awg-supervisor] ошибка: {exc}")

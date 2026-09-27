@@ -24,7 +24,7 @@ from datetime import timedelta
 
 from . import awg_manager, cascade, wg_status
 from .database import SessionLocal
-from .models import ServerConfig, TrafficSample
+from .models import ServerConfig, TrafficSample, Tunnel
 
 HISTORY_INTERVAL = 5  # секунд между замерами
 HISTORY_MAX = 1080  # 1080 * 5s = 1.5 часа в памяти
@@ -48,8 +48,15 @@ def _sample_once() -> None:
 
         iface_rx = iface_tx = 0
         if awg_manager.tools_available():
-            result = awg_manager.show_dump(server.interface_name)
-            if result.ok:
+            # Трафик клиентов всех протоколов: основной интерфейс плюс
+            # включённые AWG 1.x и WireGuard.
+            names = [server.interface_name] + [
+                t.interface_name for t in db.query(Tunnel).all() if t.enabled
+            ]
+            for name in names:
+                result = awg_manager.show_dump(name)
+                if not result.ok:
+                    continue
                 parsed = wg_status.parse_dump(result.output)
                 if parsed:
                     for peer in parsed.peers.values():

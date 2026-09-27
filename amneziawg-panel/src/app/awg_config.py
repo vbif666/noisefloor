@@ -12,7 +12,7 @@ from __future__ import annotations
 
 from . import cascade
 from .config import settings
-from .models import Peer, ServerConfig
+from .models import PROTOCOL_AWG1, PROTOCOL_AWG2, Peer, ServerConfig, Tunnel
 
 # Скрипт лежит в образе; он же отвечает за идемпотентность правил.
 RULES_SCRIPT = "/usr/local/bin/noisefloor-rules"
@@ -37,7 +37,64 @@ def _obfuscation_lines(obj) -> list[str]:
     return lines
 
 
-def server_interface_block(server: ServerConfig) -> str:
+def _peer_protocol(peer) -> str:
+    return getattr(peer, "protocol", None) or PROTOCOL_AWG2
+
+
+def _awg1_obfuscation_lines(tunnel) -> list[str]:
+    """AmneziaWG 1.x понимает только Jc/Jmin/Jmax, S1/S2 и H1–H4. Поля 2.0
+    (S3/S4, I1–I5) в его конфиг не пишем: старый клиент их не разберёт."""
+    lines = [
+        f"Jc = {tunnel.jc}",
+        f"Jmin = {tunnel.jmin}",
+        f"Jmax = {tunnel.jmax}",
+        f"S1 = {tunnel.s1}",
+        f"S2 = {tunnel.s2}",
+    ]
+    for field in _OBFS_STR_FIELDS:
+        value = getattr(tunnel, field)
+        if value:
+            lines.append(f"{field.upper()} = {value}")
+    return lines
+
+
+def rules_commands(server: ServerConfig, interfaces: list[str]) -> tuple[list[str], list[str]]:
+    """Команды noisefloor-rules up/down для всех интерфейсов туннеля разом.
+
+    Цепочки у скрипта общие и перед заполнением очищаются, поэтому правила
+    для всех протоколов ставятся одним вызовом из PostUp основного
+    интерфейса. Дополнительные интерфейсы своих PostUp не имеют: иначе
+    каждый их подъём стирал бы правила соседей."""
+    iface_args: list[str] = []
+    for name in interfaces:
+        iface_args += ["--iface", name]
+    mode = settings.cascade_intercept_mode if server.cascade_enabled else "off"
+    up = [
+        RULES_SCRIPT, "up",
+        *iface_args,
+        "--egress", server.egress_interface,
+        "--mode", mode,
+    ]
+    if server.cascade_enabled:
+        up += ["--cascade-port", str(cascade.REDIRECT_PORT)]
+        if cascade.dns_via_cascade():
+            up += ["--cascade-dns-port", str(cascade.DNS_REDIRECT_PORT)]
+        # QUIC в режиме redirect не перехватывается вовсе, поэтому его
+        # либо режем, либо сознательно выпускаем мимо каскада с
+        # настоящим адресом сервера.
+        if mode == "redirect" and settings.cascade_block_quic:
+            up.append("--block-quic")
+    if settings.isolate_clients:
+        up.append("--isolate-clients")
+    down = [
+        RULES_SCRIPT, "down",
+        *iface_args,
+        "--egress", server.egress_interface,
+    ]
+    return up, down
+
+
+def server_interface_block(server: ServerConfig, extra_interfaces: list[str] | tuple[str, ...] = ()) -> str:
     lines = [
         "[Interface]",
         f"PrivateKey = {server.private_key}",
@@ -56,29 +113,7 @@ def server_interface_block(server: ServerConfig) -> str:
         # Теперь вся работа у noisefloor-rules: он держит правила в
         # собственных цепочках и очищает их перед заполнением, поэтому
         # повторный запуск не может ничего продублировать.
-        mode = settings.cascade_intercept_mode if server.cascade_enabled else "off"
-        up = [
-            RULES_SCRIPT, "up",
-            "--iface", server.interface_name,
-            "--egress", server.egress_interface,
-            "--mode", mode,
-        ]
-        if server.cascade_enabled:
-            up += ["--cascade-port", str(cascade.REDIRECT_PORT)]
-            if cascade.dns_via_cascade():
-                up += ["--cascade-dns-port", str(cascade.DNS_REDIRECT_PORT)]
-            # QUIC в режиме redirect не перехватывается вовсе, поэтому его
-            # либо режем, либо сознательно выпускаем мимо каскада с
-            # настоящим адресом сервера.
-            if mode == "redirect" and settings.cascade_block_quic:
-                up.append("--block-quic")
-        if settings.isolate_clients:
-            up.append("--isolate-clients")
-        down = [
-            RULES_SCRIPT, "down",
-            "--iface", server.interface_name,
-            "--egress", server.egress_interface,
-        ]
+        up, down = rules_commands(server, [server.interface_name, *extra_interfaces])
         lines.append("PostUp = " + " ".join(up))
         lines.append("PostDown = " + " ".join(down))
     return "\n".join(lines)
@@ -95,17 +130,46 @@ def server_peer_block(peer: Peer) -> str:
     return "\n".join(lines)
 
 
-def full_server_config(server: ServerConfig, peers: list[Peer]) -> str:
-    """Полный awg0.conf сервера: интерфейс + один [Peer] блок на каждого включённого клиента."""
-    blocks = [server_interface_block(server)]
+def full_server_config(
+    server: ServerConfig, peers: list[Peer], extra_interfaces: list[str] | tuple[str, ...] = ()
+) -> str:
+    """Полный awg0.conf сервера: интерфейс + один [Peer] блок на каждого
+    включённого клиента AmneziaWG 2.0. extra_interfaces — включённые
+    дополнительные интерфейсы: правила фаервола ставятся и для них."""
+    blocks = [server_interface_block(server, extra_interfaces)]
     for peer in peers:
-        if peer.enabled:
+        if peer.enabled and _peer_protocol(peer) == PROTOCOL_AWG2:
             blocks.append(server_peer_block(peer))
     return "\n\n".join(blocks) + "\n"
 
 
-def client_config(peer: Peer, server: ServerConfig) -> str:
-    """Конфиг, который клиент импортирует в приложение AmneziaWG / сканирует как QR."""
+def tunnel_config(tunnel: Tunnel, server: ServerConfig, peers: list[Peer]) -> str:
+    """Конфиг дополнительного интерфейса (AWG 1.x или обычный WireGuard).
+
+    Без PostUp/PostDown: правила для него ставит основной интерфейс
+    (см. rules_commands). MTU общий с основным — клиенты в тех же сетях."""
+    lines = [
+        "[Interface]",
+        f"PrivateKey = {tunnel.private_key}",
+        f"Address = {tunnel.address}",
+        f"ListenPort = {tunnel.listen_port}",
+    ]
+    if server.mtu:
+        lines.append(f"MTU = {server.mtu}")
+    if tunnel.protocol == PROTOCOL_AWG1:
+        lines.extend(_awg1_obfuscation_lines(tunnel))
+    blocks = ["\n".join(lines)]
+    for peer in peers:
+        if peer.enabled and _peer_protocol(peer) == tunnel.protocol:
+            blocks.append(server_peer_block(peer))
+    return "\n\n".join(blocks) + "\n"
+
+
+def client_config(peer: Peer, server: ServerConfig, tunnel: Tunnel | None = None) -> str:
+    """Конфиг, который клиент импортирует в приложение AmneziaWG / сканирует как QR.
+
+    tunnel — дополнительный интерфейс, к которому относится клиент (AWG 1.x
+    или обычный WireGuard); None — основной интерфейс AmneziaWG 2.0."""
     lines = [
         "[Interface]",
         f"PrivateKey = {peer.private_key}",
@@ -123,14 +187,20 @@ def client_config(peer: Peer, server: ServerConfig) -> str:
         lines.append(f"DNS = {dns}")
     # Jc/Jmin/Jmax/S1-S4/H1-H4 — параметры интерфейса, а не секрет пира: они
     # обязаны совпадать с тем, что настроено на сервере, иначе сервер не
-    # опознает пакеты этого клиента как WireGuard-трафик.
-    lines.extend(_obfuscation_lines(server))
+    # опознает пакеты этого клиента как WireGuard-трафик. У обычного
+    # WireGuard их нет вовсе — стандартное приложение не примет такие поля.
+    if tunnel is None:
+        lines.extend(_obfuscation_lines(server))
+    elif tunnel.protocol == PROTOCOL_AWG1:
+        lines.extend(_awg1_obfuscation_lines(tunnel))
     lines.append("")
     lines.append("[Peer]")
-    lines.append(f"PublicKey = {server.public_key}")
+    lines.append(f"PublicKey = {(tunnel or server).public_key}")
     lines.append(f"PresharedKey = {peer.preshared_key}")
     endpoint_host = server.endpoint_host or "YOUR_SERVER_HOST_OR_IP"
-    lines.append(f"Endpoint = {endpoint_host}:{server.listen_port}")
+    if ":" in endpoint_host and not endpoint_host.startswith("["):
+        endpoint_host = f"[{endpoint_host}]"  # IPv6 в Endpoint — только в скобках
+    lines.append(f"Endpoint = {endpoint_host}:{(tunnel or server).listen_port}")
     lines.append(f"AllowedIPs = {peer.allowed_ips_client}")
     if peer.persistent_keepalive:
         lines.append(f"PersistentKeepalive = {peer.persistent_keepalive}")

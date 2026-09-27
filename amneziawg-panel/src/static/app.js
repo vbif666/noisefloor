@@ -7,6 +7,27 @@
 let token = localStorage.getItem("noisefloor_token") || null;
 let currentPeers = [];
 let currentServer = null;
+let currentTunnels = [];
+
+// Протоколы клиентов. У каждого свой интерфейс и свой UDP-порт: маскировка
+// задаётся на интерфейс, и клиент другого протокола рукопожатие не пройдёт.
+const PROTOCOLS = {
+  awg2: {
+    name: "AmneziaWG 2.0",
+    badge: "",
+    hint: "Основной протокол с полной маскировкой. Импорт — в приложение AmneziaVPN или AmneziaWG свежей версии.",
+  },
+  awg1: {
+    name: "AmneziaWG 1.x",
+    badge: "AWG 1.x",
+    hint: "Для старых версий AmneziaVPN и AmneziaWG и прошивок роутеров, которые не понимают S3/S4 и I1–I5. Маскировка слабее, чем у 2.0.",
+  },
+  wg: {
+    name: "WireGuard",
+    badge: "WG",
+    hint: "Обычный WireGuard без маскировки: подойдёт стандартное приложение WireGuard и почти любой роутер. DPI опознаёт его легко, в РФ часто блокируется.",
+  },
+};
 let activePeerId = null;
 let confirmCallback = null;
 let statusPollTimer = null;
@@ -345,7 +366,118 @@ document.querySelectorAll(".tab-btn").forEach((btn) => {
    ========================================================================== */
 
 async function loadEverything() {
-  await Promise.all([loadServer(), loadPeers(), loadBackups()]);
+  await Promise.all([loadServer(), loadPeers(), loadBackups(), loadTunnels()]);
+}
+
+/* ==========================================================================
+   Дополнительные протоколы: AmneziaWG 1.x и обычный WireGuard
+   ========================================================================== */
+
+async function loadTunnels() {
+  currentTunnels = await api("/tunnels");
+  renderTunnels();
+}
+
+function tunnelStatusText(t) {
+  if (!t.enabled) return { text: "выключен", cls: "" };
+  if (t.last_apply_status === "error") return { text: `ошибка: ${t.last_apply_error || "не поднялся"}`, cls: "is-error" };
+  if (t.interface_up) return { text: `работает · UDP ${t.listen_port}`, cls: "is-ok" };
+  return { text: "не поднят", cls: "is-error" };
+}
+
+function tunnelCardHtml(t) {
+  const info = PROTOCOLS[t.protocol];
+  const st = tunnelStatusText(t);
+  const p = t.protocol;
+  const obfs = p === "awg1" ? `
+      <div class="field-group">
+        <span class="eyebrow">Маскировка AmneziaWG 1.x — своя, не та же, что у 2.0</span>
+        <div class="field-grid">
+          <div class="field"><label>Jc</label><input data-t="${p}" data-f="jc" type="number" min="0" value="${t.jc}" /></div>
+          <div class="field"><label>Jmin</label><input data-t="${p}" data-f="jmin" type="number" min="0" value="${t.jmin}" /></div>
+          <div class="field"><label>Jmax</label><input data-t="${p}" data-f="jmax" type="number" min="0" value="${t.jmax}" /></div>
+        </div>
+        <div class="field-grid">
+          <div class="field"><label>S1</label><input data-t="${p}" data-f="s1" type="number" min="0" value="${t.s1}" /></div>
+          <div class="field"><label>S2</label><input data-t="${p}" data-f="s2" type="number" min="0" value="${t.s2}" /></div>
+        </div>
+        <div class="field-grid">
+          <div class="field"><label>H1</label><input data-t="${p}" data-f="h1" value="${escapeHtml(t.h1)}" /></div>
+          <div class="field"><label>H2</label><input data-t="${p}" data-f="h2" value="${escapeHtml(t.h2)}" /></div>
+          <div class="field"><label>H3</label><input data-t="${p}" data-f="h3" value="${escapeHtml(t.h3)}" /></div>
+          <div class="field"><label>H4</label><input data-t="${p}" data-f="h4" value="${escapeHtml(t.h4)}" /></div>
+        </div>
+      </div>` : "";
+  return `
+    <div class="field-group tunnel-card" style="border-top:1px solid var(--line); padding-top:14px;">
+      <div style="display:flex; justify-content:space-between; align-items:center; gap:12px; flex-wrap:wrap;">
+        <label style="display:flex; align-items:center; gap:8px; font-weight:600;">
+          <input data-t="${p}" data-f="enabled" type="checkbox" style="width:auto;" ${t.enabled ? "checked" : ""} />
+          ${info.name}
+        </label>
+        <span class="apply-status ${st.cls}">${escapeHtml(st.text)}</span>
+      </div>
+      <p class="field-hint">${info.hint}</p>
+      <div class="field-row">
+        <div class="field"><label>UDP-порт</label><input data-t="${p}" data-f="listen_port" type="number" min="1" max="65535" value="${t.listen_port}" /></div>
+        <div class="field"><label>Подсеть в туннеле</label><input data-t="${p}" data-f="address" value="${escapeHtml(t.address)}" /></div>
+      </div>
+      <p class="field-hint">Интерфейс ${escapeHtml(t.interface_name)} · клиентов: ${t.peers_total} · порт должен быть открыт по UDP в фаерволе хостинга.</p>
+      ${obfs}
+      <div class="server-actions">
+        <button type="button" class="btn btn-primary btn-sm" data-tunnel-save="${p}">Сохранить и применить</button>
+        ${p === "awg1" ? `<button type="button" class="btn btn-sm" data-tunnel-randomize="${p}">⟳ Пересоздать маскировку</button>` : ""}
+      </div>
+    </div>`;
+}
+
+function renderTunnels() {
+  const box = $("tunnels-list");
+  box.innerHTML = currentTunnels.map(tunnelCardHtml).join("");
+  box.querySelectorAll("[data-tunnel-save]").forEach((btn) => {
+    btn.addEventListener("click", () => saveTunnel(btn.dataset.tunnelSave, btn));
+  });
+  box.querySelectorAll("[data-tunnel-randomize]").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      openConfirm(
+        "Пересоздать маскировку AmneziaWG 1.x?",
+        "Все выданные конфиги этого протокола перестанут подключаться — клиентам придётся раздать их заново.",
+        async () => {
+          try {
+            await api(`/tunnels/${btn.dataset.tunnelRandomize}/randomize`, { method: "POST" });
+            await loadTunnels();
+            showToast("Маскировка пересоздана — перевыпустите конфиги клиентам AWG 1.x");
+          } catch (err) {
+            showToast(err.message, true);
+          }
+        },
+      );
+    });
+  });
+}
+
+async function saveTunnel(protocol, btn) {
+  const payload = {};
+  $("tunnels-list").querySelectorAll(`[data-t="${protocol}"]`).forEach((el) => {
+    const f = el.dataset.f;
+    if (el.type === "checkbox") payload[f] = el.checked;
+    else if (el.type === "number") payload[f] = Number(el.value);
+    else payload[f] = el.value.trim();
+  });
+  btn.disabled = true;
+  try {
+    const t = await api(`/tunnels/${protocol}`, { method: "PUT", body: JSON.stringify(payload) });
+    await loadTunnels();
+    if (t.enabled && t.last_apply_status === "error") {
+      showToast(`Сохранено, но интерфейс не поднялся: ${t.last_apply_error}`, true);
+    } else {
+      showToast(t.enabled ? `${PROTOCOLS[protocol].name} включён` : `${PROTOCOLS[protocol].name} выключен`);
+    }
+  } catch (err) {
+    showToast(err.message, true);
+  } finally {
+    btn.disabled = false;
+  }
 }
 
 async function loadServer() {
@@ -639,6 +771,7 @@ function peerRowHtml(p) {
         <div class="peer-name-cell">
           <span class="peer-dot ${dotClass}"></span>
           <span class="peer-name ${nameClass}">${escapeHtml(p.name)}</span>
+          ${PROTOCOLS[p.protocol]?.badge ? `<span class="eyebrow" title="${PROTOCOLS[p.protocol].name}">${PROTOCOLS[p.protocol].badge}</span>` : ""}
         </div>
       </td>
       <td class="peer-meta">${escapeHtml(p.address)}</td>
@@ -668,10 +801,28 @@ async function togglePeerEnabled(peer, refreshDialog) {
    Добавление пира
    ========================================================================== */
 
+function updateProtocolHint() {
+  const proto = $("np-protocol").value;
+  $("np-protocol-hint").textContent = PROTOCOLS[proto].hint;
+}
+
+$("np-protocol").addEventListener("change", updateProtocolHint);
+
 function openAddPeerDialog() {
   $("add-peer-form").reset();
   $("np-allowed").value = "0.0.0.0/0, ::/0";
   $("np-keepalive").value = 25;
+  // Выключенный протокол выбрать нельзя: сервер его не слушает.
+  for (const opt of $("np-protocol").options) {
+    if (opt.value === "awg2") continue;
+    const t = currentTunnels.find((x) => x.protocol === opt.value);
+    const on = !!(t && t.enabled);
+    opt.disabled = !on;
+    if (!opt.dataset.label) opt.dataset.label = opt.textContent;
+    opt.textContent = on ? opt.dataset.label : `${PROTOCOLS[opt.value].name} — выключен, включите на вкладке «Сервер»`;
+  }
+  $("np-protocol").value = "awg2";
+  updateProtocolHint();
   $("add-peer-error").hidden = true;
   $("add-peer-dialog").showModal();
   $("np-name").focus();
@@ -690,6 +841,7 @@ $("add-peer-form").addEventListener("submit", async (e) => {
     persistent_keepalive: Number($("np-keepalive").value || 25),
     dns_override: $("np-dns").value.trim() || null,
     note: $("np-note").value.trim() || null,
+    protocol: $("np-protocol").value,
   };
   const btn = $("add-peer-submit");
   btn.disabled = true;
@@ -716,6 +868,8 @@ async function openPeerDialog(id) {
   const peer = await api(`/peers/${id}`);
 
   $("peer-dialog-title").textContent = peer.name;
+  const proto = PROTOCOLS[peer.protocol] || PROTOCOLS.awg2;
+  $("peer-dialog-protocol").textContent = `${proto.name}. ${proto.hint}`;
   $("peer-config-text").textContent = peer.config_text;
   $("peer-toggle-btn").textContent = peer.enabled ? "Выключить" : "Включить";
 

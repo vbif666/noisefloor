@@ -11,8 +11,8 @@ from sqlalchemy.orm import Session
 
 from . import crypto
 from .config import DATA_DIR, settings
-from .models import AdminUser, ServerConfig
-from .obfuscation import random_obfuscation_profile
+from .models import PROTOCOL_AWG1, PROTOCOL_WG, AdminUser, ServerConfig, Tunnel
+from .obfuscation import random_awg1_profile, random_obfuscation_profile
 from .security import hash_password
 
 
@@ -104,6 +104,40 @@ def ensure_server_config(db: Session) -> None:
     db.commit()
 
 
+# Дополнительные интерфейсы: имя (не длиннее 15 символов — ограничение
+# ядра), подсеть и порт по умолчанию. Подсети рядом с основной 10.13.13.0/24
+# и внутри 10.0.0.0/8, которую правила уже пускают мимо каскада как
+# служебную. Порты — не 51820: его часто занимает соседний wg-easy.
+DEFAULT_TUNNELS = (
+    (PROTOCOL_AWG1, "awg-v1", "10.13.14.1/24", 51821),
+    (PROTOCOL_WG, "wg-plain", "10.13.15.1/24", 51822),
+)
+
+
+def ensure_tunnels(db: Session) -> None:
+    """Создать выключенные записи дополнительных интерфейсов, если их нет.
+    Ключи и профиль обфускации генерируются сразу, чтобы включение в панели
+    было одной галочкой."""
+    existing = {t.protocol for t in db.query(Tunnel).all()}
+    for protocol, iface, address, port in DEFAULT_TUNNELS:
+        if protocol in existing:
+            continue
+        priv, pub = crypto.generate_keypair()
+        profile = random_awg1_profile() if protocol == PROTOCOL_AWG1 else {}
+        db.add(Tunnel(
+            protocol=protocol,
+            interface_name=iface,
+            enabled=False,
+            private_key=priv,
+            public_key=pub,
+            address=address,
+            listen_port=port,
+            **profile,
+        ))
+    db.commit()
+
+
 def run(db: Session) -> None:
     ensure_admin_user(db)
     ensure_server_config(db)
+    ensure_tunnels(db)

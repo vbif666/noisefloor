@@ -70,3 +70,29 @@ class RulesScriptTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class MultipleInterfacesTests(unittest.TestCase):
+    """Один вызов ставит правила для всех протоколов (awg0, awg-v1,
+    wg-plain). Цепочки общие и очищаются перед заполнением, поэтому
+    отдельный вызов на интерфейс стёр бы правила соседей."""
+
+    def setUp(self):
+        self.text = SCRIPT.read_text(encoding="utf-8")
+        self.up = self.text.split("cmd_up() {", 1)[1].split("cmd_down() {", 1)[0]
+
+    def test_iface_flag_accumulates(self):
+        self.assertIn('--iface)         IFACES="${IFACES:+$IFACES }$2"', self.text)
+
+    def test_every_per_interface_rule_is_inside_a_loop(self):
+        # Любое правило с -i/-o "$IFACE" вне цикла молча применилось бы
+        # только к последнему интерфейсу из списка.
+        loops = []  # стек открытых циклов: True — цикл по интерфейсам
+        for line in self.up.splitlines():
+            stripped = line.strip()
+            if stripped.startswith("for ") and stripped.endswith("; do"):
+                loops.append(stripped.startswith("for IFACE in $IFACES"))
+            elif stripped == "done" and loops:
+                loops.pop()
+            elif '"$IFACE"' in stripped:
+                self.assertIn(True, loops, f"правило вне цикла по интерфейсам: {stripped}")

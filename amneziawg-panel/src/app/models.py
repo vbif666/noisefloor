@@ -96,6 +96,59 @@ class ServerConfig(Base):
     updated_at = Column(DateTime, default=_utcnow, onupdate=_utcnow)
 
 
+# Протоколы клиентов. Параметры обфускации задаются на интерфейс, а не на
+# клиента: обычный WireGuard не пройдёт рукопожатие с интерфейсом, где
+# включена маскировка, а старый клиент AmneziaWG не знает полей S3/S4/I1–I5.
+# Поэтому у каждого протокола свой интерфейс со своим UDP-портом.
+PROTOCOL_AWG2 = "awg2"  # основной интерфейс, ServerConfig (awg0)
+PROTOCOL_AWG1 = "awg1"  # AmneziaWG 1.x: Jc/Jmin/Jmax, S1/S2, H1–H4
+PROTOCOL_WG = "wg"      # обычный WireGuard, без обфускации
+PROTOCOLS = (PROTOCOL_AWG2, PROTOCOL_AWG1, PROTOCOL_WG)
+
+
+class Tunnel(Base):
+    """
+    Дополнительный интерфейс для клиентов, которым не подходит AmneziaWG 2.0.
+
+    Строк ровно две — на AWG 1.x и на обычный WireGuard (создаёт
+    bootstrap). Основной интерфейс по-прежнему описывает ServerConfig, а
+    отсюда берутся только ключи, подсеть, порт и, для AWG 1.x, свой профиль
+    обфускации. DNS, MTU, публичный адрес и каскад — общие, из ServerConfig.
+
+    Выключены по умолчанию: каждый интерфейс — отдельный процесс
+    amneziawg-go, а на машинах с 1 ГБ памяти это уже заметно (OOM 2026-09-20).
+    """
+
+    __tablename__ = "tunnels"
+
+    id = Column(Integer, primary_key=True)
+    protocol = Column(String(8), nullable=False, unique=True)
+    interface_name = Column(String(15), nullable=False, unique=True)
+    enabled = Column(Boolean, default=False, nullable=False)
+
+    private_key = Column(String(64), nullable=False)
+    public_key = Column(String(64), nullable=False)
+    address = Column(String(64), nullable=False)
+    listen_port = Column(Integer, nullable=False)
+
+    # Только для AWG 1.x; у обычного WireGuard остаются нулями и пустыми.
+    jc = Column(Integer, default=0)
+    jmin = Column(Integer, default=0)
+    jmax = Column(Integer, default=0)
+    s1 = Column(Integer, default=0)
+    s2 = Column(Integer, default=0)
+    h1 = Column(String(32), default="")
+    h2 = Column(String(32), default="")
+    h3 = Column(String(32), default="")
+    h4 = Column(String(32), default="")
+
+    last_apply_status = Column(String(16), nullable=True)
+    last_apply_error = Column(Text, nullable=True)
+    last_applied_at = Column(DateTime, nullable=True)
+
+    updated_at = Column(DateTime, default=_utcnow, onupdate=_utcnow)
+
+
 class TrafficSample(Base):
     """
     Точка истории трафика, поминутно.
@@ -137,6 +190,9 @@ class Peer(Base):
 
     enabled = Column(Boolean, default=True, nullable=False)
     note = Column(Text, nullable=True)
+    # Через какой интерфейс подключается клиент (PROTOCOLS). Меняется только
+    # пересозданием: адрес выдаётся из подсети конкретного интерфейса.
+    protocol = Column(String(8), default="awg2", nullable=False)
 
     # Параметров обфускации (Jc/Jmin/Jmax/S1-S4/H1-H4/I1-I5) у пира нет:
     # это общие настройки интерфейса, они берутся из ServerConfig и должны

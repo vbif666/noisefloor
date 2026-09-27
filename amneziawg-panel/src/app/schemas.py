@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from typing import Annotated
+from typing import Annotated, Literal
 
 from pydantic import AfterValidator, BaseModel, ConfigDict, Field
 
@@ -147,6 +147,52 @@ class CascadeStatus(BaseModel):
     relay_label: str | None = None
 
 
+# --- Дополнительные протоколы (AWG 1.x, обычный WireGuard) ---
+
+Protocol = Literal["awg2", "awg1", "wg"]
+
+
+class TunnelRead(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    protocol: Protocol
+    interface_name: str
+    enabled: bool
+    public_key: str
+    address: str
+    listen_port: int
+    jc: int
+    jmin: int
+    jmax: int
+    s1: int
+    s2: int
+    h1: str
+    h2: str
+    h3: str
+    h4: str
+    last_apply_status: str | None
+    last_apply_error: str | None
+    last_applied_at: UtcDatetime | None
+    # живое состояние, в БД не хранится
+    interface_up: bool = False
+    peers_total: int = 0
+
+
+class TunnelUpdate(BaseModel):
+    enabled: bool | None = None
+    address: str | None = None
+    listen_port: int | None = Field(default=None, ge=1, le=65535)
+    jc: int | None = Field(default=None, ge=0, le=128)
+    jmin: int | None = Field(default=None, ge=0, le=1280)
+    jmax: int | None = Field(default=None, ge=0, le=1280)
+    s1: int | None = Field(default=None, ge=0, le=1132)
+    s2: int | None = Field(default=None, ge=0, le=1188)
+    h1: str | None = None
+    h2: str | None = None
+    h3: str | None = None
+    h4: str | None = None
+
+
 # --- Peers ---
 
 class PeerCreate(BaseModel):
@@ -158,6 +204,9 @@ class PeerCreate(BaseModel):
     dns_override: str | None = None
     persistent_keepalive: int = Field(default=25, ge=0, le=3600)
     note: str | None = None
+    # awg2 — основной интерфейс; awg1 и wg — дополнительные, их нужно
+    # сначала включить на вкладке «Сервер».
+    protocol: Protocol = "awg2"
 
 
 class PeerUpdate(BaseModel):
@@ -181,6 +230,7 @@ class PeerRead(BaseModel):
     persistent_keepalive: int
     enabled: bool
     note: str | None
+    protocol: Protocol = "awg2"
     created_at: UtcDatetime
 
     # живой статус (заполняется отдельно, не хранится в БД)
@@ -206,6 +256,14 @@ class LivePeerStatus(BaseModel):
     transfer_tx: int
 
 
+class TunnelLiveStatus(BaseModel):
+    protocol: Protocol
+    interface_name: str
+    enabled: bool
+    interface_up: bool
+    listen_port: int
+
+
 class StatusResponse(BaseModel):
     live_management_available: bool
     interface_name: str
@@ -213,6 +271,7 @@ class StatusResponse(BaseModel):
     interface_mtu: int | None
     listen_port: int | None
     peers: list[LivePeerStatus]
+    tunnels: list[TunnelLiveStatus] = []
 
 
 class TrafficHistoryPoint(BaseModel):
