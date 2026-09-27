@@ -556,11 +556,14 @@ function updateSaveBar() {
     ? "Туннель перезапустится — клиенты переподключатся за несколько секунд."
     : "Применится без обрыва клиентов.";
   $("save-bar-detail").classList.toggle("is-warn", restart);
-  // Проверять связь с релеем по несохранённому адресу или токену бессмысленно:
-  // панель спросит релей по старым.
-  const cascadeDirty = changed.some(([field]) => field.startsWith("cascade_"));
-  $("cascade-check-btn").disabled = cascadeDirty;
-  $("cascade-check-hint").textContent = cascadeDirty ? "сначала сохраните изменения каскада" : "";
+  // Кнопка в самом блоке каскада: изменения там есть — применяет их и
+  // проверяет, нет — просто проверяет связь. Раньше внести релей можно было
+  // только кнопкой внизу страницы (или неочевидным Enter).
+  const cascadeDirty = changed.some(([field]) => isCascadeField(field));
+  const checkBtn = $("cascade-check-btn");
+  checkBtn.textContent = cascadeDirty ? "Применить и проверить" : "Проверить подключение";
+  checkBtn.classList.toggle("btn-primary", cascadeDirty);
+  $("cascade-check-hint").textContent = cascadeDirty ? "есть несохранённые изменения каскада" : "";
   if (!cascadeChecking) renderCascadeChecklist(lastCascadeStatus || {});
 }
 
@@ -577,10 +580,18 @@ window.addEventListener("beforeunload", (e) => {
   }
 });
 
-function fillServerForm(s) {
+// Заполнить форму значениями с сервера. Несохранённые правки остаются на
+// месте: форма перезаполняется и по фоновым поводам (проверка каскада,
+// перезапуск), и стирать при этом начатое администратором нельзя.
+// reset — «Отменить»: вернуть всё как на сервере. saved — поля, которые
+// только что сохранены: для них верно значение с сервера.
+function fillServerForm(s, { reset = false, saved = [] } = {}) {
+  const edits = reset ? [] : changedServerFields().filter(([field]) => !saved.includes(field));
+  const editValues = serverFormValues();
   $("server-pubkey-display").textContent = s.public_key;
   for (const [field, id, , , kind] of SERVER_FIELDS) writeServerField(id, kind, s[field]);
   savedServerValues = serverFormValues();
+  for (const [field, id, , , kind] of edits) writeServerField(id, kind, editValues[field]);
   renderApplyStatus(s);
   updateSaveBar();
   // Версия релея приходит вместе с настройками сервера — обновляем блок версий.
@@ -610,27 +621,29 @@ function renderApplyStatus(s) {
 }
 
 $("discard-btn").addEventListener("click", () => {
-  if (currentServer) fillServerForm(currentServer);
+  if (currentServer) fillServerForm(currentServer, { reset: true });
 });
 
-$("server-form").addEventListener("submit", async (e) => {
-  e.preventDefault();
-  const changed = changedServerFields();
-  if (!changed.length) return;
-  const payload = {};
+const isCascadeField = (field) => field.startsWith("cascade_") || field === "split_ru_direct";
+
+// Сохранить изменённые поля (все или только подходящие под only) и сразу
+// применить. Несохранённые правки в остальных блоках остаются в форме.
+async function saveServer(only = null) {
+  const changed = changedServerFields().filter(([field]) => !only || only(field));
+  if (!changed.length) return true;
   const now = serverFormValues();
+  const payload = {};
   for (const [field] of changed) payload[field] = now[field];
 
-  const btn = $("save-btn");
   savingServer = true;
-  btn.disabled = true;
+  $("save-btn").disabled = true;
   $("discard-btn").disabled = true;
   $("save-bar-title").textContent = "Сохраняю и применяю…";
   $("save-bar-detail").textContent = "";
   try {
     currentServer = await api("/server", { method: "PUT", body: JSON.stringify(payload) });
     savingServer = false;
-    fillServerForm(currentServer);
+    fillServerForm(currentServer, { saved: Object.keys(payload) });
     if (currentServer.last_apply_status === "error") {
       showToast(`Сохранено, но не применилось: ${currentServer.last_apply_error}`, true);
     } else {
@@ -638,17 +651,24 @@ $("server-form").addEventListener("submit", async (e) => {
     }
     // Каскад затронут — сразу показываем, что из этого вышло, а не ждём
     // фонового опроса и пятиминутной пробы.
-    if (changed.some(([field]) => field.startsWith("cascade_") || field === "split_ru_direct")) {
+    if (changed.some(([field]) => isCascadeField(field))) {
       await checkCascade({ quiet: true });
     }
+    return true;
   } catch (err) {
     showToast(err.message, true);
+    return false;
   } finally {
     savingServer = false;
-    btn.disabled = false;
+    $("save-btn").disabled = false;
     $("discard-btn").disabled = false;
     updateSaveBar();
   }
+}
+
+$("server-form").addEventListener("submit", (e) => {
+  e.preventDefault();
+  saveServer();
 });
 
 // Синхронизация с релеем и проба трафика через каскад — по кнопке и сразу
@@ -663,6 +683,7 @@ async function checkCascade({ quiet = false } = {}) {
   const btn = $("cascade-check-btn");
   cascadeChecking = true;
   btn.disabled = true;
+  btn.textContent = "Проверяю…";
   try {
     lastCascadeStatus = { ...(lastCascadeStatus || {}), checking: "sync" };
     renderCascadeChecklist(lastCascadeStatus);
@@ -686,7 +707,13 @@ async function checkCascade({ quiet = false } = {}) {
   }
 }
 
-$("cascade-check-btn").addEventListener("click", () => checkCascade());
+$("cascade-check-btn").addEventListener("click", async () => {
+  if (changedServerFields().some(([field]) => isCascadeField(field))) {
+    await saveServer(isCascadeField);  // сама проверит каскад после сохранения
+  } else {
+    await checkCascade();
+  }
+});
 
 $("randomize-btn").addEventListener("click", () => {
   openConfirm(
@@ -695,7 +722,7 @@ $("randomize-btn").addEventListener("click", () => {
     async () => {
       try {
         currentServer = await api("/server/randomize-obfuscation", { method: "POST" });
-        fillServerForm(currentServer);
+        fillServerForm(currentServer, { saved: SERVER_FIELDS.filter(([, , section]) => section === "Обфускация").map(([f]) => f) });
         showToast("Параметры пересозданы и применены — перевыпустите конфиги клиентам");
       } catch (err) {
         showToast(err.message, true);
@@ -1279,7 +1306,7 @@ function renderCascadeChecklist(c) {
   if (!currentServer || !currentServer.cascade_enabled) {
     const pending = $("f-cascade-enabled").checked;
     box.innerHTML = pending
-      ? `<div class="check-row is-wait"><span class="check-mark">…</span><span>Каскад включится, когда вы сохраните изменения (кнопка внизу экрана).</span></div>`
+      ? `<div class="check-row is-wait"><span class="check-mark">…</span><span>Каскад включится, когда вы нажмёте «Применить и проверить» ниже.</span></div>`
       : `<div class="check-row is-off"><span class="check-mark">○</span><span>Каскад выключен — трафик клиентов выходит в интернет прямо с этого сервера.</span></div>`;
     return;
   }
