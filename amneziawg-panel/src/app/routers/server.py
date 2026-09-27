@@ -15,6 +15,16 @@ def read_server(db: Session = Depends(get_db), _admin: str = Depends(get_current
     return config_sync.get_server(db)
 
 
+# Поля, смена которых требует перезапуска awg0 (см. update_server). Этот же
+# список знает интерфейс: он заранее предупреждает, что клиенты
+# переподключатся.
+RESTART_FIELDS = frozenset({
+    "address", "listen_port", "mtu",
+    "jc", "jmin", "jmax", "s1", "s2", "s3", "s4",
+    "h1", "h2", "h3", "h4", "i1", "i2", "i3", "i4", "i5",
+})
+
+
 @router.put("", response_model=ServerRead)
 def update_server(
     payload: ServerUpdate,
@@ -46,18 +56,26 @@ def update_server(
         except cascade.VlessParseError as exc:
             raise HTTPException(status_code=400, detail=f"Ссылка каскада: {exc}") from exc
 
+    changed = {f for f, v in updates.items() if getattr(server, f) != v}
     for field, value in updates.items():
         setattr(server, field, value)
     db.add(server)
     db.commit()
     db.refresh(server)
 
-    # Поля интерфейса (адрес/порт/MTU/DNS/обфускация и т.д.) должны сразу
-    # применяться к живому awg0, иначе БД и реальный интерфейс расходятся
-    # молча — ровно так один раз уже потерялась настройка MTU. restart=True,
-    # потому что часть этих полей (адрес, MTU, порт) `awg syncconf` не
-    # применяет на лету, нужен полноценный down/up.
-    config_sync.apply_current_config(db, restart=True)
+    # Сохранение сразу применяется к живому интерфейсу, иначе БД и
+    # реальный интерфейс расходятся молча — так однажды уже потерялась
+    # настройка MTU. Перезапуск (обрыв всех клиентов на несколько секунд)
+    # только когда он действительно нужен: адрес, порт, MTU и маскировку
+    # `awg syncconf` на лету не применяет. DNS и публичный адрес влияют лишь
+    # на клиентские конфиги, а каскад и внешний интерфейс — на xray и
+    # правила, которые переставляются без перезапуска туннеля. Раньше
+    # перезапуск был на каждое сохранение, даже на смену токена релея.
+    restart = bool(changed & RESTART_FIELDS)
+    # MTU у дополнительных протоколов общий с основным.
+    restart_tunnels = frozenset(t.protocol for t in config_sync.get_tunnels(db)) if "mtu" in changed else frozenset()
+    config_sync.apply_current_config(db, restart=restart, restart_tunnels=restart_tunnels)
+    db.refresh(server)
     return server
 
 
@@ -99,7 +117,10 @@ def apply_server_config(db: Session = Depends(get_db), _admin: str = Depends(get
 def restart_server_interface(db: Session = Depends(get_db), _admin: str = Depends(get_current_admin)):
     from .. import awg_manager
 
-    result = config_sync.apply_current_config(db, restart=True)
+    # Кнопка «перезапустить» — на случай, когда что-то повисло, поэтому
+    # перезапускаем всё, включая дополнительные протоколы.
+    everything = frozenset(t.protocol for t in config_sync.get_tunnels(db))
+    result = config_sync.apply_current_config(db, restart=True, restart_tunnels=everything)
     return ApplyResult(ok=result.ok, message=result.output, live_management_available=awg_manager.tools_available())
 
 
@@ -108,6 +129,17 @@ def cascade_sync_now(db: Session = Depends(get_db), _admin: str = Depends(get_cu
     """Синхронизация по кнопке: не ждать фонового цикла, когда только что
     поменяли настройки на релее."""
     cascade_sync.sync_once(db)
+    return cascade_status(db=db, _admin=_admin)
+
+
+@router.post("/cascade/verify", response_model=CascadeStatus)
+def cascade_verify_now(db: Session = Depends(get_db), _admin: str = Depends(get_current_admin)):
+    """Проба трафика через каскад прямо сейчас. Фоновая идёт раз в пять
+    минут — слишком долго, чтобы после включения каскада понять, работает ли
+    он."""
+    server = config_sync.get_server(db)
+    if server.cascade_enabled:
+        cascade.verify_now()
     return cascade_status(db=db, _admin=_admin)
 
 

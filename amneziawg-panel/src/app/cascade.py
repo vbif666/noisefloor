@@ -548,6 +548,13 @@ def verify() -> tuple[bool, str | None]:
     return False, f"проба вернула HTTP {code} вместо 204"
 
 
+def verify_now() -> tuple[bool, str | None]:
+    """verify() с записью результата в health() — для проверки по кнопке."""
+    ok, error = verify()
+    _record(ok, error)
+    return ok, error
+
+
 def health() -> dict:
     """Состояние каскада для API: не только «жив ли процесс», но и
     «проходил ли через него трафик, когда мы последний раз смотрели»."""

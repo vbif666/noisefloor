@@ -36,7 +36,7 @@ def interface_names(db: Session, server: ServerConfig) -> list[str]:
     return [server.interface_name] + [t.interface_name for t in get_tunnels(db) if t.enabled]
 
 
-def _apply_tunnels(db: Session, server: ServerConfig, peers: list[Peer], *, restart: bool,
+def _apply_tunnels(db: Session, server: ServerConfig, peers: list[Peer], *,
                    restart_tunnels: frozenset[str] = frozenset()) -> None:
     now = datetime.now(timezone.utc)
     for tunnel in get_tunnels(db):
@@ -45,7 +45,7 @@ def _apply_tunnels(db: Session, server: ServerConfig, peers: list[Peer], *, rest
                 awg_manager.down(tunnel.interface_name)
             continue
         text = awg_config.tunnel_config(tunnel, server, peers)
-        apply = awg_manager.restart if restart or tunnel.protocol in restart_tunnels else awg_manager.apply
+        apply = awg_manager.restart if tunnel.protocol in restart_tunnels else awg_manager.apply
         result = apply(tunnel.interface_name, text)
         tunnel.last_apply_status = "ok" if result.ok else "error"
         tunnel.last_apply_error = None if result.ok else result.output
@@ -80,10 +80,10 @@ def apply_current_config(db: Session, *, restart: bool = False,
     оставаться источником истины независимо от того, удалось ли применить
     конфиг на сервере прямо сейчас.
 
-    restart_tunnels — протоколы дополнительных интерфейсов, которые нужно
-    перезапустить, а не применить горячим способом: смена адреса или профиля
-    обфускации через syncconf не доезжает. Основной интерфейс при этом не
-    трогается.
+    restart относится только к основному интерфейсу. restart_tunnels —
+    протоколы дополнительных интерфейсов, которые нужно перезапустить, а не
+    применить горячим способом: смена адреса или профиля обфускации через
+    syncconf не доезжает. Остальные дополнительные при этом не трогаются.
     """
     server = get_server(db)
 
@@ -109,7 +109,7 @@ def apply_current_config(db: Session, *, restart: bool = False,
     else:
         result = awg_manager.apply(server.interface_name, config_text)
 
-    _apply_tunnels(db, server, peers, restart=restart, restart_tunnels=restart_tunnels)
+    _apply_tunnels(db, server, peers, restart_tunnels=restart_tunnels)
     _ensure_rules(server, interfaces, main_was_up, restart, result.ok)
 
     server.last_apply_status = "ok" if result.ok else "error"

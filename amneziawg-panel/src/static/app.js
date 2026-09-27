@@ -8,6 +8,7 @@ let token = localStorage.getItem("noisefloor_token") || null;
 let currentPeers = [];
 let currentServer = null;
 let currentTunnels = [];
+let lastCascadeStatus = null;  // последний ответ /server/cascade/status
 
 // Протоколы клиентов. У каждого свой интерфейс и свой UDP-порт: маскировка
 // задаётся на интерфейс, и клиент другого протокола рукопожатие не пройдёт.
@@ -485,112 +486,242 @@ async function loadServer() {
   fillServerForm(currentServer);
 }
 
+// Поле формы → id инпута, раздел (для подсказки «что изменено») и нужен ли
+// перезапуск туннеля. Тот же список перезапуска знает сервер
+// (routers/server.py, RESTART_FIELDS): интерфейс лишь заранее предупреждает.
+const SERVER_FIELDS = [
+  ["endpoint_host", "f-endpoint-host", "Сеть", false, "text"],
+  ["listen_port", "f-listen-port", "Сеть", true, "number"],
+  ["address", "f-address", "Сеть", true, "text"],
+  ["dns", "f-dns", "Сеть", false, "text"],
+  ["egress_interface", "f-egress", "Сеть", false, "text"],
+  ["mtu", "f-mtu", "Сеть", true, "nullable-number"],
+  ["cascade_enabled", "f-cascade-enabled", "Каскад", false, "checkbox"],
+  ["split_ru_direct", "f-split-ru-direct", "Каскад", false, "checkbox"],
+  ["cascade_sync_url", "f-cascade-sync-url", "Каскад", false, "text"],
+  ["cascade_sync_token", "f-cascade-sync-token", "Каскад", false, "text"],
+  ["jc", "f-jc", "Обфускация", true, "number"],
+  ["jmin", "f-jmin", "Обфускация", true, "number"],
+  ["jmax", "f-jmax", "Обфускация", true, "number"],
+  ["s1", "f-s1", "Обфускация", true, "number"],
+  ["s2", "f-s2", "Обфускация", true, "number"],
+  ["s3", "f-s3", "Обфускация", true, "number"],
+  ["s4", "f-s4", "Обфускация", true, "number"],
+  ["h1", "f-h1", "Обфускация", true, "text"],
+  ["h2", "f-h2", "Обфускация", true, "text"],
+  ["h3", "f-h3", "Обфускация", true, "text"],
+  ["h4", "f-h4", "Обфускация", true, "text"],
+];
+
+// Значения формы в том виде, в каком они сохранены на сервере. С ними
+// сравнивается текущее содержимое, чтобы показать панель сохранения.
+let savedServerValues = null;
+let savingServer = false;
+
+function readServerField(id, kind) {
+  const el = $(id);
+  if (kind === "checkbox") return el.checked;
+  if (kind === "number") return Number(el.value);
+  if (kind === "nullable-number") return el.value ? Number(el.value) : null;
+  return el.value.trim();
+}
+
+function writeServerField(id, kind, value) {
+  const el = $(id);
+  if (kind === "checkbox") el.checked = !!value;
+  else el.value = value ?? "";
+}
+
+function serverFormValues() {
+  const values = {};
+  for (const [field, id, , , kind] of SERVER_FIELDS) values[field] = readServerField(id, kind);
+  return values;
+}
+
+function changedServerFields() {
+  if (!savedServerValues) return [];
+  const now = serverFormValues();
+  return SERVER_FIELDS.filter(([field]) => now[field] !== savedServerValues[field]);
+}
+
+function updateSaveBar() {
+  const changed = changedServerFields();
+  const bar = $("save-bar");
+  bar.hidden = changed.length === 0 && !savingServer;
+  if (savingServer) return;
+  const sections = [...new Set(changed.map(([, , section]) => section))];
+  const restart = changed.some(([, , , needsRestart]) => needsRestart);
+  $("save-bar-title").textContent = `Изменено: ${sections.join(", ")}`;
+  $("save-bar-detail").textContent = restart
+    ? "Туннель перезапустится — клиенты переподключатся за несколько секунд."
+    : "Применится без обрыва клиентов.";
+  $("save-bar-detail").classList.toggle("is-warn", restart);
+  // Проверять связь с релеем по несохранённому адресу или токену бессмысленно:
+  // панель спросит релей по старым.
+  const cascadeDirty = changed.some(([field]) => field.startsWith("cascade_"));
+  $("cascade-check-btn").disabled = cascadeDirty;
+  $("cascade-check-hint").textContent = cascadeDirty ? "сначала сохраните изменения каскада" : "";
+  if (!cascadeChecking) renderCascadeChecklist(lastCascadeStatus || {});
+}
+
+document.querySelectorAll("#server-form input").forEach((el) => {
+  if (el.closest("#tunnels-list")) return;  // у протоколов своё сохранение
+  el.addEventListener("input", updateSaveBar);
+  el.addEventListener("change", updateSaveBar);
+});
+
+window.addEventListener("beforeunload", (e) => {
+  if (changedServerFields().length) {
+    e.preventDefault();
+    e.returnValue = "";
+  }
+});
+
 function fillServerForm(s) {
   $("server-pubkey-display").textContent = s.public_key;
-  $("f-endpoint-host").value = s.endpoint_host || "";
-  $("f-listen-port").value = s.listen_port;
-  $("f-address").value = s.address;
-  $("f-dns").value = s.dns || "";
-  $("f-egress").value = s.egress_interface || "";
-  $("f-mtu").value = s.mtu || "";
-  $("f-cascade-enabled").checked = !!s.cascade_enabled;
-  $("f-split-ru-direct").checked = !!s.split_ru_direct;
-  $("f-cascade-sync-url").value = s.cascade_sync_url || "";
-  $("f-cascade-sync-token").value = s.cascade_sync_token || "";
-  $("f-jc").value = s.jc;
-  $("f-jmin").value = s.jmin;
-  $("f-jmax").value = s.jmax;
-  $("f-s1").value = s.s1;
-  $("f-s2").value = s.s2;
-  $("f-s3").value = s.s3;
-  $("f-s4").value = s.s4;
-  $("f-h1").value = s.h1;
-  $("f-h2").value = s.h2;
-  $("f-h3").value = s.h3;
-  $("f-h4").value = s.h4;
+  for (const [field, id, , , kind] of SERVER_FIELDS) writeServerField(id, kind, s[field]);
+  savedServerValues = serverFormValues();
   renderApplyStatus(s);
+  updateSaveBar();
   // Версия релея приходит вместе с настройками сервера — обновляем блок версий.
   if (selfUpdateState) renderSelfUpdate(selfUpdateState);
 }
 
 function renderApplyStatus(s) {
   const el = $("apply-status");
+  const dot = $("apply-strip-dot");
   el.classList.remove("is-error", "is-ok");
+  dot.className = "apply-strip-dot";
   if (!s.last_applied_at) {
-    el.textContent = "ещё не применялось на сервере";
+    el.textContent = "Настройки ещё не применялись на сервере";
     return;
   }
   const appliedAt = new Date(s.last_applied_at);
-  const when = timeAgo(appliedAt);
   el.title = appliedAt.toLocaleString();
   if (s.last_apply_status === "ok") {
-    el.textContent = `применено ${when}`;
+    el.textContent = `Настройки применены на сервере ${timeAgo(appliedAt)}`;
     el.classList.add("is-ok");
+    dot.classList.add("is-ok");
   } else {
-    el.textContent = `не применено (${when}): ${s.last_apply_error || "неизвестная ошибка"}`;
+    el.textContent = `Не применилось (${timeAgo(appliedAt)}): ${s.last_apply_error || "неизвестная ошибка"}`;
     el.classList.add("is-error");
+    dot.classList.add("is-error");
   }
 }
 
+$("discard-btn").addEventListener("click", () => {
+  if (currentServer) fillServerForm(currentServer);
+});
+
 $("server-form").addEventListener("submit", async (e) => {
   e.preventDefault();
-  const payload = {
-    endpoint_host: $("f-endpoint-host").value.trim(),
-    listen_port: Number($("f-listen-port").value),
-    address: $("f-address").value.trim(),
-    dns: $("f-dns").value.trim(),
-    egress_interface: $("f-egress").value.trim(),
-    mtu: $("f-mtu").value ? Number($("f-mtu").value) : null,
-    cascade_enabled: $("f-cascade-enabled").checked,
-    split_ru_direct: $("f-split-ru-direct").checked,
-    cascade_sync_url: $("f-cascade-sync-url").value.trim(),
-    cascade_sync_token: $("f-cascade-sync-token").value.trim(),
-    jc: Number($("f-jc").value),
-    jmin: Number($("f-jmin").value),
-    jmax: Number($("f-jmax").value),
-    s1: Number($("f-s1").value),
-    s2: Number($("f-s2").value),
-    s3: Number($("f-s3").value),
-    s4: Number($("f-s4").value),
-    h1: $("f-h1").value.trim(),
-    h2: $("f-h2").value.trim(),
-    h3: $("f-h3").value.trim(),
-    h4: $("f-h4").value.trim(),
-  };
+  const changed = changedServerFields();
+  if (!changed.length) return;
+  const payload = {};
+  const now = serverFormValues();
+  for (const [field] of changed) payload[field] = now[field];
+
+  const btn = $("save-btn");
+  savingServer = true;
+  btn.disabled = true;
+  $("discard-btn").disabled = true;
+  $("save-bar-title").textContent = "Сохраняю и применяю…";
+  $("save-bar-detail").textContent = "";
   try {
     currentServer = await api("/server", { method: "PUT", body: JSON.stringify(payload) });
+    savingServer = false;
     fillServerForm(currentServer);
-    showToast("Настройки сохранены. Не забудьте «Применить на сервере».");
+    if (currentServer.last_apply_status === "error") {
+      showToast(`Сохранено, но не применилось: ${currentServer.last_apply_error}`, true);
+    } else {
+      showToast("Сохранено и применено");
+    }
+    // Каскад затронут — сразу показываем, что из этого вышло, а не ждём
+    // фонового опроса и пятиминутной пробы.
+    if (changed.some(([field]) => field.startsWith("cascade_") || field === "split_ru_direct")) {
+      await checkCascade({ quiet: true });
+    }
   } catch (err) {
     showToast(err.message, true);
+  } finally {
+    savingServer = false;
+    btn.disabled = false;
+    $("discard-btn").disabled = false;
+    updateSaveBar();
   }
 });
 
-$("cascade-sync-btn").addEventListener("click", async () => {
-  const btn = $("cascade-sync-btn");
-  const status = $("cascade-sync-status");
+// Синхронизация с релеем и проба трафика через каскад — по кнопке и сразу
+// после сохранения настроек каскада.
+let cascadeChecking = false;
+
+async function checkCascade({ quiet = false } = {}) {
+  if (!currentServer || !currentServer.cascade_enabled) {
+    renderCascadeStatus(await api("/server/cascade/status"));
+    return;
+  }
+  const btn = $("cascade-check-btn");
+  cascadeChecking = true;
   btn.disabled = true;
-  status.classList.remove("is-error", "is-ok");
-  status.textContent = "спрашиваю релей…";
   try {
-    // Сохраняем адрес и токен перед синхронизацией: иначе спросим релей
-    // по старым данным и покажем непонятную ошибку.
-    await api("/server", {
-      method: "PUT",
-      body: JSON.stringify({
-        cascade_sync_url: $("f-cascade-sync-url").value.trim(),
-        cascade_sync_token: $("f-cascade-sync-token").value.trim(),
-      }),
-    });
-    const result = await api("/server/cascade/sync", { method: "POST" });
-    renderCascadeSync(result);
+    lastCascadeStatus = { ...(lastCascadeStatus || {}), checking: "sync" };
+    renderCascadeChecklist(lastCascadeStatus);
+    if (currentServer.cascade_sync_url) {
+      lastCascadeStatus = await api("/server/cascade/sync", { method: "POST" });
+    }
+    renderCascadeStatus({ ...lastCascadeStatus, checking: "verify" });
+    const result = await api("/server/cascade/verify", { method: "POST" });
+    renderCascadeStatus(result);
+    if (!quiet || result.verified_ok === false) {
+      showToast(result.verified_ok ? "Каскад работает: трафик проходит через релей" : `Каскад не работает: ${cascadeProblem(result)}`,
+        !result.verified_ok);
+    }
     await loadServer();
   } catch (err) {
-    status.textContent = err.message;
-    status.classList.add("is-error");
+    showToast(err.message, true);
   } finally {
+    cascadeChecking = false;
     btn.disabled = false;
+    updateSaveBar();
   }
+}
+
+$("cascade-check-btn").addEventListener("click", () => checkCascade());
+
+$("randomize-btn").addEventListener("click", () => {
+  openConfirm(
+    "Пересоздать параметры обфускации?",
+    "Туннель перезапустится с новыми параметрами, и все выданные клиентам AmneziaWG 2.0 конфиги перестанут подключаться — их придётся раздать заново.",
+    async () => {
+      try {
+        currentServer = await api("/server/randomize-obfuscation", { method: "POST" });
+        fillServerForm(currentServer);
+        showToast("Параметры пересозданы и применены — перевыпустите конфиги клиентам");
+      } catch (err) {
+        showToast(err.message, true);
+      }
+    },
+  );
+});
+
+$("restart-btn").addEventListener("click", () => {
+  openConfirm(
+    "Перезапустить туннель?",
+    "Все интерфейсы опустятся и поднимутся заново. Клиенты переподключатся сами за несколько секунд. Нужно, если что-то повисло; для применения настроек не требуется.",
+    async () => {
+      const btn = $("restart-btn");
+      btn.disabled = true;
+      try {
+        const result = await api("/server/restart", { method: "POST" });
+        await loadServer();
+        showToast(result.ok ? "Туннель перезапущен" : result.message, !result.ok);
+      } catch (err) {
+        showToast(err.message, true);
+      } finally {
+        btn.disabled = false;
+      }
+    },
+  );
 });
 
 function renderCascadeSummary(c) {
@@ -606,64 +737,6 @@ function renderCascadeSummary(c) {
   if (c.relay_sni) parts.push(`sni ${c.relay_sni}`);
   if (c.relay_label) parts.push(c.relay_label);
   el.textContent = parts.join("  ·  ");
-}
-
-function renderCascadeSync(c) {
-  const status = $("cascade-sync-status");
-  if (!status) return;
-  status.classList.remove("is-error", "is-ok");
-  if (!c.sync_enabled) {
-    status.textContent = "";
-    return;
-  }
-  if (c.sync_error) {
-    status.textContent = c.sync_error;
-    status.classList.add("is-error");
-    return;
-  }
-  if (c.synced_at) {
-    const at = new Date(c.synced_at);
-    status.textContent = `параметры получены ${timeAgo(at)}`;
-    if (c.relay_rotation_at) {
-      // Релей меняет SNI по расписанию; панель придёт за новыми
-      // параметрами сразу после этого момента.
-      const rot = new Date(c.relay_rotation_at);
-      status.textContent += ` · релей сменит SNI в ${rot.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}`;
-    }
-    // Точный момент — подсказкой: относительное время удобно читать, но
-    // сразу после нажатия кнопки хочется убедиться, что это именно оно.
-    status.title = at.toLocaleString();
-    status.classList.add("is-ok");
-  } else {
-    status.textContent = "ещё не синхронизировались";
-    status.title = "";
-  }
-}
-
-$("randomize-btn").addEventListener("click", async () => {
-  try {
-    currentServer = await api("/server/randomize-obfuscation", { method: "POST" });
-    fillServerForm(currentServer);
-    showToast("Параметры обфускации пересозданы — сохранены, осталось применить");
-  } catch (err) {
-    showToast(err.message, true);
-  }
-});
-
-$("apply-btn").addEventListener("click", () => runApply("/server/apply", $("apply-btn")));
-$("restart-btn").addEventListener("click", () => runApply("/server/restart", $("restart-btn")));
-
-async function runApply(path, btn) {
-  btn.disabled = true;
-  try {
-    const result = await api(path, { method: "POST" });
-    await loadServer();
-    showToast(result.ok ? "Применено на сервере" : result.message, !result.ok);
-  } catch (err) {
-    showToast(err.message, true);
-  } finally {
-    btn.disabled = false;
-  }
 }
 
 /* ==========================================================================
@@ -1191,9 +1264,60 @@ function renderCascadeBadge(hist) {
     ` · всего ↑${formatBytes(last.cascade_uplink)} ↓${formatBytes(last.cascade_downlink)}`;
 }
 
+function cascadeProblem(c) {
+  if (c.sync_enabled && c.sync_error) return c.sync_error;
+  if (c.error) return c.error;
+  if (!c.running) return "xray каскада не запущен";
+  return c.verify_error || "трафик через релей не проходит";
+}
+
+// Чек-лист каскада: по нему видно, на каком шаге всё стоит и чего панель
+// ждёт — адреса релея, ответа от него, запуска xray или проверки трафика.
+function renderCascadeChecklist(c) {
+  const box = $("cascade-checklist");
+  if (!box) return;
+  if (!currentServer || !currentServer.cascade_enabled) {
+    const pending = $("f-cascade-enabled").checked;
+    box.innerHTML = pending
+      ? `<div class="check-row is-wait"><span class="check-mark">…</span><span>Каскад включится, когда вы сохраните изменения (кнопка внизу экрана).</span></div>`
+      : `<div class="check-row is-off"><span class="check-mark">○</span><span>Каскад выключен — трафик клиентов выходит в интернет прямо с этого сервера.</span></div>`;
+    return;
+  }
+  const rows = [];
+  const row = (state, text, detail = "") =>
+    rows.push(`<div class="check-row is-${state}"><span class="check-mark">${{ ok: "✓", bad: "✕", wait: "…", todo: "○" }[state]}</span><span>${text}${detail ? ` <span class="check-detail">${detail}</span>` : ""}</span></div>`);
+
+  const hasRelay = !!(currentServer.cascade_sync_url && currentServer.cascade_sync_token);
+  if (hasRelay) row("ok", "Релей указан", escapeHtml(currentServer.cascade_sync_url));
+  else if (c.configured) row("ok", "Ссылка на релей задана вручную");
+  else row("todo", "Укажите адрес релея и токен ниже и сохраните");
+
+  if (c.checking === "sync") row("wait", "Спрашиваю параметры у релея…");
+  else if (c.sync_enabled && c.sync_error) row("bad", "Релей не ответил", escapeHtml(c.sync_error));
+  else if (c.sync_enabled && c.synced_at) {
+    const extra = c.relay_host ? ` · ${escapeHtml(`${c.relay_host}:${c.relay_port}`)}${c.relay_sni ? `, SNI ${escapeHtml(c.relay_sni)}` : ""}` : "";
+    row("ok", "Параметры получены от релея", `${timeAgo(new Date(c.synced_at))}${extra}`);
+  } else if (hasRelay) row("todo", "Параметры от релея ещё не получены");
+
+  if (c.configured) {
+    if (c.error) row("bad", "xray каскада не запустился", escapeHtml(c.error));
+    else if (c.running) row("ok", "xray каскада запущен", `↑${formatBytes(c.uplink)} ↓${formatBytes(c.downlink)}`);
+    else row("bad", "xray каскада не запущен");
+  }
+
+  if (c.checking === "verify") row("wait", "Проверяю трафик через релей…");
+  else if (c.verified_ok === true) row("ok", "Трафик проходит через релей", c.verified_at ? `проверено ${timeAgo(new Date(c.verified_at))}` : "");
+  else if (c.verified_ok === false) row("bad", "Трафик через релей не проходит", escapeHtml(c.verify_error || ""));
+  else if (c.running) row("todo", "Трафик ещё не проверялся", "нажмите «Проверить связь сейчас»");
+
+  box.innerHTML = rows.join("");
+}
+
 function renderCascadeStatus(c) {
-  renderCascadeSync(c);
+  if (cascadeChecking && !c.checking) return;  // идёт проверка по кнопке — не мигаем фоновым опросом
+  lastCascadeStatus = c;
   renderCascadeSummary(c);
+  renderCascadeChecklist(c);
   const el = $("cascade-status");
   if (!el) return;
   el.classList.remove("is-error", "is-ok");
@@ -1201,23 +1325,24 @@ function renderCascadeStatus(c) {
     el.textContent = "выключен";
     return;
   }
-  if (!c.configured) {
-    el.textContent = "включен, но ссылка не задана";
+  if (c.checking) {
+    el.textContent = "проверяю…";
+    return;
+  }
+  if (c.sync_enabled && c.sync_error && c.running && c.verified_ok) {
+    // Релей не отдаёт новые параметры, но каскад пока живёт на прежних —
+    // сломается при следующей смене SNI на релее.
+    el.textContent = "работает на старых параметрах";
     el.classList.add("is-error");
     return;
   }
-  if (c.error) {
-    el.textContent = `ошибка: ${c.error}`;
+  if (!c.configured || c.error || !c.running || c.verified_ok === false || (c.sync_enabled && c.sync_error)) {
+    el.textContent = c.configured ? "не работает" : "ждёт настройки";
     el.classList.add("is-error");
     return;
   }
-  if (!c.running) {
-    el.textContent = "не запущен";
-    el.classList.add("is-error");
-    return;
-  }
-  el.textContent = `активен · ↑${formatBytes(c.uplink)} ↓${formatBytes(c.downlink)}`;
-  el.classList.add("is-ok");
+  el.textContent = c.verified_ok ? "работает" : "запущен, не проверен";
+  if (c.verified_ok) el.classList.add("is-ok");
 }
 
 function renderLiveMtu(liveMtu) {
@@ -1237,7 +1362,7 @@ function renderLiveMtu(liveMtu) {
     el.textContent = `на интерфейсе сейчас: ${liveMtu} (совпадает)`;
     el.classList.add("is-ok");
   } else {
-    el.textContent = `на интерфейсе сейчас: ${liveMtu} (в панели ${configured} — примените конфиг)`;
+    el.textContent = `на интерфейсе сейчас: ${liveMtu} (в панели ${configured} — не применилось, перезапустите туннель)`;
     el.classList.add("is-error");
   }
 }

@@ -109,6 +109,13 @@
     <section id="tab-server" hidden>
       <form id="server-form">
 
+        <div class="apply-strip">
+          <span class="apply-strip-dot" id="apply-strip-dot"></span>
+          <span id="apply-status" class="apply-status"></span>
+          <button type="button" id="restart-btn" class="btn btn-ghost btn-sm"
+                  title="Опустить и поднять все интерфейсы туннеля. Клиенты переподключатся за несколько секунд.">Перезапустить туннель</button>
+        </div>
+
         <div class="panel" style="margin-bottom:16px;">
           <div class="panel-header"><h2>Идентичность сервера</h2></div>
           <div class="panel-body">
@@ -164,7 +171,8 @@
             <span id="cascade-status" class="apply-status"></span>
           </div>
           <div class="panel-body">
-            <p class="field-hint">Весь TCP-трафик клиентов туннеля дополнительно заворачивается через внешний VLESS+Reality эндпоинт — сервер прячется за ещё одним хопом (UDP каскад не затрагивает, идёт напрямую).</p>
+            <p class="field-hint" style="margin-top:0;">Трафик клиентов уходит в интернет не отсюда, а через второй сервер (релей). Сайты видят адрес релея, а этот сервер прячется за ещё одним хопом.</p>
+            <div class="cascade-checklist" id="cascade-checklist"></div>
             <div class="field-group">
               <label for="f-cascade-enabled" style="display:flex; align-items:center; gap:8px;">
                 <input id="f-cascade-enabled" type="checkbox" style="width:auto;" /> Включить каскад
@@ -202,8 +210,8 @@
                 </div>
               </div>
               <div class="server-actions" style="margin-top:4px;">
-                <button type="button" id="cascade-sync-btn" class="btn btn-sm">Синхронизировать сейчас</button>
-                <span id="cascade-sync-status" class="apply-status"></span>
+                <button type="button" id="cascade-check-btn" class="btn btn-sm">Проверить связь сейчас</button>
+                <span id="cascade-check-hint" class="apply-status"></span>
               </div>
             </div>
             <div class="field-group" style="margin-bottom:0;">
@@ -320,14 +328,14 @@
           </div>
         </div>
 
-        <div class="panel">
-          <div class="panel-body">
-            <div class="server-actions">
-              <button type="submit" class="btn btn-primary">Сохранить</button>
-              <button type="button" id="apply-btn" class="btn">Применить на сервере</button>
-              <button type="button" id="restart-btn" class="btn btn-ghost btn-sm">Перезапустить интерфейс</button>
-              <span id="apply-status" class="apply-status"></span>
-            </div>
+        <div class="save-bar" id="save-bar" hidden>
+          <div class="save-bar-text">
+            <strong id="save-bar-title">Есть несохранённые изменения</strong>
+            <span id="save-bar-detail" class="save-bar-detail"></span>
+          </div>
+          <div class="save-bar-actions">
+            <button type="button" id="discard-btn" class="btn btn-ghost btn-sm">Отменить</button>
+            <button type="submit" id="save-btn" class="btn btn-primary btn-sm">Сохранить и применить</button>
           </div>
         </div>
 
