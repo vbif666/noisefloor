@@ -13,6 +13,7 @@ from __future__ import annotations
 from . import cascade
 from .config import settings
 from .models import PROTOCOL_AWG1, PROTOCOL_AWG2, Peer, ServerConfig, Tunnel
+from .obfuscation import AWG31_PARAMS
 
 # Скрипт лежит в образе; он же отвечает за идемпотентность правил.
 RULES_SCRIPT = "/usr/local/bin/noisefloor-rules"
@@ -34,6 +35,13 @@ def _obfuscation_lines(obj) -> list[str]:
         value = getattr(obj, field)
         if value:
             lines.append(f"{field.upper()} = {value}")
+    # AmneziaWG 3.1: ключ защиты заголовков и тайминги. Без ключа интерфейс
+    # остаётся 2.0 — клиент 3.1 к нему не подключится, и наоборот.
+    hpk = getattr(obj, "header_protection_key", "")
+    if hpk:
+        lines.append(f"HeaderProtectionKey = {hpk}")
+        for key, value in AWG31_PARAMS:
+            lines.append(f"{key} = {value}")
     return lines
 
 
@@ -169,7 +177,7 @@ def client_config(peer: Peer, server: ServerConfig, tunnel: Tunnel | None = None
     """Конфиг, который клиент импортирует в приложение AmneziaWG / сканирует как QR.
 
     tunnel — дополнительный интерфейс, к которому относится клиент (AWG 1.x
-    или обычный WireGuard); None — основной интерфейс AmneziaWG 2.0."""
+    или обычный WireGuard); None — основной интерфейс AmneziaWG 3.1."""
     lines = [
         "[Interface]",
         f"PrivateKey = {peer.private_key}",

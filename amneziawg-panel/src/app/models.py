@@ -89,6 +89,11 @@ class ServerConfig(Base):
     i3 = Column(Text, default="")
     i4 = Column(Text, default="")
     i5 = Column(Text, default="")
+    # --- AmneziaWG 3.1 ---
+    # Ключ защиты заголовков (формат как у приватного ключа WireGuard). Как и
+    # остальная маскировка, он общий для сервера и всех клиентов интерфейса.
+    # Пустой — интерфейс работает как AmneziaWG 2.0.
+    header_protection_key = Column(String(64), default="")
 
     # --- Статус последнего применения на живой интерфейс ---
     last_apply_status = Column(String(16), nullable=True)  # "ok" | "error" | None

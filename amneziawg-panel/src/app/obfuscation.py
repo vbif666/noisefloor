@@ -18,6 +18,8 @@
 """
 import random
 
+from .crypto import generate_keypair
+
 _H_SPACE_START = 5  # избегаем 0 (означает "выключено") и 1-4 (зарезервированы под типы пакетов WireGuard)
 _H_SPACE_END = 2_000_000_000  # с запасом внутри uint32, чтобы не думать про переполнение
 _BAND_SIZE = (_H_SPACE_END - _H_SPACE_START) // 4
@@ -72,6 +74,27 @@ def random_paddings() -> tuple[int, int, int, int]:
     )
 
 
+# Параметры AmneziaWG 3.1 — те же, что ставит официальный установщик
+# Amnezia (amnezia-client, protocolConstants.h). Диапазоны: каждая сторона
+# сама выбирает значение внутри, поэтому совпадать до числа им не нужно.
+AWG31_PARAMS = (
+    ("ContentPaddingAddition", "10-100"),
+    ("RekeyAfterTime", "100-120"),
+    ("RekeyTimeout", "3-7"),
+    ("RejectAfterTime", "150-180"),
+    ("KeepaliveTimeout", "5-15"),
+    ("MaxHandshakeAttempts", "15-20"),
+    ("RandomTrailers", "on"),
+    ("DisableCookies", "on"),
+)
+
+
+def random_header_protection_key() -> str:
+    """Ключ защиты заголовков AmneziaWG 3.1. Amnezia берёт для него обычный
+    приватный ключ WireGuard (genClientKeys().clientPrivKey)."""
+    return generate_keypair()[0]
+
+
 def random_obfuscation_profile() -> dict:
     jc, jmin, jmax = random_junk()
     s1, s2, s3, s4 = random_paddings()
@@ -80,6 +103,7 @@ def random_obfuscation_profile() -> dict:
         "jc": jc, "jmin": jmin, "jmax": jmax,
         "s1": s1, "s2": s2, "s3": s3, "s4": s4,
         "h1": h1, "h2": h2, "h3": h3, "h4": h4,
+        "header_protection_key": random_header_protection_key(),
     }
 
 

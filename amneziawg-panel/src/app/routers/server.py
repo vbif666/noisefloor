@@ -86,7 +86,8 @@ def update_server(
 @router.post("/randomize-obfuscation", response_model=ServerRead)
 def randomize_obfuscation(db: Session = Depends(get_db), _admin: str = Depends(get_current_admin)):
     """
-    Пересоздаёт Jc/Jmin/Jmax/S1-S4/H1-H4 сервера. Это общие параметры
+    Пересоздаёт Jc/Jmin/Jmax/S1-S4/H1-H4 и ключ защиты заголовков 3.1
+    сервера. Это общие параметры
     интерфейса (см. models.Peer — у пиров своих полей обфускации нет,
     они всегда берутся из ServerConfig при генерации клиентского конфига),
     поэтому раскатывать их отдельно на записи Peer не нужно и не имеет

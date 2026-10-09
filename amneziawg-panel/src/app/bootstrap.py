@@ -12,7 +12,7 @@ from sqlalchemy.orm import Session
 from . import crypto
 from .config import DATA_DIR, settings
 from .models import PROTOCOL_AWG1, PROTOCOL_WG, AdminUser, ServerConfig, Tunnel
-from .obfuscation import random_awg1_profile, random_obfuscation_profile
+from .obfuscation import random_awg1_profile, random_header_protection_key, random_obfuscation_profile
 from .security import hash_password
 
 
@@ -85,6 +85,13 @@ def ensure_server_config(db: Session) -> None:
                 existing.endpoint_host = detected
                 db.add(existing)
                 db.commit()
+        # Основной интерфейс — AmneziaWG 3.1. Сервер, поднятый ещё на 2.0,
+        # переводим один раз: выданные раньше конфиги после этого перестают
+        # подключаться, клиентам нужны новые (и Amnezia 5.0.3+).
+        if not existing.header_protection_key:
+            existing.header_protection_key = random_header_protection_key()
+            db.add(existing)
+            db.commit()
         return
 
     priv, pub = crypto.generate_keypair()

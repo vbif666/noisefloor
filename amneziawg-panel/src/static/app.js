@@ -14,14 +14,14 @@ let lastCascadeStatus = null;  // последний ответ /server/cascade/
 // задаётся на интерфейс, и клиент другого протокола рукопожатие не пройдёт.
 const PROTOCOLS = {
   awg2: {
-    name: "AmneziaWG 2.0",
+    name: "AmneziaWG 3.1",
     badge: "",
-    hint: "Основной протокол с полной маскировкой. Импорт — в приложение AmneziaVPN или AmneziaWG свежей версии.",
+    hint: "Основной протокол с полной маскировкой и защитой заголовков. Импорт — в AmneziaVPN 5.0.3 или новее.",
   },
   awg1: {
     name: "AmneziaWG 1.x",
     badge: "AWG 1.x",
-    hint: "Для старых версий AmneziaVPN и AmneziaWG и прошивок роутеров, которые не понимают S3/S4 и I1–I5. Маскировка слабее, чем у 2.0.",
+    hint: "Для старых версий AmneziaVPN и AmneziaWG и прошивок роутеров, которые не понимают S3/S4 и I1–I5. Маскировка слабее, чем у 3.1.",
   },
   wg: {
     name: "WireGuard",
@@ -392,7 +392,7 @@ function tunnelCardHtml(t) {
   const p = t.protocol;
   const obfs = p === "awg1" ? `
       <div class="field-group">
-        <span class="eyebrow">Маскировка AmneziaWG 1.x — своя, не та же, что у 2.0</span>
+        <span class="eyebrow">Маскировка AmneziaWG 1.x — своя, не та же, что у 3.1</span>
         <div class="field-grid">
           <div class="field"><label>Jc</label><input data-t="${p}" data-f="jc" type="number" min="0" value="${t.jc}" /></div>
           <div class="field"><label>Jmin</label><input data-t="${p}" data-f="jmin" type="number" min="0" value="${t.jmin}" /></div>
@@ -718,7 +718,7 @@ $("cascade-check-btn").addEventListener("click", async () => {
 $("randomize-btn").addEventListener("click", () => {
   openConfirm(
     "Пересоздать параметры обфускации?",
-    "Туннель перезапустится с новыми параметрами, и все выданные клиентам AmneziaWG 2.0 конфиги перестанут подключаться — их придётся раздать заново.",
+    "Туннель перезапустится с новыми параметрами, и все выданные клиентам AmneziaWG 3.1 конфиги перестанут подключаться — их придётся раздать заново.",
     async () => {
       try {
         currentServer = await api("/server/randomize-obfuscation", { method: "POST" });
