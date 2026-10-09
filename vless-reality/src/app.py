@@ -491,6 +491,11 @@ def render_config(creds: dict, now: datetime | None = None) -> None:
             ]
         },
     }
+    gh_dns, gh_outbounds, gh_rules = geohide_xray_parts(creds)
+    if gh_dns:
+        config["dns"] = gh_dns
+        config["outbounds"].extend(gh_outbounds)
+        config["routing"]["rules"].extend(gh_rules)
     CONFIG_FILE.write_text(json.dumps(config, indent=2))
 
 
@@ -536,6 +541,158 @@ def get_rotation(creds: dict) -> dict:
 
 def load_creds() -> dict:
     return json.loads(CREDS_FILE.read_text())
+
+
+# ------------------------------------------------------------ geohide ----
+#
+# GeoHide (geohide.ru) - DNS, который для сайтов с геоблоком отдаёт адреса
+# своих прокси. Включение здесь: домены из их списка (плюс свои) xray
+# резолвит через DoH GeoHide и отправляет через отдельный outbound
+# "geohide"; остальной трафик идёт как раньше. Список доменов хранится
+# отдельным файлом, чтобы не раздувать creds, и обновляется раз в сутки.
+
+GEOHIDE_REGIONS = ("eu", "us")
+GEOHIDE_DOMAINS_FILE = DATA_DIR / "geohide-domains.txt"
+GEOHIDE_REFRESH_SECONDS = 24 * 3600
+GEOHIDE_FETCH_TIMEOUT = 20
+_DOMAIN_RE = re.compile(r"^(?=.{1,253}$)([a-z0-9_]([a-z0-9_-]{0,61}[a-z0-9])?\.)+[a-z][a-z0-9-]{0,62}$")
+
+
+def geohide_defaults() -> dict:
+    return {
+        "enabled": False,
+        "region": "eu",
+        "extra": [],
+        "updated_at": None,
+        "count": 0,
+        "last_error": None,
+    }
+
+
+def get_geohide(creds: dict) -> dict:
+    gh = geohide_defaults()
+    gh.update(creds.get("geohide") or {})
+    if gh["region"] not in GEOHIDE_REGIONS:
+        gh["region"] = "eu"
+    return gh
+
+
+def parse_domains(text: str) -> list[str]:
+    out: list[str] = []
+    for raw in re.split(r"[\s,;]+", text or ""):
+        d = raw.strip().lower().strip(".")
+        if d.startswith("#") or not d:
+            continue
+        d = d.split("://")[-1].split("/")[0].split(":")[0]
+        if d.startswith("*."):
+            d = d[2:]
+        if _DOMAIN_RE.match(d) and d not in out:
+            out.append(d)
+    return out
+
+
+def geohide_doh_url(region: str) -> str:
+    # https+local: запрос к DoH идёт напрямую, мимо маршрутизации xray.
+    return f"https+local://{region}.geohide.ru/dns-query"
+
+
+def geohide_domains(gh: dict) -> list[str]:
+    base: list[str] = []
+    if GEOHIDE_DOMAINS_FILE.exists():
+        base = parse_domains(GEOHIDE_DOMAINS_FILE.read_text())
+    seen = set(base)
+    return base + [d for d in gh["extra"] if d not in seen]
+
+
+def fetch_geohide_list(region: str) -> list[str]:
+    import urllib.request
+    req = urllib.request.Request(
+        f"https://geohide.ru/{region}/domains.txt",
+        headers={"User-Agent": f"{APP_NAME}/{build_info()['version']}"},
+    )
+    with urllib.request.urlopen(req, timeout=GEOHIDE_FETCH_TIMEOUT) as resp:
+        body = resp.read(2 * 1024 * 1024).decode("utf-8", "replace")
+    domains = parse_domains(body)
+    if len(domains) < 10:
+        raise ValueError(f"в списке GeoHide подозрительно мало доменов ({len(domains)})")
+    return domains
+
+
+def refresh_geohide(region: str) -> tuple[int, str | None]:
+    """Скачать список. При ошибке старый файл остаётся как был."""
+    try:
+        domains = fetch_geohide_list(region)
+    except Exception as e:
+        return 0, f"не удалось скачать список: {e}"
+    tmp = GEOHIDE_DOMAINS_FILE.with_suffix(".tmp")
+    tmp.write_text("\n".join(domains) + "\n")
+    tmp.replace(GEOHIDE_DOMAINS_FILE)
+    return len(domains), None
+
+
+def geohide_xray_parts(creds: dict) -> tuple[dict | None, list[dict], list[dict]]:
+    """dns-секция, доп. outbounds и правила маршрутизации для конфига."""
+    gh = get_geohide(creds)
+    if not gh["enabled"]:
+        return None, [], []
+    domains = geohide_domains(gh)
+    if not domains:
+        return None, [], []
+    matchers = [f"domain:{d}" for d in domains]
+    dns = {
+        "servers": [
+            {"address": geohide_doh_url(gh["region"]), "domains": matchers, "skipFallback": True},
+            "localhost",
+        ],
+        "queryStrategy": "UseIPv4",
+    }
+    outbounds = [{"protocol": "freedom", "tag": "geohide", "settings": {"domainStrategy": "UseIPv4"}}]
+    rules = [{"type": "field", "inboundTag": ["vless-in"], "domain": matchers, "outboundTag": "geohide"}]
+    return dns, outbounds, rules
+
+
+def geohide_apply(update_list: bool) -> dict:
+    """Пересобрать конфиг под текущие настройки GeoHide (опционально
+    обновив список) и перезапустить xray. Вызывать под rotation_lock."""
+    creds = load_creds()
+    gh = get_geohide(creds)
+    if update_list:
+        count, err = refresh_geohide(gh["region"])
+        gh["last_error"] = err
+        if not err:
+            gh["count"] = count
+            gh["updated_at"] = datetime.now(timezone.utc).isoformat()
+    creds["geohide"] = gh
+    save_creds(creds)
+    render_config(creds)
+    restart_xray()
+    return gh
+
+
+def geohide_headline(gh: dict) -> str:
+    if not gh["enabled"]:
+        return "выключено"
+    n = len(geohide_domains(gh))
+    when = ""
+    if gh["updated_at"]:
+        when = f', список от <span data-iso="{html.escape(gh["updated_at"], quote=True)}">{html.escape(gh["updated_at"])}</span>'
+    return f"включено, {gh['region'].upper()}, доменов: {n}{when}"
+
+
+def geohide_loop(stop_event: threading.Event):
+    while not stop_event.wait(600):
+        try:
+            gh = get_geohide(load_creds())
+            if not gh["enabled"]:
+                continue
+            last = gh["updated_at"]
+            due = (not last or (datetime.now(timezone.utc)
+                   - datetime.fromisoformat(last)).total_seconds() >= GEOHIDE_REFRESH_SECONDS)
+            if due:
+                with rotation_lock:
+                    geohide_apply(update_list=True)
+        except Exception:
+            continue
 
 
 def parse_pool(text: str) -> list[str]:
@@ -928,6 +1085,7 @@ async def lifespan(app: FastAPI):
         threading.Thread(target=poll_stats, args=(_stop_event,), daemon=True),
         threading.Thread(target=rotate_access_log, args=(_stop_event,), daemon=True),
         threading.Thread(target=rotation_loop, args=(_stop_event,), daemon=True),
+        threading.Thread(target=geohide_loop, args=(_stop_event,), daemon=True),
         threading.Thread(target=self_update.run, args=(_stop_event,), daemon=True),
     ]
     for t in threads:
@@ -1153,6 +1311,38 @@ def api_rotation_now():
         rot = rotate_now(creds, reason="вручную")
     return JSONResponse({"sni": load_creds().get("sni"), "next_at": rot["next_at"],
                          "next_sni": rot["next_sni"], "error": rot["last_error"]})
+
+
+@app.get("/api/geohide")
+def api_geohide():
+    gh = get_geohide(load_creds())
+    gh["active_domains"] = len(geohide_domains(gh)) if gh["enabled"] else 0
+    gh["doh"] = geohide_doh_url(gh["region"])
+    return JSONResponse(gh)
+
+
+@app.post("/api/geohide")
+def api_geohide_save(enabled: str = Form(""), region: str = Form("eu"), extra: str = Form("")):
+    with rotation_lock:
+        creds = load_creds()
+        gh = get_geohide(creds)
+        region_changed = region in GEOHIDE_REGIONS and region != gh["region"]
+        gh["enabled"] = bool(enabled)
+        if region in GEOHIDE_REGIONS:
+            gh["region"] = region
+        gh["extra"] = parse_domains(extra)
+        creds["geohide"] = gh
+        save_creds(creds)
+        need_list = gh["enabled"] and (region_changed or not GEOHIDE_DOMAINS_FILE.exists())
+        geohide_apply(update_list=need_list)
+    return RedirectResponse(url="/", status_code=303)
+
+
+@app.post("/api/geohide/refresh")
+def api_geohide_refresh():
+    with rotation_lock:
+        gh = geohide_apply(update_list=True)
+    return JSONResponse({"count": gh["count"], "updated_at": gh["updated_at"], "error": gh["last_error"]})
 
 
 @app.post("/api/rotation/check")
@@ -1541,6 +1731,40 @@ canvas.chart-canvas { width: 100%; height: 140px; display: block; }
   </div>
 
   <div class="panel">
+    <div class="panel-header">
+      <h2>GeoHide</h2>
+      <span class="eyebrow">@@GH_HEADLINE@@</span>
+    </div>
+    <div class="panel-body">
+      <form method="post" action="/api/geohide">
+        <div class="field-row">
+          <div class="field">
+            <label class="check"><input type="checkbox" name="enabled" @@GH_ENABLED@@> Обходить геоблоки через GeoHide</label>
+            <p class="field-hint">
+              Домены из списка GeoHide (ChatGPT, Claude, Gemini, Notion, Canva и др.)
+              релей резолвит через DoH GeoHide и ходит к ним через их прокси.
+              Остальной трафик идёт напрямую, как раньше. Список обновляется раз в сутки.
+            </p>
+          </div>
+          <div class="field">
+            <label for="f-gh-region">Регион списка и DNS</label>
+            <select id="f-gh-region" name="region">@@GH_REGION_OPTIONS@@</select>
+          </div>
+        </div>
+        <div class="field">
+          <label for="f-gh-extra">Свои домены - по одному в строке (поддомены включаются)</label>
+          <textarea id="f-gh-extra" name="extra" rows="4">@@GH_EXTRA@@</textarea>
+        </div>
+        <div class="btn-row">
+          <button type="submit" class="btn btn-primary">Сохранить и применить</button>
+          <button type="button" class="btn" id="gh-refresh-btn" onclick="geohideRefresh()">Обновить список</button>
+        </div>
+      </form>
+      <p class="field-hint hint-error">@@GH_ERROR@@</p>
+    </div>
+  </div>
+
+  <div class="panel">
     <div class="panel-header"><h2>Управление</h2></div>
     <div class="panel-body">
       <button class="btn btn-danger btn-sm" onclick="if(confirm('Перезапустить контейнер?')){fetch('/api/restart',{method:'POST'}).then(()=>setTimeout(()=>location.reload(),4000))}">Перезапустить контейнер</button>
@@ -1569,6 +1793,17 @@ function fmtWhen(iso) {
 function localizeTimes() {
   // Сервер отдаёт UTC; человеку удобнее видеть своё время.
   document.querySelectorAll("[data-iso]").forEach(el => { el.textContent = fmtWhen(el.dataset.iso); });
+}
+async function geohideRefresh() {
+  const btn = document.getElementById("gh-refresh-btn");
+  btn.disabled = true; btn.textContent = "Скачиваю…";
+  try {
+    const r = await fetch("/api/geohide/refresh", { method: "POST" });
+    const j = await r.json().catch(() => ({}));
+    if (j.error) alert(j.error);
+  } finally {
+    location.reload();
+  }
 }
 async function rotateNow() {
   const btn = document.getElementById("rot-now-btn");
@@ -1938,6 +2173,7 @@ def index(response: Response):
         s = dict(state)
     creds = json.loads(CREDS_FILE.read_text()) if CREDS_FILE.exists() else {}
     rot = get_rotation(creds)
+    gh = get_geohide(creds)
     # current_host() здесь больше не зовём: при пустом PUBLIC_HOST он ходил
     # к ifconfig.me при КАЖДОМ открытии страницы, а страница опрашивается
     # дашбордом каждые несколько секунд. Ссылка на странице больше не нужна: она содержит UUID, то есть
@@ -1975,6 +2211,13 @@ def index(response: Response):
         "@@DEST_MAX_MS@@": str(DEST_MAX_HANDSHAKE_MS),
         "@@ROT_ERROR@@": html.escape(rot["last_error"] or ""),
         "@@ROT_HISTORY@@": rotation_history_html(rot),
+        "@@GH_HEADLINE@@": geohide_headline(gh),
+        "@@GH_ENABLED@@": "checked" if gh["enabled"] else "",
+        "@@GH_REGION_OPTIONS@@": "".join(
+            f'<option value="{r}"{" selected" if r == gh["region"] else ""}>{r.upper()}</option>'
+            for r in GEOHIDE_REGIONS),
+        "@@GH_EXTRA@@": html.escape("\n".join(gh["extra"])),
+        "@@GH_ERROR@@": html.escape(gh["last_error"] or ""),
     }
     for token, value in replacements.items():
         page_html = page_html.replace(token, value)
