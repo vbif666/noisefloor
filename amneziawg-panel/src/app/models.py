@@ -107,17 +107,20 @@ class ServerConfig(Base):
 # клиента: обычный WireGuard не пройдёт рукопожатие с интерфейсом, где
 # включена маскировка, а старый клиент AmneziaWG не знает полей S3/S4/I1–I5.
 # Поэтому у каждого протокола свой интерфейс со своим UDP-портом.
-PROTOCOL_AWG2 = "awg2"  # основной интерфейс, ServerConfig (awg0)
-PROTOCOL_AWG1 = "awg1"  # AmneziaWG 1.x: Jc/Jmin/Jmax, S1/S2, H1–H4
-PROTOCOL_WG = "wg"      # обычный WireGuard, без обфускации
-PROTOCOLS = (PROTOCOL_AWG2, PROTOCOL_AWG1, PROTOCOL_WG)
+PROTOCOL_AWG2 = "awg2"    # основной интерфейс, ServerConfig (awg0), AmneziaWG 3.1
+PROTOCOL_AWG20 = "awg20"  # AmneziaWG 2.0: S1–S4, H1–H4, без ключа защиты заголовков
+PROTOCOL_AWG1 = "awg1"    # AmneziaWG 1.x: Jc/Jmin/Jmax, S1/S2, H1–H4
+PROTOCOL_WG = "wg"        # обычный WireGuard, без обфускации
+PROTOCOLS = (PROTOCOL_AWG2, PROTOCOL_AWG20, PROTOCOL_AWG1, PROTOCOL_WG)
+# Дополнительные протоколы, у которых есть свой профиль маскировки.
+OBFUSCATED_TUNNELS = (PROTOCOL_AWG20, PROTOCOL_AWG1)
 
 
 class Tunnel(Base):
     """
     Дополнительный интерфейс для клиентов, которым не подходит AmneziaWG 2.0.
 
-    Строк ровно две — на AWG 1.x и на обычный WireGuard (создаёт
+    Строк ровно три — на AWG 2.0, AWG 1.x и обычный WireGuard (создаёт
     bootstrap). Основной интерфейс по-прежнему описывает ServerConfig, а
     отсюда берутся только ключи, подсеть, порт и, для AWG 1.x, свой профиль
     обфускации. DNS, MTU, публичный адрес и каскад — общие, из ServerConfig.
@@ -138,12 +141,15 @@ class Tunnel(Base):
     address = Column(String(64), nullable=False)
     listen_port = Column(Integer, nullable=False)
 
-    # Только для AWG 1.x; у обычного WireGuard остаются нулями и пустыми.
+    # Только для AWG 2.0 и 1.x; у обычного WireGuard остаются нулями и
+    # пустыми. S3/S4 — только у 2.0: клиент 1.x их не знает.
     jc = Column(Integer, default=0)
     jmin = Column(Integer, default=0)
     jmax = Column(Integer, default=0)
     s1 = Column(Integer, default=0)
     s2 = Column(Integer, default=0)
+    s3 = Column(Integer, default=0)
+    s4 = Column(Integer, default=0)
     h1 = Column(String(32), default="")
     h2 = Column(String(32), default="")
     h3 = Column(String(32), default="")

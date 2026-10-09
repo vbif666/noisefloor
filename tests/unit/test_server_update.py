@@ -23,6 +23,8 @@ class _Server:
     cascade_sync_url = ""
     cascade_sync_token = ""
     jc = 5
+    s1, s2, s3, s4 = 20, 30, 40, 12
+    header_protection_key = "HPK="
 
 
 class _Tunnel:
@@ -31,8 +33,8 @@ class _Tunnel:
         self.listen_port = port
 
 
-def _save(**changes):
-    server = _Server()
+def _save(server=None, **changes):
+    server = server or _Server()
     with mock.patch.object(server_router.config_sync, "get_server", return_value=server), \
          mock.patch.object(server_router.config_sync, "get_tunnels",
                            return_value=[_Tunnel("awg1", 51821), _Tunnel("wg", 51822)]), \
@@ -79,3 +81,18 @@ class RestartTests(unittest.TestCase):
         self.assertLessEqual(js_restart, server_router.RESTART_FIELDS)
         editable = {field for field, _ in rows}
         self.assertEqual(js_restart, server_router.RESTART_FIELDS & editable)
+
+
+
+class HeaderProtectionPaddingTests(unittest.TestCase):
+    """С ключом 3.1 amneziawg-go не поднимет интерфейс при S меньше 12 —
+    такое сохранение отклоняется ещё схемой, а не роняет туннель."""
+
+    def test_small_padding_rejected(self):
+        from pydantic import ValidationError
+        for field in ("s1", "s2", "s3", "s4"):
+            with self.subTest(field=field), self.assertRaises(ValidationError):
+                ServerUpdate(**{field: 11})
+
+    def test_floor_value_accepted(self):
+        self.assertTrue(_save(s2=12)["restart"])

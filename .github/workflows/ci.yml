@@ -101,6 +101,15 @@ jobs:
           sudo modprobe dummy || true
           sudo -E env PATH="$PATH" PANEL_IMAGE="$PANEL_IMAGE:ci" RELAY_IMAGE="$RELAY_IMAGE:ci" bash tests/smoke.sh
 
+      # Четыре протокола клиентов с настоящим рукопожатием: AmneziaWG 3.1, 2.0,
+      # 1.x и обычный WireGuard (включая эталонный клиент из модуля ядра).
+      # Юнит-тесты проверяют только текст конфигов, а v1.0.12 сломался на
+      # подъёме интерфейса — это ловит только живой amneziawg-go.
+      - name: Протоколы клиентов
+        run: |
+          sudo modprobe wireguard || true
+          sudo -E env PATH="$PATH" PANEL_IMAGE="$PANEL_IMAGE:ci" bash tests/protocols.sh
+
       - name: Вход в Docker Hub
         if: github.event_name == 'push' && env.DOCKERHUB_TOKEN != ''
         uses: docker/login-action@v3

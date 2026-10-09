@@ -269,7 +269,7 @@
           <div class="panel-body">
             <p class="field-hint" style="margin-top:0;">
               Основной протокол — AmneziaWG 3.1 (настройки выше). Для устройств, которые
-              его не понимают, можно включить ещё два. Маскировка задаётся на весь
+              его не понимают, есть ещё три: AmneziaWG 2.0, 1.x и WireGuard. Маскировка задаётся на весь
               интерфейс, поэтому у каждого протокола свой UDP-порт, свои ключи и своя
               подсеть. Трафик всех протоколов идёт через каскад так же, как основной.
               Каждый включённый протокол — отдельный процесс на сервере, примерно
@@ -396,6 +396,11 @@
             <input type="radio" name="np-protocol" value="awg2" checked />
             <span class="proto-name">AmneziaWG 3.1</span>
             <span class="proto-sub" data-default="рекомендуется">рекомендуется</span>
+          </label>
+          <label class="proto-option">
+            <input type="radio" name="np-protocol" value="awg20" />
+            <span class="proto-name">AmneziaWG 2.0</span>
+            <span class="proto-sub" data-default="AmneziaVPN до 5.0.3">AmneziaVPN до 5.0.3</span>
           </label>
           <label class="proto-option">
             <input type="radio" name="np-protocol" value="awg1" />

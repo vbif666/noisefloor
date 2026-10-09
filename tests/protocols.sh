@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Протоколы клиентов с настоящим рукопожатием: AmneziaWG 2.0, AmneziaWG 1.x и
-# обычный WireGuard.
+# Протоколы клиентов с настоящим рукопожатием: AmneziaWG 3.1 (основной),
+# AmneziaWG 2.0, AmneziaWG 1.x и обычный WireGuard.
 #
 # Юнит-тесты проверяют текст конфигов, но не то, что клиент с таким конфигом
 # действительно подключится. Здесь в отдельной docker-сети поднимается панель
@@ -34,7 +34,7 @@ fail() { red   "  ✗ $*"; FAILED=1; }
 
 cleanup() {
     dim "  очистка…"
-    docker rm -f "$SERVER" nf-proto-c-awg2 nf-proto-c-awg1 nf-proto-c-wg >/dev/null 2>&1 || true
+    docker rm -f "$SERVER" nf-proto-c-awg2 nf-proto-c-awg20 nf-proto-c-awg1 nf-proto-c-wg >/dev/null 2>&1 || true
     docker network rm "$NET" >/dev/null 2>&1 || true
     rm -rf "$WORKDIR"
 }
@@ -82,7 +82,14 @@ api PUT /server -d "{\"endpoint_host\":\"$SERVER_IP\"}" >/dev/null
 
 # --- включение протоколов ----------------------------------------------------
 
-for proto in awg1 wg; do
+# v1.0.12: ключ защиты заголовков 3.1 при S1–S4 < 12 — amneziawg-go
+# отвечает "Invalid argument", и awg0 не поднимается вовсе.
+health="$(curl -kfsS "$PANEL/api/health" || true)"
+printf '%s' "$health" | grep -q '"interface_up":true' \
+    && pass "awg2: основной интерфейс AmneziaWG 3.1 поднялся" \
+    || fail "awg2: основной интерфейс не поднялся: $health"
+
+for proto in awg20 awg1 wg; do
     up="$(api PUT "/tunnels/$proto" -d '{"enabled":true}' | json 'd["interface_up"]')"
     [ "$up" = "True" ] && pass "$proto: интерфейс поднялся" || fail "$proto: интерфейс не поднялся"
 done
@@ -94,7 +101,7 @@ clash="$(api PUT /tunnels/wg -d '{"listen_port":51999}' -o /dev/null -w '%{http_
 # Правила ставятся одним вызовом на все интерфейсы. Если PostUp основного
 # интерфейса их не перезапустил, клиенты дополнительных останутся без NAT.
 rules="$(docker exec "$SERVER" iptables -S NOISEFLOOR-FWD 2>/dev/null || true)"
-for iface in awg0 awg-v1 wg-plain; do
+for iface in awg0 awg-v2 awg-v1 wg-plain; do
     printf '%s' "$rules" | grep -q -- "-i $iface -j ACCEPT" \
         && pass "правила форвардинга есть для $iface" \
         || fail "нет правил форвардинга для $iface"
@@ -102,9 +109,9 @@ done
 
 # --- клиенты -----------------------------------------------------------------
 
-declare -A TUNNEL_IP=([awg2]=10.13.13.1 [awg1]=10.13.14.1 [wg]=10.13.15.1)
+declare -A TUNNEL_IP=([awg2]=10.13.13.1 [awg20]=10.13.16.1 [awg1]=10.13.14.1 [wg]=10.13.15.1)
 
-for proto in awg2 awg1 wg; do
+for proto in awg2 awg20 awg1 wg; do
     cfg="$(api POST /peers -d "{\"name\":\"proto-$proto\",\"protocol\":\"$proto\"}" | json 'd["config_text"]')"
     server_ip="${TUNNEL_IP[$proto]}"
 
@@ -115,6 +122,13 @@ for proto in awg2 awg1 wg; do
         awg1) printf '%s\n' "$cfg" | grep -qE '^(S3|S4|I1) =' \
                   && fail "awg1: в конфиге 1.x есть поля 2.0" \
                   || pass "awg1: в конфиге только поля 1.x" ;;
+        awg20) { printf '%s\n' "$cfg" | grep -qE '^S4 =' \
+                   && ! printf '%s\n' "$cfg" | grep -qE '^(HeaderProtectionKey|RekeyAfterTime) ='; } \
+                  && pass "awg20: в конфиге поля 2.0 без 3.1" \
+                  || fail "awg20: конфиг не похож на 2.0" ;;
+        awg2) printf '%s\n' "$cfg" | grep -qE '^HeaderProtectionKey =' \
+                  && pass "awg2: в конфиге есть ключ защиты заголовков 3.1" \
+                  || fail "awg2: в конфиге нет HeaderProtectionKey" ;;
     esac
 
     # Весь трафик в туннель клиенту не нужен: хватит адреса сервера. DNS
@@ -140,19 +154,19 @@ for proto in awg2 awg1 wg; do
     fi
 done
 
-# Клиент 2.0 не должен проходить на интерфейс обычного WireGuard: иначе
+# Клиент 3.1 не должен проходить на интерфейс обычного WireGuard: иначе
 # маскировка ничего не значит, и разделение по интерфейсам лишнее.
 wg_port="$(api GET /tunnels | json '[t["listen_port"] for t in d if t["protocol"]=="wg"][0]')"
 docker exec nf-proto-c-awg2 sh -c "awg-quick down c0 >/dev/null 2>&1; sed -i 's|^Endpoint = .*|Endpoint = $SERVER_IP:$wg_port|' /etc/amnezia/amneziawg/c0.conf && awg-quick up c0 >/dev/null 2>&1"
 if docker exec nf-proto-c-awg2 python3 -c \
     "import urllib.request; import ssl; urllib.request.urlopen('https://10.13.13.1:8000/api/health', timeout=5, context=ssl._create_unverified_context())" >/dev/null 2>&1; then
-    fail "клиент AmneziaWG 2.0 прошёл на порт обычного WireGuard"
+    fail "клиент AmneziaWG 3.1 прошёл на порт обычного WireGuard"
 else
-    pass "клиент AmneziaWG 2.0 на порт обычного WireGuard не проходит"
+    pass "клиент AmneziaWG 3.1 на порт обычного WireGuard не проходит"
 fi
 
 online="$(api GET /peers | json 'sorted(p["protocol"] for p in d if p["online"])')"
-[ "$online" = "['awg1', 'awg2', 'wg']" ] && pass "панель видит онлайн клиентов всех протоколов" \
+[ "$online" = "['awg1', 'awg2', 'awg20', 'wg']" ] && pass "панель видит онлайн клиентов всех протоколов" \
     || fail "онлайн в панели: $online"
 
 # --- настоящий WireGuard -----------------------------------------------------
@@ -197,6 +211,17 @@ docker exec "$SERVER" ip link show wg-plain >/dev/null 2>&1 \
 code="$(api POST /peers -d '{"name":"late","protocol":"wg"}' -o /dev/null -w '%{http_code}' || true)"
 [ "$code" = "400" ] && pass "клиента выключенного протокола создать нельзя" \
                     || fail "клиент выключенного протокола создался (HTTP $code)"
+
+# --- починка профиля 3.1 при старте ----------------------------------------
+# Сервер, получивший ключ 3.1 поверх профиля 2.0 с маленькими S, должен сам
+# поднять их до 12 при старте, а не лежать с "Invalid argument".
+docker exec "$SERVER" python3 -c "
+import sqlite3; c = sqlite3.connect('/opt/panel/data/awg_panel.db')
+c.execute('update server_config set s2=11, s4=5'); c.commit()" \
+    && docker restart "$SERVER" >/dev/null \
+    && wait_for 60 sh -c "curl -kfsS '$PANEL/api/health' | grep -q '\"interface_up\":true'" \
+    && pass "awg2: старый профиль с S<12 исправлен при старте, интерфейс поднялся" \
+    || fail "awg2: после S2=11/S4=5 интерфейс не поднялся"
 
 echo
 if [ "$FAILED" = 0 ]; then green "Все проверки протоколов прошли"; else red "Есть провалы"; exit 1; fi

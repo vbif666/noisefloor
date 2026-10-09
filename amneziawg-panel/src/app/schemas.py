@@ -147,9 +147,9 @@ class CascadeStatus(BaseModel):
     relay_label: str | None = None
 
 
-# --- Дополнительные протоколы (AWG 1.x, обычный WireGuard) ---
+# --- Дополнительные протоколы (AWG 2.0, AWG 1.x, обычный WireGuard) ---
 
-Protocol = Literal["awg2", "awg1", "wg"]
+Protocol = Literal["awg2", "awg20", "awg1", "wg"]
 
 
 class TunnelRead(BaseModel):
@@ -166,6 +166,8 @@ class TunnelRead(BaseModel):
     jmax: int
     s1: int
     s2: int
+    s3: int = 0
+    s4: int = 0
     h1: str
     h2: str
     h3: str
@@ -187,6 +189,8 @@ class TunnelUpdate(BaseModel):
     jmax: int | None = Field(default=None, ge=0, le=1280)
     s1: int | None = Field(default=None, ge=0, le=1132)
     s2: int | None = Field(default=None, ge=0, le=1188)
+    s3: int | None = Field(default=None, ge=0, le=1188)
+    s4: int | None = Field(default=None, ge=0, le=1188)
     h1: str | None = None
     h2: str | None = None
     h3: str | None = None
@@ -204,7 +208,7 @@ class PeerCreate(BaseModel):
     dns_override: str | None = None
     persistent_keepalive: int = Field(default=25, ge=0, le=3600)
     note: str | None = None
-    # awg2 — основной интерфейс; awg1 и wg — дополнительные, их нужно
+    # awg2 — основной интерфейс (3.1); awg20, awg1 и wg — дополнительные, их нужно
     # сначала включить на вкладке «Сервер».
     protocol: Protocol = "awg2"
 

@@ -44,10 +44,21 @@ _PEER_MIGRATIONS = [
 ]
 
 
+# Туннели: S3/S4 появились вместе с отдельным интерфейсом AmneziaWG 2.0.
+_TUNNEL_MIGRATIONS = [
+    ("s3", "ALTER TABLE tunnels ADD COLUMN s3 INTEGER DEFAULT 0"),
+    ("s4", "ALTER TABLE tunnels ADD COLUMN s4 INTEGER DEFAULT 0"),
+]
+
+
 def run_migrations() -> None:
     inspector = inspect(engine)
     tables = inspector.get_table_names()
-    for table, migrations in (("server_config", _SERVER_CONFIG_MIGRATIONS), ("peers", _PEER_MIGRATIONS)):
+    for table, migrations in (
+        ("server_config", _SERVER_CONFIG_MIGRATIONS),
+        ("peers", _PEER_MIGRATIONS),
+        ("tunnels", _TUNNEL_MIGRATIONS),
+    ):
         if table not in tables:
             continue  # свежая БД — create_all() уже создал таблицу с полным набором столбцов
         existing = {col["name"] for col in inspector.get_columns(table)}

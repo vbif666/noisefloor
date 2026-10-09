@@ -1,6 +1,6 @@
 """
-Три протокола клиентов: AmneziaWG 2.0 (основной интерфейс), AmneziaWG 1.x и
-обычный WireGuard (дополнительные).
+Четыре протокола клиентов: AmneziaWG 3.1 (основной интерфейс), AmneziaWG 2.0,
+AmneziaWG 1.x и обычный WireGuard (дополнительные).
 
 Маскировка задаётся на интерфейс, поэтому главное, что здесь закреплено:
 клиент каждого протокола получает конфиг ровно своего интерфейса. Лишнее
@@ -38,7 +38,7 @@ class _Server:
 
 class _Tunnel:
     def __init__(self, protocol, iface, address, port):
-        self.id = {"awg1": 1, "wg": 2}[protocol]
+        self.id = {"awg1": 1, "wg": 2, "awg20": 3}[protocol]
         self.protocol = protocol
         self.interface_name = iface
         self.enabled = True
@@ -46,9 +46,14 @@ class _Tunnel:
         self.public_key = f"{iface}_PUBLIC="
         self.address = address
         self.listen_port = port
+        self.s3 = self.s4 = 0
         if protocol == "awg1":
             self.jc, self.jmin, self.jmax, self.s1, self.s2 = 5, 50, 100, 10, 20
             self.h1, self.h2, self.h3, self.h4 = "5555", "6666", "7777", "8888"
+        elif protocol == "awg20":
+            self.jc, self.jmin, self.jmax, self.s1, self.s2 = 6, 60, 120, 3, 9
+            self.s3, self.s4 = 7, 2
+            self.h1, self.h2, self.h3, self.h4 = "9001", "9002", "9003", "9004"
         else:
             self.jc = self.jmin = self.jmax = self.s1 = self.s2 = 0
             self.h1 = self.h2 = self.h3 = self.h4 = ""
@@ -70,10 +75,12 @@ class _Peer:
 
 AWG1 = _Tunnel("awg1", "awg-v1", "10.13.14.1/24", 51821)
 WG = _Tunnel("wg", "wg-plain", "10.13.15.1/24", 51822)
+AWG20 = _Tunnel("awg20", "awg-v2", "10.13.16.1/24", 51823)
 PEERS = [
     _Peer("phone", "awg2", "10.13.13.2/32"),
     _Peer("router", "awg1", "10.13.14.2/32"),
     _Peer("laptop", "wg", "10.13.15.2/32"),
+    _Peer("tablet", "awg20", "10.13.16.2/32"),
 ]
 
 
@@ -228,3 +235,77 @@ class ValidationTests(unittest.TestCase):
         a, b = self._patched()
         with a, b, self.assertRaises(HTTPException):
             tunnels_router.validate_address(mock.MagicMock(), AWG1, "fd00::1/64")
+
+
+class Awg20TunnelTests(unittest.TestCase):
+    """Отдельный интерфейс AmneziaWG 2.0: после перевода основного на 3.1
+    клиенты без поддержки 3.1 подключаются сюда."""
+
+    def test_interface_has_2_0_fields_without_3_1(self):
+        keys = _keys(awg_config.tunnel_config(AWG20, _Server(), PEERS))
+        self.assertTrue({"Jc", "Jmin", "Jmax", "S1", "S2", "S3", "S4", "H1", "H2", "H3", "H4"} <= keys)
+        self.assertFalse({"HeaderProtectionKey", "RekeyAfterTime", "I1"} & keys)
+
+    def test_interface_serves_only_its_clients(self):
+        conf = awg_config.tunnel_config(AWG20, _Server(), PEERS)
+        self.assertIn("tablet_PUB=", conf)
+        for other in ("phone_PUB=", "router_PUB=", "laptop_PUB="):
+            self.assertNotIn(other, conf)
+
+    def test_main_interface_does_not_serve_awg20_clients(self):
+        conf = awg_config.full_server_config(_Server(), PEERS, ["awg-v2"])
+        self.assertNotIn("tablet_PUB=", conf)
+
+    def test_client_gets_tunnel_profile(self):
+        server = _Server()
+        server.header_protection_key = "HPK="
+        conf = awg_config.client_config(PEERS[3], server, AWG20)
+        self.assertIn("S3 = 7", conf)
+        self.assertIn("H1 = 9001", conf)
+        self.assertNotIn("H1 = 1111", conf)
+        self.assertNotIn("HeaderProtectionKey", conf)
+        self.assertIn("PublicKey = awg-v2_PUBLIC=", conf)
+        self.assertIn("Endpoint = vpn.example.com:51823", conf)
+
+    def test_profile_shape(self):
+        for _ in range(200):
+            p = obfuscation.random_awg20_profile()
+            self.assertEqual(set(p), {"jc", "jmin", "jmax", "s1", "s2", "s3", "s4", "h1", "h2", "h3", "h4"})
+            self.assertNotEqual(p["s1"] + 56, p["s2"])
+
+    def test_s3_s4_editable_only_on_awg20(self):
+        self.assertIn("s3", tunnels_router._PROTOCOL_FIELDS["awg20"])
+        self.assertNotIn("s3", tunnels_router._PROTOCOL_FIELDS["awg1"])
+        self.assertNotIn("wg", tunnels_router._PROTOCOL_FIELDS)
+
+
+class HeaderProtectionPaddingTests(unittest.TestCase):
+    """amneziawg-go с ключом защиты заголовков требует S1–S4 >= 12, иначе
+    `awg setconf` отвечает "Invalid argument" и awg0 не поднимается
+    (v1.0.12, сервер с S2=11, S4=5)."""
+
+    LOW = obfuscation.HEADER_PROTECTION_MIN_PADDING
+
+    def test_main_profile_respects_floor(self):
+        for _ in range(500):
+            p = obfuscation.random_obfuscation_profile()
+            for f in ("s1", "s2", "s3", "s4"):
+                self.assertGreaterEqual(p[f], self.LOW, f)
+            self.assertNotEqual(p["s1"] + 56, p["s2"])
+            self.assertTrue(p["header_protection_key"])
+
+    def test_fix_replaces_only_small_values(self):
+        for _ in range(200):
+            obj = _Server()
+            obj.s1, obj.s2, obj.s3, obj.s4 = 22, 11, 21, 5
+            self.assertTrue(obfuscation.fix_header_protection_paddings(obj))
+            self.assertEqual((obj.s1, obj.s3), (22, 21))  # подходящие не трогаем
+            self.assertGreaterEqual(obj.s2, self.LOW)
+            self.assertGreaterEqual(obj.s4, self.LOW)
+            self.assertNotEqual(obj.s1 + 56, obj.s2)
+
+    def test_fix_leaves_valid_profile(self):
+        obj = _Server()
+        obj.s1, obj.s2, obj.s3, obj.s4 = 32, 40, 61, 12
+        self.assertFalse(obfuscation.fix_header_protection_paddings(obj))
+        self.assertEqual((obj.s1, obj.s2, obj.s3, obj.s4), (32, 40, 61, 12))

@@ -18,6 +18,11 @@ const PROTOCOLS = {
     badge: "",
     hint: "Основной протокол с полной маскировкой и защитой заголовков. Импорт — в AmneziaVPN 5.0.3 или новее.",
   },
+  awg20: {
+    name: "AmneziaWG 2.0",
+    badge: "AWG 2.0",
+    hint: "Для AmneziaVPN до 5.0.3 и приложения AmneziaWG без поддержки 3.1: полная маскировка S1–S4, H1–H4, но без защиты заголовков.",
+  },
   awg1: {
     name: "AmneziaWG 1.x",
     badge: "AWG 1.x",
@@ -371,11 +376,12 @@ async function loadEverything() {
 }
 
 /* ==========================================================================
-   Дополнительные протоколы: AmneziaWG 1.x и обычный WireGuard
+   Дополнительные протоколы: AmneziaWG 2.0, 1.x и обычный WireGuard
    ========================================================================== */
 
 async function loadTunnels() {
-  currentTunnels = await api("/tunnels");
+  const order = Object.keys(PROTOCOLS);
+  currentTunnels = (await api("/tunnels")).sort((a, b) => order.indexOf(a.protocol) - order.indexOf(b.protocol));
   renderTunnels();
 }
 
@@ -390,9 +396,10 @@ function tunnelCardHtml(t) {
   const info = PROTOCOLS[t.protocol];
   const st = tunnelStatusText(t);
   const p = t.protocol;
-  const obfs = p === "awg1" ? `
+  const hasObfs = p === "awg1" || p === "awg20";
+  const obfs = hasObfs ? `
       <div class="field-group">
-        <span class="eyebrow">Маскировка AmneziaWG 1.x — своя, не та же, что у 3.1</span>
+        <span class="eyebrow">Маскировка ${info.name} — своя, не та же, что у 3.1</span>
         <div class="field-grid">
           <div class="field"><label>Jc</label><input data-t="${p}" data-f="jc" type="number" min="0" value="${t.jc}" /></div>
           <div class="field"><label>Jmin</label><input data-t="${p}" data-f="jmin" type="number" min="0" value="${t.jmin}" /></div>
@@ -401,6 +408,9 @@ function tunnelCardHtml(t) {
         <div class="field-grid">
           <div class="field"><label>S1</label><input data-t="${p}" data-f="s1" type="number" min="0" value="${t.s1}" /></div>
           <div class="field"><label>S2</label><input data-t="${p}" data-f="s2" type="number" min="0" value="${t.s2}" /></div>
+          ${p === "awg20" ? `
+          <div class="field"><label>S3</label><input data-t="${p}" data-f="s3" type="number" min="0" value="${t.s3}" /></div>
+          <div class="field"><label>S4</label><input data-t="${p}" data-f="s4" type="number" min="0" value="${t.s4}" /></div>` : ""}
         </div>
         <div class="field-grid">
           <div class="field"><label>H1</label><input data-t="${p}" data-f="h1" value="${escapeHtml(t.h1)}" /></div>
@@ -427,7 +437,7 @@ function tunnelCardHtml(t) {
       ${obfs}
       <div class="server-actions">
         <button type="button" class="btn btn-primary btn-sm" data-tunnel-save="${p}">Сохранить и применить</button>
-        ${p === "awg1" ? `<button type="button" class="btn btn-sm" data-tunnel-randomize="${p}">⟳ Пересоздать маскировку</button>` : ""}
+        ${hasObfs ? `<button type="button" class="btn btn-sm" data-tunnel-randomize="${p}">⟳ Пересоздать маскировку</button>` : ""}
       </div>
     </div>`;
 }
@@ -440,14 +450,15 @@ function renderTunnels() {
   });
   box.querySelectorAll("[data-tunnel-randomize]").forEach((btn) => {
     btn.addEventListener("click", () => {
+      const info = PROTOCOLS[btn.dataset.tunnelRandomize];
       openConfirm(
-        "Пересоздать маскировку AmneziaWG 1.x?",
+        `Пересоздать маскировку ${info.name}?`,
         "Все выданные конфиги этого протокола перестанут подключаться — клиентам придётся раздать их заново.",
         async () => {
           try {
             await api(`/tunnels/${btn.dataset.tunnelRandomize}/randomize`, { method: "POST" });
             await loadTunnels();
-            showToast("Маскировка пересоздана — перевыпустите конфиги клиентам AWG 1.x");
+            showToast(`Маскировка пересоздана — перевыпустите конфиги клиентам ${info.badge}`);
           } catch (err) {
             showToast(err.message, true);
           }

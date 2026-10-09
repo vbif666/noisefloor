@@ -1,9 +1,9 @@
 """
-Дополнительные протоколы: AmneziaWG 1.x и обычный WireGuard.
+Дополнительные протоколы: AmneziaWG 2.0, AmneziaWG 1.x и обычный WireGuard.
 
 Каждый — отдельный интерфейс со своим UDP-портом, ключами и подсетью (см.
-models.Tunnel). Здесь их включают, двигают порт и подсеть и, для AWG 1.x,
-меняют профиль обфускации.
+models.Tunnel). Здесь их включают, двигают порт и подсеть и, для AWG 2.0 и
+1.x, меняют профиль обфускации.
 """
 from __future__ import annotations
 
@@ -16,14 +16,20 @@ from sqlalchemy.orm import Session
 
 from .. import awg_manager, config_sync
 from ..database import get_db
-from ..models import PROTOCOL_AWG1, PROTOCOLS, Peer, Tunnel
-from ..obfuscation import random_awg1_profile
+from ..models import OBFUSCATED_TUNNELS, PROTOCOL_AWG1, PROTOCOL_AWG20, PROTOCOLS, Peer, Tunnel
+from ..obfuscation import random_awg1_profile, random_awg20_profile
 from ..schemas import TunnelRead, TunnelUpdate
 from ..security import get_current_admin
 
 router = APIRouter()
 
-_OBFS_FIELDS = ("jc", "jmin", "jmax", "s1", "s2", "h1", "h2", "h3", "h4")
+_AWG1_FIELDS = ("jc", "jmin", "jmax", "s1", "s2", "h1", "h2", "h3", "h4")
+_AWG20_FIELDS = ("jc", "jmin", "jmax", "s1", "s2", "s3", "s4", "h1", "h2", "h3", "h4")
+_OBFS_FIELDS = _AWG20_FIELDS
+# Какие поля маскировки у протокола есть; у остальных их не бывает.
+_PROTOCOL_FIELDS = {PROTOCOL_AWG1: _AWG1_FIELDS, PROTOCOL_AWG20: _AWG20_FIELDS}
+_PROFILES = {PROTOCOL_AWG1: random_awg1_profile, PROTOCOL_AWG20: random_awg20_profile}
+_NAMES = {PROTOCOL_AWG1: "AmneziaWG 1.x", PROTOCOL_AWG20: "AmneziaWG 2.0"}
 _UINT32_MAX = 2**32 - 1
 
 
@@ -94,7 +100,7 @@ def validate_address(db: Session, tunnel: Tunnel, address: str) -> str:
 def validate_port(db: Session, tunnel: Tunnel, port: int) -> None:
     server = config_sync.get_server(db)
     if port == server.listen_port:
-        raise _bad(f"Порт {port} уже у основного интерфейса AmneziaWG 2.0")
+        raise _bad(f"Порт {port} уже у основного интерфейса AmneziaWG 3.1")
     for other in config_sync.get_tunnels(db):
         if other.id != tunnel.id and other.listen_port == port:
             raise _bad(f"Порт {port} уже у интерфейса {other.interface_name}")
@@ -130,18 +136,19 @@ def update_tunnel(
     tunnel = _get_or_404(db, protocol)
     updates = payload.model_dump(exclude_unset=True)
 
-    if tunnel.protocol != PROTOCOL_AWG1:
-        # У обычного WireGuard обфускации нет и быть не может: стандартный
-        # клиент с ней не соединится.
-        for field in _OBFS_FIELDS:
+    # У обычного WireGuard обфускации нет и быть не может: стандартный
+    # клиент с ней не соединится. У 1.x нет S3/S4.
+    allowed = _PROTOCOL_FIELDS.get(tunnel.protocol, ())
+    for field in _OBFS_FIELDS:
+        if field not in allowed:
             updates.pop(field, None)
 
     if "address" in updates:
         updates["address"] = validate_address(db, tunnel, updates["address"])
     if "listen_port" in updates:
         validate_port(db, tunnel, updates["listen_port"])
-    if tunnel.protocol == PROTOCOL_AWG1 and any(f in updates for f in _OBFS_FIELDS):
-        validate_obfuscation({f: updates.get(f, getattr(tunnel, f)) for f in _OBFS_FIELDS})
+    if allowed and any(f in updates for f in allowed):
+        validate_obfuscation({f: updates.get(f, getattr(tunnel, f)) for f in allowed})
 
     enabling = updates.get("enabled", tunnel.enabled)
     port = updates.get("listen_port", tunnel.listen_port)
@@ -172,13 +179,13 @@ def update_tunnel(
 
 @router.post("/{protocol}/randomize", response_model=TunnelRead)
 def randomize_tunnel(protocol: str, db: Session = Depends(get_db), _admin: str = Depends(get_current_admin)):
-    """Новый профиль обфускации AWG 1.x. Все выданные клиентам этого
+    """Новый профиль обфускации AWG 2.0 или 1.x. Все выданные клиентам этого
     протокола конфиги после этого перестают подключаться — их надо
     перевыпустить."""
     tunnel = _get_or_404(db, protocol)
-    if tunnel.protocol != PROTOCOL_AWG1:
-        raise _bad("Обфускация есть только у AmneziaWG 1.x")
-    for field, value in random_awg1_profile().items():
+    if tunnel.protocol not in OBFUSCATED_TUNNELS:
+        raise _bad("Обфускация есть только у AmneziaWG 2.0 и 1.x")
+    for field, value in _PROFILES[tunnel.protocol]().items():
         setattr(tunnel, field, value)
     db.add(tunnel)
     db.commit()

@@ -12,7 +12,7 @@ from __future__ import annotations
 
 from . import cascade
 from .config import settings
-from .models import PROTOCOL_AWG1, PROTOCOL_AWG2, Peer, ServerConfig, Tunnel
+from .models import PROTOCOL_AWG1, PROTOCOL_AWG2, PROTOCOL_AWG20, Peer, ServerConfig, Tunnel
 from .obfuscation import AWG31_PARAMS
 
 # Скрипт лежит в образе; он же отвечает за идемпотентность правил.
@@ -64,6 +64,33 @@ def _awg1_obfuscation_lines(tunnel) -> list[str]:
         if value:
             lines.append(f"{field.upper()} = {value}")
     return lines
+
+
+def _awg20_obfuscation_lines(tunnel) -> list[str]:
+    """Отдельный интерфейс AmneziaWG 2.0: S1–S4 и H1–H4 без ключа защиты
+    заголовков и параметров 3.1 — клиент 2.0 их не знает."""
+    lines = [
+        f"Jc = {tunnel.jc}",
+        f"Jmin = {tunnel.jmin}",
+        f"Jmax = {tunnel.jmax}",
+        f"S1 = {tunnel.s1}",
+        f"S2 = {tunnel.s2}",
+        f"S3 = {tunnel.s3}",
+        f"S4 = {tunnel.s4}",
+    ]
+    for field in _OBFS_STR_FIELDS:
+        value = getattr(tunnel, field)
+        if value:
+            lines.append(f"{field.upper()} = {value}")
+    return lines
+
+
+def _tunnel_obfuscation_lines(tunnel) -> list[str]:
+    if tunnel.protocol == PROTOCOL_AWG20:
+        return _awg20_obfuscation_lines(tunnel)
+    if tunnel.protocol == PROTOCOL_AWG1:
+        return _awg1_obfuscation_lines(tunnel)
+    return []
 
 
 def rules_commands(server: ServerConfig, interfaces: list[str]) -> tuple[list[str], list[str]]:
@@ -152,7 +179,7 @@ def full_server_config(
 
 
 def tunnel_config(tunnel: Tunnel, server: ServerConfig, peers: list[Peer]) -> str:
-    """Конфиг дополнительного интерфейса (AWG 1.x или обычный WireGuard).
+    """Конфиг дополнительного интерфейса (AWG 2.0, AWG 1.x или обычный WireGuard).
 
     Без PostUp/PostDown: правила для него ставит основной интерфейс
     (см. rules_commands). MTU общий с основным — клиенты в тех же сетях."""
@@ -164,8 +191,7 @@ def tunnel_config(tunnel: Tunnel, server: ServerConfig, peers: list[Peer]) -> st
     ]
     if server.mtu:
         lines.append(f"MTU = {server.mtu}")
-    if tunnel.protocol == PROTOCOL_AWG1:
-        lines.extend(_awg1_obfuscation_lines(tunnel))
+    lines.extend(_tunnel_obfuscation_lines(tunnel))
     blocks = ["\n".join(lines)]
     for peer in peers:
         if peer.enabled and _peer_protocol(peer) == tunnel.protocol:
@@ -176,8 +202,8 @@ def tunnel_config(tunnel: Tunnel, server: ServerConfig, peers: list[Peer]) -> st
 def client_config(peer: Peer, server: ServerConfig, tunnel: Tunnel | None = None) -> str:
     """Конфиг, который клиент импортирует в приложение AmneziaWG / сканирует как QR.
 
-    tunnel — дополнительный интерфейс, к которому относится клиент (AWG 1.x
-    или обычный WireGuard); None — основной интерфейс AmneziaWG 3.1."""
+    tunnel — дополнительный интерфейс, к которому относится клиент (AWG 2.0,
+    AWG 1.x или обычный WireGuard); None — основной интерфейс AmneziaWG 3.1."""
     lines = [
         "[Interface]",
         f"PrivateKey = {peer.private_key}",
@@ -199,8 +225,8 @@ def client_config(peer: Peer, server: ServerConfig, tunnel: Tunnel | None = None
     # WireGuard их нет вовсе — стандартное приложение не примет такие поля.
     if tunnel is None:
         lines.extend(_obfuscation_lines(server))
-    elif tunnel.protocol == PROTOCOL_AWG1:
-        lines.extend(_awg1_obfuscation_lines(tunnel))
+    else:
+        lines.extend(_tunnel_obfuscation_lines(tunnel))
     lines.append("")
     lines.append("[Peer]")
     lines.append(f"PublicKey = {(tunnel or server).public_key}")

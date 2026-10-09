@@ -13,7 +13,8 @@
 - Jc: рекомендуется 4-12
 - Jmin/Jmax: держим заметно ниже типичного MTU (1500), чтобы junk-пакеты
   не фрагментировались (это демаскирует трафик)
-- S1-S3: 0-64 байта, S4: 0-32 байта
+- S1-S3: 0-64 байта, S4: 0-32 байта; с ключом защиты заголовков (3.1)
+  каждое не меньше HEADER_PROTECTION_MIN_PADDING
 - H1-H4: 4 числа в пределах uint32, гарантированно не пересекающиеся
 """
 import random
@@ -56,6 +57,14 @@ def random_junk() -> tuple[int, int, int]:
 _INIT_RESPONSE_SIZE_DIFF = 56
 
 
+# С ключом защиты заголовков (AmneziaWG 3.1) в начале каждого пакета лежит
+# nonce шифра заголовка, и место под него берётся из случайного префикса.
+# Поэтому amneziawg-go требует S1-S4 не меньше размера nonce
+# (HeaderCipherNonceSize в device/noise-types.go), иначе `awg setconf`
+# отвечает "Invalid argument" и интерфейс не поднимается вовсе (v1.0.12).
+HEADER_PROTECTION_MIN_PADDING = 12
+
+
 def _init_response_paddings(low: int = 0) -> tuple[int, int]:
     while True:
         s1, s2 = random.randint(low, 64), random.randint(low, 64)
@@ -63,25 +72,34 @@ def _init_response_paddings(low: int = 0) -> tuple[int, int]:
             return s1, s2
 
 
-# С HeaderProtectionKey (AmneziaWG 3.1) amneziawg-go требует S1-S4 не меньше
-# размера nonce шифра заголовков (device/uapi.go, HeaderCipherNonceSize = 12),
-# иначе `awg setconf` падает с "Invalid argument" и интерфейс не поднимается.
-HPK_MIN_PADDING = 12
-
-
-def random_paddings() -> tuple[int, int, int, int]:
-    """S1, S2, S3, S4 - сразу пригодные для 3.1 (все >= HPK_MIN_PADDING)."""
-    s1, s2 = _init_response_paddings(HPK_MIN_PADDING)
+def random_paddings(low: int = 0) -> tuple[int, int, int, int]:
+    """S1, S2, S3, S4; low — нижняя граница каждого."""
+    s1, s2 = _init_response_paddings(low)
     return (
         s1,
         s2,
-        random.randint(HPK_MIN_PADDING, 64),
-        random.randint(HPK_MIN_PADDING, 32),
+        random.randint(low, 64),
+        random.randint(low, 32),
     )
 
 
-def paddings_ok_for_hpk(s1: int, s2: int, s3: int, s4: int) -> bool:
-    return min(s1 or 0, s2 or 0, s3 or 0, s4 or 0) >= HPK_MIN_PADDING
+def fix_header_protection_paddings(obj) -> bool:
+    """S1-S4 меньше HEADER_PROTECTION_MIN_PADDING заменить новыми случайными
+    допустимыми. Нужно серверам, получившим ключ защиты заголовков поверх
+    профиля 2.0: с прежними значениями интерфейс не поднимется. Подходящие
+    значения не трогаем — на них уже могут быть выданы конфиги. True, если
+    что-то поменялось."""
+    low = HEADER_PROTECTION_MIN_PADDING
+    if all(getattr(obj, f) >= low for f in ("s1", "s2", "s3", "s4")):
+        return False
+    while True:
+        fresh = dict(zip(("s1", "s2", "s3", "s4"), random_paddings(low)))
+        values = {f: getattr(obj, f) if getattr(obj, f) >= low else fresh[f] for f in fresh}
+        if values["s1"] + _INIT_RESPONSE_SIZE_DIFF != values["s2"]:
+            break
+    for field, value in values.items():
+        setattr(obj, field, value)
+    return True
 
 
 # Параметры AmneziaWG 3.1 — те же, что ставит официальный установщик
@@ -106,6 +124,21 @@ def random_header_protection_key() -> str:
 
 
 def random_obfuscation_profile() -> dict:
+    """Профиль основного интерфейса — AmneziaWG 3.1, с ключом защиты заголовков."""
+    jc, jmin, jmax = random_junk()
+    s1, s2, s3, s4 = random_paddings(HEADER_PROTECTION_MIN_PADDING)
+    h1, h2, h3, h4 = random_headers()
+    return {
+        "jc": jc, "jmin": jmin, "jmax": jmax,
+        "s1": s1, "s2": s2, "s3": s3, "s4": s4,
+        "h1": h1, "h2": h2, "h3": h3, "h4": h4,
+        "header_protection_key": random_header_protection_key(),
+    }
+
+
+def random_awg20_profile() -> dict:
+    """Профиль отдельного интерфейса AmneziaWG 2.0: S1-S4 и H1-H4, без ключа
+    защиты заголовков и сигнатурных пакетов I1-I5."""
     jc, jmin, jmax = random_junk()
     s1, s2, s3, s4 = random_paddings()
     h1, h2, h3, h4 = random_headers()
@@ -113,7 +146,6 @@ def random_obfuscation_profile() -> dict:
         "jc": jc, "jmin": jmin, "jmax": jmax,
         "s1": s1, "s2": s2, "s3": s3, "s4": s4,
         "h1": h1, "h2": h2, "h3": h3, "h4": h4,
-        "header_protection_key": random_header_protection_key(),
     }
 
 

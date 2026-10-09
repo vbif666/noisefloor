@@ -11,13 +11,13 @@ from sqlalchemy.orm import Session
 
 from . import crypto
 from .config import DATA_DIR, settings
-from .models import PROTOCOL_AWG1, PROTOCOL_WG, AdminUser, ServerConfig, Tunnel
+from .models import PROTOCOL_AWG1, PROTOCOL_AWG20, PROTOCOL_WG, AdminUser, ServerConfig, Tunnel
 from .obfuscation import (
-    paddings_ok_for_hpk,
+    fix_header_protection_paddings,
     random_awg1_profile,
+    random_awg20_profile,
     random_header_protection_key,
     random_obfuscation_profile,
-    random_paddings,
 )
 from .security import hash_password
 
@@ -98,10 +98,11 @@ def ensure_server_config(db: Session) -> None:
         if not existing.header_protection_key:
             existing.header_protection_key = random_header_protection_key()
             changed = True
-        # Профили 2.0 могли иметь S1-S4 < 12 - с ключом защиты заголовков
-        # amneziawg-go такой конфиг не принимает. Перегенерируем только S.
-        if not paddings_ok_for_hpk(existing.s1, existing.s2, existing.s3, existing.s4):
-            existing.s1, existing.s2, existing.s3, existing.s4 = random_paddings()
+        # С ключом 3.1 каждое S1–S4 обязано быть не меньше 12, а профиль,
+        # созданный под 2.0, этого не гарантировал: v1.0.12 добавил ключ
+        # поверх и интерфейс переставал подниматься ("Invalid argument").
+        # Меняются только слишком маленькие S, подходящие остаются.
+        if fix_header_protection_paddings(existing):
             changed = True
         if changed:
             db.add(existing)
@@ -132,7 +133,13 @@ def ensure_server_config(db: Session) -> None:
 DEFAULT_TUNNELS = (
     (PROTOCOL_AWG1, "awg-v1", "10.13.14.1/24", 51821),
     (PROTOCOL_WG, "wg-plain", "10.13.15.1/24", 51822),
+    (PROTOCOL_AWG20, "awg-v2", "10.13.16.1/24", 51823),
 )
+
+_TUNNEL_PROFILES = {
+    PROTOCOL_AWG1: random_awg1_profile,
+    PROTOCOL_AWG20: random_awg20_profile,
+}
 
 
 def ensure_tunnels(db: Session) -> None:
@@ -144,7 +151,8 @@ def ensure_tunnels(db: Session) -> None:
         if protocol in existing:
             continue
         priv, pub = crypto.generate_keypair()
-        profile = random_awg1_profile() if protocol == PROTOCOL_AWG1 else {}
+        make_profile = _TUNNEL_PROFILES.get(protocol)
+        profile = make_profile() if make_profile else {}
         db.add(Tunnel(
             protocol=protocol,
             interface_name=iface,
