@@ -359,12 +359,24 @@
         <input id="np-name" required placeholder="Ноутбук Джейкоба" />
       </div>
       <div class="field">
-        <label for="np-protocol">Протокол</label>
-        <select id="np-protocol">
-          <option value="awg2">AmneziaWG 2.0 — рекомендуется</option>
-          <option value="awg1">AmneziaWG 1.x — для старых клиентов</option>
-          <option value="wg">WireGuard — без маскировки</option>
-        </select>
+        <span class="field-label" id="np-protocol-label">Протокол</span>
+        <div class="proto-picker" id="np-protocol" role="radiogroup" aria-labelledby="np-protocol-label">
+          <label class="proto-option">
+            <input type="radio" name="np-protocol" value="awg2" checked />
+            <span class="proto-name">AmneziaWG 2.0</span>
+            <span class="proto-sub" data-default="рекомендуется">рекомендуется</span>
+          </label>
+          <label class="proto-option">
+            <input type="radio" name="np-protocol" value="awg1" />
+            <span class="proto-name">AmneziaWG 1.x</span>
+            <span class="proto-sub" data-default="для старых клиентов">для старых клиентов</span>
+          </label>
+          <label class="proto-option">
+            <input type="radio" name="np-protocol" value="wg" />
+            <span class="proto-name">WireGuard</span>
+            <span class="proto-sub" data-default="без маскировки">без маскировки</span>
+          </label>
+        </div>
         <p class="field-hint" id="np-protocol-hint"></p>
       </div>
       <div class="field">

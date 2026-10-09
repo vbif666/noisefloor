@@ -236,6 +236,88 @@ button, input, select, textarea {
   color: var(--danger-strong);
 }
 
+/* Выбор протокола карточками вместо <select> (см. app.js, openAddPeerDialog) */
+.field-label {
+  display: block;
+  font-size: 12px;
+  color: var(--text-dim);
+  margin-bottom: 6px;
+}
+
+.proto-picker {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 8px;
+}
+
+.field .proto-option {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  margin: 0;
+  padding: 10px 12px;
+  background: var(--surface-2);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  transition: border-color 0.15s var(--ease), background 0.15s var(--ease);
+}
+
+.field .proto-option:hover {
+  border-color: #333a46;
+}
+
+/* Сама радиокнопка скрыта визуально, но остаётся в фокусе и для скринридеров */
+.field .proto-option input {
+  position: absolute;
+  opacity: 0;
+  width: 1px;
+  height: 1px;
+  margin: 0;
+  padding: 0;
+  pointer-events: none;
+}
+
+.proto-name {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text);
+}
+
+.proto-sub {
+  font-size: 11px;
+  line-height: 1.35;
+  color: var(--text-faint);
+}
+
+.field .proto-option.is-checked {
+  border-color: var(--signal);
+  background: var(--signal-dim);
+}
+
+.field .proto-option.is-checked .proto-sub {
+  color: var(--signal-strong);
+}
+
+.field .proto-option:focus-within {
+  outline: 2px solid var(--signal-line);
+  outline-offset: 2px;
+}
+
+.field .proto-option.is-disabled {
+  cursor: not-allowed;
+  opacity: 0.5;
+}
+
+.field .proto-option.is-disabled:hover {
+  border-color: var(--line);
+}
+
+@media (max-width: 480px) {
+  .proto-picker { grid-template-columns: 1fr; }
+}
+
 .field-row {
   display: grid;
   grid-template-columns: 1fr 1fr;

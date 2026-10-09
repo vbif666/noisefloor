@@ -901,27 +901,41 @@ async function togglePeerEnabled(peer, refreshDialog) {
    Добавление пира
    ========================================================================== */
 
-function updateProtocolHint() {
-  const proto = $("np-protocol").value;
-  $("np-protocol-hint").textContent = PROTOCOLS[proto].hint;
+// Протокол выбирается карточками-радиокнопками, а не <select>: выпадающий
+// список рисуется браузером поверх страницы, и клик по пункту в некоторых
+// браузерах долетал до <dialog> как клик «мимо окна» - окно закрывалось.
+const protocolRadios = () => document.querySelectorAll('input[name="np-protocol"]');
+
+function selectedProtocol() {
+  const r = document.querySelector('input[name="np-protocol"]:checked');
+  return r ? r.value : "awg2";
 }
 
-$("np-protocol").addEventListener("change", updateProtocolHint);
+function updateProtocolHint() {
+  // Подсветку ставим классами, а не :has() - он есть не во всех браузерах.
+  for (const r of protocolRadios()) {
+    const card = r.closest(".proto-option");
+    card.classList.toggle("is-checked", r.checked);
+    card.classList.toggle("is-disabled", r.disabled);
+  }
+  $("np-protocol-hint").textContent = PROTOCOLS[selectedProtocol()].hint;
+}
+
+protocolRadios().forEach((r) => r.addEventListener("change", updateProtocolHint));
 
 function openAddPeerDialog() {
   $("add-peer-form").reset();
   $("np-allowed").value = "0.0.0.0/0, ::/0";
   $("np-keepalive").value = 25;
   // Выключенный протокол выбрать нельзя: сервер его не слушает.
-  for (const opt of $("np-protocol").options) {
-    if (opt.value === "awg2") continue;
-    const t = currentTunnels.find((x) => x.protocol === opt.value);
-    const on = !!(t && t.enabled);
-    opt.disabled = !on;
-    if (!opt.dataset.label) opt.dataset.label = opt.textContent;
-    opt.textContent = on ? opt.dataset.label : `${PROTOCOLS[opt.value].name} — выключен, включите на вкладке «Сервер»`;
+  for (const radio of protocolRadios()) {
+    const sub = radio.closest(".proto-option").querySelector(".proto-sub");
+    const t = currentTunnels.find((x) => x.protocol === radio.value);
+    const on = radio.value === "awg2" || !!(t && t.enabled);
+    radio.disabled = !on;
+    sub.textContent = on ? sub.dataset.default : "выключен - включите на вкладке «Сервер»";
+    radio.checked = radio.value === "awg2";
   }
-  $("np-protocol").value = "awg2";
   updateProtocolHint();
   $("add-peer-error").hidden = true;
   $("add-peer-dialog").showModal();
@@ -941,7 +955,7 @@ $("add-peer-form").addEventListener("submit", async (e) => {
     persistent_keepalive: Number($("np-keepalive").value || 25),
     dns_override: $("np-dns").value.trim() || null,
     note: $("np-note").value.trim() || null,
-    protocol: $("np-protocol").value,
+    protocol: selectedProtocol(),
   };
   const btn = $("add-peer-submit");
   btn.disabled = true;
@@ -1078,12 +1092,24 @@ document.querySelectorAll("[data-close]").forEach((btn) => {
   btn.addEventListener("click", () => btn.closest("dialog").close());
 });
 
+// Закрываем по клику на подложку, только если и нажатие, и отпускание пришлись
+// на сам <dialog> (подложка), а не на содержимое. Координаты не сравниваем:
+// клики по нативным выпадающим спискам и автозаполнению приходят с координатами
+// за пределами окна (или нулевыми) и раньше закрывали его. Выделение текста
+// мышью с уходом за край окна тоже больше не закрывает его.
 document.querySelectorAll("dialog").forEach((dlg) => {
+  let downOnBackdrop = false;
+  dlg.addEventListener("pointerdown", (e) => {
+    downOnBackdrop = e.target === dlg;
+  });
   dlg.addEventListener("click", (e) => {
+    const onBackdrop = e.target === dlg && downOnBackdrop && e.detail > 0;
+    downOnBackdrop = false;
+    if (!onBackdrop) return;
     const rect = dlg.getBoundingClientRect();
-    const inside =
-      e.clientX >= rect.left && e.clientX <= rect.right && e.clientY >= rect.top && e.clientY <= rect.bottom;
-    if (!inside) dlg.close();
+    const outside =
+      e.clientX < rect.left || e.clientX > rect.right || e.clientY < rect.top || e.clientY > rect.bottom;
+    if (outside) dlg.close();
   });
 });
 
