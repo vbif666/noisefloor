@@ -38,7 +38,7 @@ import subprocess
 import threading
 import time
 import uuid
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import quote
@@ -122,6 +122,12 @@ ROTATION_DEFAULT_POOL = [
 ]
 ROTATION_DEFAULT_HOURS = 4
 ROTATION_CHECK_SECONDS = 15
+# Через сколько секунд после ответа перезапускать xray, если смену конфига
+# попросили из веб-интерфейса. Браузер администратора часто сам ходит
+# через этот релей (каскад с первого сервера): перезапуск прямо внутри
+# запроса рвал соединение раньше, чем уходил ответ, - браузер оставался
+# на POST-адресе с ERR_CACHE_MISS.
+XRAY_RESTART_DEFER_SECONDS = 1.5
 ROTATION_HISTORY_MAX = 30
 # Если объявленный момент смены проспали дольше этого (контейнер лежал) —
 # не переключаемся задним числом, а объявляем новый момент: панель на
@@ -960,6 +966,33 @@ def stop_xray():
         _stop_xray_locked()
 
 
+_restart_defer = threading.local()
+_restart_timer: threading.Timer | None = None
+_restart_timer_lock = threading.Lock()
+
+
+@contextmanager
+def xray_restart_after_response():
+    """Внутри блока restart_xray() не перезапускает xray сразу, а
+    планирует перезапуск через XRAY_RESTART_DEFER_SECONDS - чтобы ответ
+    успел уйти клиенту, который ходит через этот же xray."""
+    _restart_defer.on = True
+    try:
+        yield
+    finally:
+        _restart_defer.on = False
+
+
+def _schedule_xray_restart():
+    global _restart_timer
+    with _restart_timer_lock:
+        if _restart_timer is not None:
+            _restart_timer.cancel()
+        _restart_timer = threading.Timer(XRAY_RESTART_DEFER_SECONDS, restart_xray)
+        _restart_timer.daemon = True
+        _restart_timer.start()
+
+
 def restart_xray():
     """Apply a config change without restarting the whole container.
 
@@ -969,6 +1002,9 @@ def restart_xray():
     второй. Оба слушали 8443 (SO_REUSEPORT), первый терялся навсегда —
     его никто не останавливал, статистика делилась надвое, а смена dest
     к нему не доезжала."""
+    if getattr(_restart_defer, "on", False):
+        _schedule_xray_restart()
+        return
     with xray_lock:
         _stop_xray_locked()
         time.sleep(0.5)
@@ -1258,7 +1294,7 @@ def api_settings(dest: str = Form(...), sni: str = Form(...)):
     sni = sni.strip() or dest.split(":")[0]
     if ":" not in dest:
         dest = f"{dest}:443"
-    with rotation_lock:
+    with rotation_lock, xray_restart_after_response():
         apply_camouflage(load_creds(), dest, sni)
     return RedirectResponse(url="/", status_code=303)
 
@@ -1304,7 +1340,7 @@ def api_rotation_save(enabled: str = Form(""), interval_hours: int = Form(ROTATI
 
 @app.post("/api/rotation/now")
 def api_rotation_now():
-    with rotation_lock:
+    with rotation_lock, xray_restart_after_response():
         creds = load_creds()
         if len(get_rotation(creds)["pool"]) < 2:
             raise HTTPException(status_code=400, detail="в пуле меньше двух хостов")
@@ -1323,7 +1359,7 @@ def api_geohide():
 
 @app.post("/api/geohide")
 def api_geohide_save(enabled: str = Form(""), region: str = Form("eu"), extra: str = Form("")):
-    with rotation_lock:
+    with rotation_lock, xray_restart_after_response():
         creds = load_creds()
         gh = get_geohide(creds)
         region_changed = region in GEOHIDE_REGIONS and region != gh["region"]
@@ -1340,7 +1376,7 @@ def api_geohide_save(enabled: str = Form(""), region: str = Form("eu"), extra: s
 
 @app.post("/api/geohide/refresh")
 def api_geohide_refresh():
-    with rotation_lock:
+    with rotation_lock, xray_restart_after_response():
         gh = geohide_apply(update_list=True)
     return JSONResponse({"count": gh["count"], "updated_at": gh["updated_at"], "error": gh["last_error"]})
 
@@ -1551,6 +1587,13 @@ main { max-width: 880px; margin: 0 auto; padding: 24px 20px 60px; display: flex;
 .rot-log .row .ok { color: var(--good); }
 .rot-log .row .note { color: var(--text-faint); }
 .hint-error { color: var(--danger-strong); }
+.apply-status { font-family: var(--font-mono); font-size: 12px; color: var(--text-dim); }
+.apply-status.is-error { color: var(--danger-strong); }
+.apply-status.is-ok { color: var(--good); }
+
+/* Атрибут hidden должен побеждать display у компонентов (.btn - inline-flex),
+   иначе скрытая кнопка «Обновить сейчас» остаётся видимой. Как в панели. */
+[hidden] { display: none !important; }
 
 .btn {
   appearance: none; border: 1px solid var(--line); background: var(--surface-2); color: var(--text);
@@ -1582,6 +1625,7 @@ canvas.chart-canvas { width: 100%; height: 140px; display: block; }
   <div class="wordmark"><span class="dot"></span><span>@@APP_NAME@@ &middot; @@APP_CODENAME@@</span></div>
   <div style="display:flex;align-items:center;gap:12px">
     <span id="status-pill" class="status-pill"><span class="indicator"></span><span id="status-pill-text">@@STATUS_TEXT@@</span></span>
+    <button type="button" id="upd-top-btn" class="btn btn-primary btn-sm" hidden onclick="document.getElementById('upd-box').scrollIntoView({ behavior: 'smooth', block: 'center' })">Доступно обновление</button>
     <form method="post" action="/logout" style="margin:0"><button type="submit" class="btn btn-sm">Выйти</button></form>
   </div>
 </header>
@@ -1723,9 +1767,9 @@ canvas.chart-canvas { width: 100%; height: 140px; display: block; }
       </div>
       <p class="field-hint" id="upd-hint" style="margin:10px 0"></p>
       <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
-        <button type="button" class="btn btn-sm" id="upd-apply-btn" hidden onclick="applyUpdate()">Обновить сейчас</button>
+        <button type="button" class="btn btn-primary btn-sm" id="upd-apply-btn" hidden onclick="applyUpdate()">Обновить сейчас</button>
         <button type="button" class="btn btn-sm" id="upd-check-btn" onclick="checkUpdate()">Проверить обновления</button>
-        <span id="upd-status" class="field-hint"></span>
+        <span id="upd-status" class="apply-status"></span>
       </div>
     </div>
   </div>
@@ -1986,16 +2030,26 @@ function drawChart() {
 }
 
 // ------------------------------------------------------------- update ----
+// Логика та же, что в панели (amneziawg-panel/static/app.js, «Обновление
+// самой панели») - правьте оба места.
+const UPDATE_CHECK_INTERVAL_MS = 60 * 60 * 1000; // раз в час, пока открыта вкладка
+let updateCheckTimer = null;
+let updateState = null;
+let updateBusy = false;   // пока ждём перезапуска - фоновый опрос не трогает статус
+
 function renderUpdate(st) {
+  updateState = st;
   const cur = st.current || {};
   document.getElementById("upd-version-chip").textContent = cur.version || "dev";
   document.getElementById("upd-summary").textContent =
     `NOISEFLOOR ${cur.version || "dev"}  (коммит ${cur.sha || "?"}, собрано ${fmtWhen(cur.date)})\n` +
     `xray ${(st.components || {}).xray || "?"}`;
   const box = document.getElementById("upd-box");
+  const topBtn = document.getElementById("upd-top-btn");
   const apply = document.getElementById("upd-apply-btn");
   const hint = document.getElementById("upd-hint");
   const status = document.getElementById("upd-status");
+  status.classList.remove("is-error", "is-ok");
   if (st.available && st.latest) {
     const l = st.latest;
     document.getElementById("upd-text").textContent =
@@ -2003,48 +2057,110 @@ function renderUpdate(st) {
     const notes = document.getElementById("upd-notes");
     notes.textContent = l.notes || ""; notes.hidden = !l.notes;
     box.hidden = false;
+    topBtn.hidden = false;
+    topBtn.title = `Доступна версия ${l.version}`;
     apply.hidden = !st.agent_available;
     hint.textContent = st.agent_available ? "" :
-      "На хосте нет агента обновлений: выполните на сервере  noisefloor install-agent  " +
-      "(или вручную: docker compose pull && docker compose up -d).";
+      "На хосте нет агента обновлений: запустите установщик заново или выполните на сервере  " +
+      "docker compose pull && docker compose up -d";
   } else {
-    box.hidden = true; apply.hidden = true;
+    box.hidden = true; topBtn.hidden = true; apply.hidden = true;
     hint.textContent = st.check_error ? "" :
       `Обновлений нет — канал «${st.channel}»${st.checked_at ? ", проверено " + fmtWhen(st.checked_at) : ""}.`;
   }
-  if (st.check_error) status.textContent = st.check_error;
-  else if (st.pending) status.textContent = "агент обновляет…";
-  else if (st.last_result) {
+  if (st.pending) {
+    status.textContent = "агент обновляет — релей перезапустится через полминуты";
+    apply.disabled = true;
+  } else if (st.check_error) {
+    status.textContent = st.check_error;
+    status.classList.add("is-error");
+    apply.disabled = false;
+  } else if (st.last_result) {
     const r = st.last_result;
-    status.textContent = `${r.ok ? "✓" : "✗"} ${r.message}${r.finished_at ? " (" + fmtWhen(r.finished_at) + ")" : ""}`;
-  } else status.textContent = "";
+    const when = r.finished_at ? fmtWhen(r.finished_at) : "";
+    if (r.ok) {
+      status.textContent = `последнее обновление прошло успешно ${when}`;
+      status.classList.add("is-ok");
+    } else {
+      status.textContent = `последнее обновление не удалось ${when}: ${r.message || ""}` +
+        (r.rolled_back ? " (возвращена прежняя версия)" : "");
+      status.classList.add("is-error");
+    }
+    apply.disabled = false;
+  } else {
+    status.textContent = "";
+    apply.disabled = false;
+  }
 }
-async function pollUpdate() {
-  try { renderUpdate(await (await fetch("/api/update", { cache: "no-store" })).json()); } catch (e) {}
+async function loadUpdate(force) {
+  clearTimeout(updateCheckTimer);
+  updateCheckTimer = setTimeout(() => loadUpdate(false), UPDATE_CHECK_INTERVAL_MS);
+  try {
+    const r = force
+      ? await fetch("/api/update/check", { method: "POST" })
+      : await fetch("/api/update", { cache: "no-store" });
+    if (r.status === 401) { location.href = "/login"; return; }
+    if (!r.ok) throw new Error("HTTP " + r.status);
+    renderUpdate(await r.json());
+  } catch (e) {
+    if (force) {
+      const status = document.getElementById("upd-status");
+      status.textContent = "не удалось проверить: " + e.message;
+      status.classList.add("is-error");
+    }
+    /* фоновая проверка молчит: она не должна мешать работе страницы */
+  }
 }
 async function checkUpdate() {
   const btn = document.getElementById("upd-check-btn");
   btn.disabled = true; btn.textContent = "Проверяю…";
-  try { renderUpdate(await (await fetch("/api/update/check", { method: "POST" })).json()); }
-  catch (e) { document.getElementById("upd-status").textContent = "не удалось проверить: " + e.message; }
+  try { await loadUpdate(true); }
   finally { btn.disabled = false; btn.textContent = "Проверить обновления"; }
 }
 async function applyUpdate() {
-  if (!confirm("Обновить релей? Каскад прервётся на полминуты.")) return;
+  const l = updateState && updateState.latest;
+  if (!confirm(`Обновить релей до ${l ? l.version : "latest"}? Релей перезапустится — каскад с первого ` +
+               "сервера и его клиенты отвалятся примерно на полминуты. При неудаче агент вернёт прежнюю версию.")) return;
   const btn = document.getElementById("upd-apply-btn");
+  const status = document.getElementById("upd-status");
   btn.disabled = true;
+  status.classList.remove("is-error", "is-ok");
   try {
     const r = await fetch("/api/update/apply", { method: "POST" });
-    const d = await r.json();
-    document.getElementById("upd-status").textContent = r.ok ? d.message : (d.detail || "ошибка");
-    if (r.ok) setTimeout(pollUpdate, 45000);
-  } catch (e) { document.getElementById("upd-status").textContent = "ошибка: " + e.message; }
-  finally { btn.disabled = false; }
+    const d = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(d.detail || ("HTTP " + r.status));
+    status.textContent = d.message;
+    // Релей сейчас перезапустится; опрашиваем, пока не вернётся новый.
+    pollUntilBack();
+  } catch (e) {
+    status.textContent = "ошибка: " + e.message;
+    status.classList.add("is-error");
+    btn.disabled = false;
+  }
+}
+function pollUntilBack() {
+  updateBusy = true;
+  const started = Date.now();
+  const tick = async () => {
+    if (Date.now() - started > 4 * 60 * 1000) { updateBusy = false; return; }
+    try {
+      const r = await fetch("/api/update", { cache: "no-store" });
+      if (r.ok) {
+        const st = await r.json();
+        if (!st.pending) {
+          // Новый образ - новая страница (версия в шапке, шаблон): перечитываем целиком.
+          location.reload();
+          return;
+        }
+      }
+    } catch (e) { /* релей перезапускается */ }
+    setTimeout(tick, 5000);
+  };
+  setTimeout(tick, 8000);
 }
 
-pollStatus(); pollHistory(); pollUpdate();
+pollStatus(); pollHistory(); loadUpdate(false);
 setInterval(pollStatus, 4000);
-setInterval(pollUpdate, 30000);
 setInterval(pollHistory, 5000);
 window.addEventListener("resize", drawChart);
 </script>
