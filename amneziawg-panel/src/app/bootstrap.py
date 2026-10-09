@@ -12,7 +12,13 @@ from sqlalchemy.orm import Session
 from . import crypto
 from .config import DATA_DIR, settings
 from .models import PROTOCOL_AWG1, PROTOCOL_WG, AdminUser, ServerConfig, Tunnel
-from .obfuscation import random_awg1_profile, random_header_protection_key, random_obfuscation_profile
+from .obfuscation import (
+    paddings_ok_for_hpk,
+    random_awg1_profile,
+    random_header_protection_key,
+    random_obfuscation_profile,
+    random_paddings,
+)
 from .security import hash_password
 
 
@@ -88,8 +94,16 @@ def ensure_server_config(db: Session) -> None:
         # Основной интерфейс — AmneziaWG 3.1. Сервер, поднятый ещё на 2.0,
         # переводим один раз: выданные раньше конфиги после этого перестают
         # подключаться, клиентам нужны новые (и Amnezia 5.0.3+).
+        changed = False
         if not existing.header_protection_key:
             existing.header_protection_key = random_header_protection_key()
+            changed = True
+        # Профили 2.0 могли иметь S1-S4 < 12 - с ключом защиты заголовков
+        # amneziawg-go такой конфиг не принимает. Перегенерируем только S.
+        if not paddings_ok_for_hpk(existing.s1, existing.s2, existing.s3, existing.s4):
+            existing.s1, existing.s2, existing.s3, existing.s4 = random_paddings()
+            changed = True
+        if changed:
             db.add(existing)
             db.commit()
         return

@@ -56,22 +56,32 @@ def random_junk() -> tuple[int, int, int]:
 _INIT_RESPONSE_SIZE_DIFF = 56
 
 
-def _init_response_paddings() -> tuple[int, int]:
+def _init_response_paddings(low: int = 0) -> tuple[int, int]:
     while True:
-        s1, s2 = random.randint(0, 64), random.randint(0, 64)
+        s1, s2 = random.randint(low, 64), random.randint(low, 64)
         if s1 + _INIT_RESPONSE_SIZE_DIFF != s2:
             return s1, s2
 
 
+# С HeaderProtectionKey (AmneziaWG 3.1) amneziawg-go требует S1-S4 не меньше
+# размера nonce шифра заголовков (device/uapi.go, HeaderCipherNonceSize = 12),
+# иначе `awg setconf` падает с "Invalid argument" и интерфейс не поднимается.
+HPK_MIN_PADDING = 12
+
+
 def random_paddings() -> tuple[int, int, int, int]:
-    """S1, S2, S3, S4."""
-    s1, s2 = _init_response_paddings()
+    """S1, S2, S3, S4 - сразу пригодные для 3.1 (все >= HPK_MIN_PADDING)."""
+    s1, s2 = _init_response_paddings(HPK_MIN_PADDING)
     return (
         s1,
         s2,
-        random.randint(0, 64),
-        random.randint(0, 32),
+        random.randint(HPK_MIN_PADDING, 64),
+        random.randint(HPK_MIN_PADDING, 32),
     )
+
+
+def paddings_ok_for_hpk(s1: int, s2: int, s3: int, s4: int) -> bool:
+    return min(s1 or 0, s2 or 0, s3 or 0, s4 or 0) >= HPK_MIN_PADDING
 
 
 # Параметры AmneziaWG 3.1 — те же, что ставит официальный установщик

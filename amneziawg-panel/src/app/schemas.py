@@ -99,10 +99,10 @@ class ServerUpdate(BaseModel):
     jc: int | None = Field(default=None, ge=0, le=128)
     jmin: int | None = Field(default=None, ge=0)
     jmax: int | None = Field(default=None, ge=0)
-    s1: int | None = Field(default=None, ge=0)
-    s2: int | None = Field(default=None, ge=0)
-    s3: int | None = Field(default=None, ge=0)
-    s4: int | None = Field(default=None, ge=0)
+    s1: int | None = Field(default=None, ge=12)  # 3.1: >= nonce (12)
+    s2: int | None = Field(default=None, ge=12)  # 3.1: >= nonce (12)
+    s3: int | None = Field(default=None, ge=12)  # 3.1: >= nonce (12)
+    s4: int | None = Field(default=None, ge=12)  # 3.1: >= nonce (12)
     h1: str | None = None
     h2: str | None = None
     h3: str | None = None
