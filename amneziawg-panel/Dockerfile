@@ -107,7 +107,7 @@ ARG BUILD_DATE
 # интерфейса и правила; curl — проверка обновлений и HEALTHCHECK; tini — PID 1,
 # пожинает зомби: убитый OOM amneziawg-go иначе висит <defunct> под uvicorn.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        bash ca-certificates curl iproute2 iptables nftables procps tini \
+        bash ca-certificates curl iproute2 iptables nftables openssl procps tini \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=awg-build  /build/awg-go/amneziawg-go              /usr/local/bin/amneziawg-go
@@ -142,6 +142,7 @@ COPY src/manage.py ./manage.py
 RUN mkdir -p /opt/panel/data /etc/amnezia/amneziawg
 
 COPY entrypoint.sh /entrypoint.sh
+COPY tls-cert.sh /usr/local/bin/tls-cert
 COPY noisefloor-rules /usr/local/bin/noisefloor-rules
 RUN chmod +x /entrypoint.sh /usr/local/bin/noisefloor-rules
 
@@ -157,7 +158,9 @@ VOLUME ["/opt/panel/data", "/etc/amnezia/amneziawg"]
 # /api/health отвечает 503, если туннель должен быть поднят, а awg0 нет —
 # раньше проверялась только веб-панель, и мёртвый VPN выглядел «healthy».
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
-    CMD curl -fsS -o /dev/null http://127.0.0.1:8000/api/health || exit 1
+    CMD curl -kfsS -o /dev/null https://127.0.0.1:8000/api/health || exit 1
 
 ENTRYPOINT ["/usr/bin/tini", "--", "/entrypoint.sh"]
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+# Только HTTPS. tls_serve выпускает сертификат в томе данных, раз в 6 часов
+# проверяет срок и перед истечением перевыпускает его без перезапуска.
+CMD ["python", "-m", "app.tls_serve", "app.main:app", "0.0.0.0", "8000", "/opt/panel/data/tls"]

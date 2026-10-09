@@ -68,6 +68,8 @@ class ServerConfig(Base):
     # Версия релея из его /api/sync: обновлять узлы нужно оба, а забыть
     # второй легко — панель показывает, если они разъехались.
     cascade_relay_version = Column(String(64), nullable=True)
+    # Отпечаток HTTPS-сертификата релея и адрес, для которого он запомнен.
+    cascade_sync_cert_pin = Column(String(400), nullable=True)
 
     # --- Параметры обфускации AmneziaWG 2.0 ---
     jc = Column(Integer, default=6)
@@ -124,7 +126,7 @@ class Tunnel(Base):
     id = Column(Integer, primary_key=True)
     protocol = Column(String(8), nullable=False, unique=True)
     interface_name = Column(String(15), nullable=False, unique=True)
-    enabled = Column(Boolean, default=False, nullable=False)
+    enabled = Column(Boolean, default=True, nullable=False)
 
     private_key = Column(String(64), nullable=False)
     public_key = Column(String(64), nullable=False)

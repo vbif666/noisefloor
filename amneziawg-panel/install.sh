@@ -13,7 +13,7 @@
 #
 # Пример:
 #   ./install.sh                                  # просто VPN
-#   ./install.sh --relay http://СЕРВЕР2:8001 --relay-token ТОКЕН  # с каскадом
+#   ./install.sh --relay https://СЕРВЕР2:8001 --relay-token ТОКЕН  # с каскадом
 #
 # Второй вызов можно сделать и позже, когда релей уже поставлен: повторный
 # запуск не сносит работающую панель, а только досогласовывает настройки.
@@ -43,7 +43,7 @@ usage() {
 Установка панели NOISEFLOOR на чистый сервер.
 
   --public-host АДРЕС      IP или домен этого сервера (по умолчанию IPv4, при нескольких — спросит)
-  --relay URL              адрес панели релея, например http://203.0.113.10:8001
+  --relay URL              адрес панели релея, например https://203.0.113.10:8001
   --relay-token ТОКЕН      токен синхронизации со страницы релея
   --intercept-mode РЕЖИМ   tproxy | redirect (по умолчанию выбирается по ядру)
   --interface ИМЯ          имя VPN-интерфейса (по умолчанию awg0)
@@ -383,10 +383,10 @@ docker compose up -d
 
 log "жду, пока панель ответит"
 for _ in $(seq 1 60); do
-    curl -fsS -o /dev/null "http://127.0.0.1:$PANEL_PORT/" 2>/dev/null && break
+    curl -kfsS -o /dev/null "https://127.0.0.1:$PANEL_PORT/" 2>/dev/null && break
     sleep 1
 done
-curl -fsS -o /dev/null "http://127.0.0.1:$PANEL_PORT/" 2>/dev/null \
+curl -kfsS -o /dev/null "https://127.0.0.1:$PANEL_PORT/" 2>/dev/null \
     || die "панель не отвечает; смотрите: docker logs $CONTAINER --tail 50"
 
 ADMIN_PASSWORD="$(docker exec "$CONTAINER" sh -c \
@@ -397,17 +397,17 @@ ADMIN_PASSWORD="$(docker exec "$CONTAINER" sh -c \
 api() { # api МЕТОД ПУТЬ [ТЕЛО]
     local method="$1" path="$2" body="${3:-}"
     if [ -n "$body" ]; then
-        curl -fsS -X "$method" "http://127.0.0.1:$PANEL_PORT$path" \
+        curl -kfsS -X "$method" "https://127.0.0.1:$PANEL_PORT$path" \
             -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" -d "$body"
     else
-        curl -fsS -X "$method" "http://127.0.0.1:$PANEL_PORT$path" \
+        curl -kfsS -X "$method" "https://127.0.0.1:$PANEL_PORT$path" \
             -H "Authorization: Bearer $TOKEN"
     fi
 }
 
 CONFIGURED_VIA_API=0
 if [ -n "$ADMIN_PASSWORD" ]; then
-    TOKEN="$(curl -fsS -X POST "http://127.0.0.1:$PANEL_PORT/api/auth/login" \
+    TOKEN="$(curl -kfsS -X POST "https://127.0.0.1:$PANEL_PORT/api/auth/login" \
         -H "Content-Type: application/json" \
         -d "{\"username\":\"admin\",\"password\":\"$ADMIN_PASSWORD\"}" 2>/dev/null \
         | python3 -c 'import json,sys; print(json.load(sys.stdin).get("access_token",""))' 2>/dev/null || true)"
@@ -459,7 +459,7 @@ fi
 
 echo
 printf '\033[1;32m=== Панель установлена ===\033[0m\n\n'
-printf '  Адрес:     http://%s:%s\n' "${PUBLIC_HOST:-АДРЕС_СЕРВЕРА}" "$PANEL_PORT"
+printf '  Адрес:     https://%s:%s  (сертификат самоподписанный - браузер предупредит)\n' "${PUBLIC_HOST:-АДРЕС_СЕРВЕРА}" "$PANEL_PORT"
 printf '  Логин:     admin\n'
 printf '  Пароль:    %s\n' "${ADMIN_PASSWORD:-см. docker exec $CONTAINER cat /opt/panel/data/INITIAL_ADMIN_PASSWORD.txt}"
 printf '  Каталог:   %s\n' "$INSTALL_DIR"

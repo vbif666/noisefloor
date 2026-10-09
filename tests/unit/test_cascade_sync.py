@@ -8,6 +8,7 @@
 разбираться собственным парсером каскада без потерь. Если эти две стороны
 разойдутся хоть в одном поле, каскад сломается молча.
 """
+import json
 import unittest
 from datetime import datetime, timedelta, timezone
 from unittest import mock
@@ -76,17 +77,22 @@ class BuildUrlTests(unittest.TestCase):
 
 class EndpointTests(unittest.TestCase):
     def test_appends_api_path(self):
-        self.assertEqual(cascade_sync._endpoint("http://203.0.113.10:8001"),
-                         "http://203.0.113.10:8001/api/sync")
+        self.assertEqual(cascade_sync._endpoint("https://203.0.113.10:8001"),
+                         "https://203.0.113.10:8001/api/sync")
 
     def test_tolerates_trailing_slash(self):
-        self.assertEqual(cascade_sync._endpoint("http://203.0.113.10:8001/"),
-                         "http://203.0.113.10:8001/api/sync")
+        self.assertEqual(cascade_sync._endpoint("https://203.0.113.10:8001/"),
+                         "https://203.0.113.10:8001/api/sync")
 
-    def test_assumes_http_when_scheme_omitted(self):
+    def test_assumes_https_when_scheme_omitted(self):
         # Частый случай: вписали "1.2.3.4:8001" без схемы.
         self.assertEqual(cascade_sync._endpoint("203.0.113.10:8001"),
-                         "http://203.0.113.10:8001/api/sync")
+                         "https://203.0.113.10:8001/api/sync")
+
+    def test_upgrades_old_http_address(self):
+        # Адрес из прежних настроек с http:// не ломает каскад.
+        self.assertEqual(cascade_sync._endpoint("http://203.0.113.10:8001"),
+                         "https://203.0.113.10:8001/api/sync")
 
     def test_rejects_foreign_schemes(self):
         for bad in ("file:///etc/passwd", "ftp://203.0.113.10"):
@@ -98,20 +104,115 @@ class EndpointTests(unittest.TestCase):
             cascade_sync._endpoint("")
 
 
+class PinTests(unittest.TestCase):
+    def test_pin_bound_to_address(self):
+        record = cascade_sync.make_pin_record("ab" * 32, "203.0.113.10:8001")
+        self.assertEqual(cascade_sync._pin_for(record, "https://203.0.113.10:8001/"), "ab" * 32)
+        # Другой адрес - отпечаток не применяется, запомнится заново.
+        self.assertEqual(cascade_sync._pin_for(record, "https://203.0.113.11:8001"), "")
+
+    def test_empty_record(self):
+        self.assertEqual(cascade_sync._pin_for("", "https://203.0.113.10:8001"), "")
+        self.assertEqual(cascade_sync._pin_for(None, "https://203.0.113.10:8001"), "")
+
+
+def _make_cert(key=None, days=365):
+    """Настоящий самоподписанный сертификат (DER) - как выпускает tls-cert.sh."""
+    from cryptography import x509
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import ec
+    from cryptography.x509.oid import NameOID
+
+    key = key or ec.generate_private_key(ec.SECP256R1())
+    name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "noisefloor")])
+    now = datetime.now(timezone.utc)
+    cert = (
+        x509.CertificateBuilder()
+        .subject_name(name).issuer_name(name)
+        .public_key(key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(now).not_valid_after(now + timedelta(days=days))
+        .sign(key, hashes.SHA256())
+    )
+    return key, cert.public_bytes(serialization.Encoding.DER)
+
+
+KEY_A, CERT_A = _make_cert()
+_, CERT_A_RENEWED = _make_cert(KEY_A, days=400)   # перевыпуск с тем же ключом
+_, CERT_B = _make_cert()                           # другой ключ
+
+
+def _fake_connection(cert=CERT_A, status=200, body=b"{}"):
+    conn = mock.MagicMock()
+    conn.sock.getpeercert.return_value = cert
+    conn.getresponse.return_value.status = status
+    conn.getresponse.return_value.read.return_value = body
+    return conn
+
+
 class FetchTests(unittest.TestCase):
+    URL = "https://203.0.113.10:8001"
+
+    def _fetch(self, cert, pin=""):
+        conn = _fake_connection(cert=cert, body=json.dumps(RELAY_ANSWER).encode())
+        with mock.patch("http.client.HTTPSConnection", return_value=conn):
+            return conn, cascade_sync.fetch_params(self.URL, "token", pin)
+
     def test_requires_token(self):
         with self.assertRaises(cascade_sync.SyncError) as ctx:
-            cascade_sync.fetch_params("http://203.0.113.10:8001", "")
+            cascade_sync.fetch_params(self.URL, "")
         self.assertIn("токен", str(ctx.exception).lower())
 
     def test_reports_incomplete_answer(self):
         broken = {k: v for k, v in RELAY_ANSWER.items() if k != "sni"}
-        with mock.patch("urllib.request.urlopen") as urlopen:
-            urlopen.return_value.__enter__.return_value.read.return_value = \
-                __import__("json").dumps(broken).encode()
+        conn = _fake_connection(body=json.dumps(broken).encode())
+        with mock.patch("http.client.HTTPSConnection", return_value=conn):
             with self.assertRaises(cascade_sync.SyncError) as ctx:
-                cascade_sync.fetch_params("http://203.0.113.10:8001", "token")
+                cascade_sync.fetch_params(self.URL, "token")
         self.assertIn("sni", str(ctx.exception))
+
+    def test_returns_key_fingerprint(self):
+        _, (params, fp) = self._fetch(CERT_A)
+        self.assertEqual(params["uuid"], RELAY_ANSWER["uuid"])
+        self.assertTrue(fp.startswith(cascade_sync.KEY_PIN_PREFIX))
+        self.assertEqual(fp, cascade_sync.key_fingerprint(CERT_A))
+
+    def test_renewed_cert_with_same_key_passes(self):
+        # Главное: плановый перевыпуск сертификата на релее не ломает каскад.
+        pin = cascade_sync.make_pin_record(cascade_sync.key_fingerprint(CERT_A), self.URL)
+        _, (params, fp) = self._fetch(CERT_A_RENEWED, pin)
+        self.assertEqual(params["sni"], RELAY_ANSWER["sni"])
+        self.assertEqual(fp, cascade_sync.key_fingerprint(CERT_A))
+
+    def test_changed_key_blocks_before_token_sent(self):
+        pin = cascade_sync.make_pin_record(cascade_sync.key_fingerprint(CERT_A), self.URL)
+        conn = _fake_connection(cert=CERT_B, body=json.dumps(RELAY_ANSWER).encode())
+        with mock.patch("http.client.HTTPSConnection", return_value=conn):
+            with self.assertRaises(cascade_sync.SyncError) as ctx:
+                cascade_sync.fetch_params(self.URL, "token", pin)
+        self.assertIn("Ключ", str(ctx.exception))
+        conn.request.assert_not_called()
+
+    def test_old_cert_pin_is_accepted_and_upgraded(self):
+        # Записи прошлой версии хранят отпечаток всего сертификата.
+        pin = cascade_sync.make_pin_record(cascade_sync.cert_fingerprint(CERT_A), self.URL)
+        _, (_, fp) = self._fetch(CERT_A, pin)
+        self.assertEqual(fp, cascade_sync.key_fingerprint(CERT_A))
+
+    def test_old_cert_pin_still_blocks_other_cert(self):
+        pin = cascade_sync.make_pin_record(cascade_sync.cert_fingerprint(CERT_A), self.URL)
+        conn = _fake_connection(cert=CERT_B, body=json.dumps(RELAY_ANSWER).encode())
+        with mock.patch("http.client.HTTPSConnection", return_value=conn):
+            with self.assertRaises(cascade_sync.SyncError):
+                cascade_sync.fetch_params(self.URL, "token", pin)
+        conn.request.assert_not_called()
+
+    def test_bad_token(self):
+        conn = _fake_connection(status=401)
+        with mock.patch("http.client.HTTPSConnection", return_value=conn):
+            with self.assertRaises(cascade_sync.SyncError) as ctx:
+                cascade_sync.fetch_params(self.URL, "token")
+        self.assertIn("токен", str(ctx.exception))
 
 
 class HostOfTests(unittest.TestCase):

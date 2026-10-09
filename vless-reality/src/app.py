@@ -11,7 +11,7 @@ On first start:
   - tails the xray access log to detect client handshakes
   - polls the local Xray Stats API to report live traffic
 
-Web UI (PANEL_PORT, default 8001), protected with HTTP Basic auth:
+Web UI (PANEL_PORT, default 8001), HTTPS only, login form + session cookie:
   GET  /              - status page: vless:// link, QR code, traffic, settings, restart
   GET  /api/status     - JSON status
   GET  /api/qr.png     - QR code of the current vless:// link
@@ -23,6 +23,8 @@ Web UI (PANEL_PORT, default 8001), protected with HTTP Basic auth:
   POST /api/restart    - restart the whole container (relies on `restart: unless-stopped`)
 """
 import base64
+import hashlib
+import hmac
 import html
 import io
 import json
@@ -45,7 +47,6 @@ from fastapi import Depends, FastAPI, Form, HTTPException, Request, status
 
 import self_update
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
-from fastapi.security import HTTPBasic, HTTPBasicCredentials
 import qrcode
 
 DATA_DIR = Path(os.environ.get("DATA_DIR", "/data"))
@@ -200,7 +201,93 @@ def get_admin_password() -> str:
 
 
 ADMIN_PASSWORD = get_admin_password()
-security = HTTPBasic(auto_error=False)
+
+# Вход по логину и паролю через форму, дальше - подписанная cookie сессии.
+# Basic-авторизации нет: браузер держит её до закрытия, выйти нельзя, а
+# пароль уходит с каждым запросом.
+SESSION_COOKIE = "nf_relay_session"
+SESSION_TTL_SECONDS = 12 * 3600
+SESSION_SECRET_FILE = DATA_DIR / "session_secret"
+LOGIN_PATH = "/login"
+LOGOUT_PATH = "/logout"
+LOGIN_MAX_ATTEMPTS = 5
+LOGIN_WINDOW_SECONDS = 300
+_failed_logins: dict[str, list[float]] = {}
+_failed_lock = threading.Lock()
+
+
+def _session_secret() -> bytes:
+    try:
+        value = SESSION_SECRET_FILE.read_text().strip()
+        if value:
+            return value.encode()
+    except FileNotFoundError:
+        pass
+    value = secrets.token_hex(32)
+    SESSION_SECRET_FILE.write_text(value + "\n")
+    try:
+        SESSION_SECRET_FILE.chmod(0o600)
+    except Exception:
+        pass
+    return value.encode()
+
+
+SESSION_SECRET = _session_secret()
+
+
+def _sign(payload: str) -> str:
+    # В подпись входит пароль: сменили пароль - старые сессии недействительны.
+    key = SESSION_SECRET + b"|" + ADMIN_PASSWORD.encode()
+    return hmac.new(key, payload.encode(), hashlib.sha256).hexdigest()
+
+
+def make_session() -> str:
+    payload = f"{ADMIN_USER}|{int(time.time()) + SESSION_TTL_SECONDS}|{secrets.token_hex(8)}"
+    return base64.urlsafe_b64encode(payload.encode()).decode().rstrip("=") + "." + _sign(payload)
+
+
+def session_valid(cookie: str | None) -> bool:
+    if not cookie or "." not in cookie:
+        return False
+    body, _, sig = cookie.rpartition(".")
+    try:
+        payload = base64.urlsafe_b64decode(body + "=" * (-len(body) % 4)).decode()
+    except Exception:
+        return False
+    if not secrets.compare_digest(sig, _sign(payload)):
+        return False
+    user, _, rest = payload.partition("|")
+    expires, _, _ = rest.partition("|")
+    try:
+        return user == ADMIN_USER and int(expires) > time.time()
+    except ValueError:
+        return False
+
+
+def _client_key(request: Request) -> str:
+    return request.client.host if request.client else "?"
+
+
+def login_blocked(request: Request) -> int:
+    """Секунд до разблокировки, 0 - можно пробовать."""
+    now = time.monotonic()
+    with _failed_lock:
+        attempts = [t for t in _failed_logins.get(_client_key(request), []) if now - t < LOGIN_WINDOW_SECONDS]
+        _failed_logins[_client_key(request)] = attempts
+        if len(attempts) >= LOGIN_MAX_ATTEMPTS:
+            return int(LOGIN_WINDOW_SECONDS - (now - attempts[0])) + 1
+    return 0
+
+
+def register_failed_login(request: Request) -> None:
+    with _failed_lock:
+        _failed_logins.setdefault(_client_key(request), []).append(time.monotonic())
+
+
+def credentials_ok(username: str, password: str) -> bool:
+    user_ok = secrets.compare_digest(username.encode(), ADMIN_USER.encode())
+    pass_ok = secrets.compare_digest(password.encode(), ADMIN_PASSWORD.encode())
+    return user_ok and pass_ok
 
 SYNC_PATH = "/api/sync"
 # Здоровье без авторизации: его спрашивают Docker (HEALTHCHECK) и хостовый
@@ -234,27 +321,18 @@ def _authorise_sync(request) -> str:
     return "sync"
 
 
-def check_auth(request: Request, credentials: HTTPBasicCredentials | None = Depends(security)):
-    if request.url.path == SYNC_PATH:
+def check_auth(request: Request):
+    path = request.url.path
+    if path == SYNC_PATH:
         return _authorise_sync(request)
-    if request.url.path == HEALTH_PATH:
-        return "health"
-
-    if credentials is None:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Unauthorized",
-            headers={"WWW-Authenticate": "Basic"},
-        )
-    user_ok = secrets.compare_digest(credentials.username, ADMIN_USER)
-    pass_ok = secrets.compare_digest(credentials.password, ADMIN_PASSWORD)
-    if not (user_ok and pass_ok):
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Unauthorized",
-            headers={"WWW-Authenticate": "Basic"},
-        )
-    return credentials.username
+    if path in (HEALTH_PATH, LOGIN_PATH, LOGOUT_PATH):
+        return "public"
+    if session_valid(request.cookies.get(SESSION_COOKIE)):
+        return ADMIN_USER
+    if path.startswith("/api/"):
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Требуется вход")
+    # Страницу без сессии отправляем на форму входа.
+    raise HTTPException(status_code=status.HTTP_303_SEE_OTHER, headers={"Location": LOGIN_PATH})
 
 
 # ------------------------------------------------------------ provision ----
@@ -1312,7 +1390,10 @@ canvas.chart-canvas { width: 100%; height: 140px; display: block; }
 
 <header class="topbar">
   <div class="wordmark"><span class="dot"></span><span>@@APP_NAME@@ &middot; @@APP_CODENAME@@</span></div>
-  <span id="status-pill" class="status-pill"><span class="indicator"></span><span id="status-pill-text">@@STATUS_TEXT@@</span></span>
+  <div style="display:flex;align-items:center;gap:12px">
+    <span id="status-pill" class="status-pill"><span class="indicator"></span><span id="status-pill-text">@@STATUS_TEXT@@</span></span>
+    <form method="post" action="/logout" style="margin:0"><button type="submit" class="btn btn-sm">Выйти</button></form>
+  </div>
 </header>
 
 <div class="signal-strip" id="signal-strip" aria-hidden="true"></div>
@@ -1469,6 +1550,16 @@ canvas.chart-canvas { width: 100%; height: 140px; display: block; }
 </main>
 
 <script>
+// Сессия истекла - любой запрос к API получит 401: уводим на форму входа,
+// а не показываем молча пустые цифры.
+(() => {
+  const nativeFetch = window.fetch.bind(window);
+  window.fetch = async (...args) => {
+    const r = await nativeFetch(...args);
+    if (r.status === 401) location.href = "/login";
+    return r;
+  };
+})();
 function fmtWhen(iso) {
   if (!iso) return "—";
   const d = new Date(iso);
@@ -1763,6 +1854,78 @@ def rotation_history_html(rot: dict) -> str:
             text += f' <span class="note">— {html.escape(item["note"])}</span>'
         rows.append(f'<div class="row"><span class="when">{_when(item.get("at"))}</span><span>{text}</span></div>')
     return "".join(rows) or '<div class="row"><span class="when">журнал</span><span class="note">смен ещё не было</span></div>'
+
+
+LOGIN_TEMPLATE = """<!doctype html>
+<html lang="ru"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Вход &middot; @@APP_NAME@@</title>
+<link rel="icon" href="data:," />
+<style>@@CSS@@
+.login-wrap { max-width: 360px; margin: 12vh auto 0; padding: 0 16px; }
+.login-wrap label { display: block; font-size: 12px; color: var(--text-dim); margin: 14px 0 6px; }
+.login-wrap input { width: 100%; box-sizing: border-box; padding: 10px 12px; border-radius: 8px;
+  border: 1px solid var(--line); background: var(--surface-2); color: var(--text); font: inherit; }
+.login-wrap .btn { width: 100%; margin-top: 18px; justify-content: center; }
+.login-error { color: var(--danger); font-size: 13px; margin-top: 12px; }
+</style></head>
+<body>
+<div class="login-wrap">
+  <div class="wordmark" style="margin-bottom:18px"><span class="dot"></span><span>@@APP_NAME@@ &middot; @@APP_CODENAME@@</span></div>
+  <div class="panel"><div class="panel-body">
+    <form method="post" action="/login" autocomplete="on">
+      <label for="u">Логин</label>
+      <input id="u" name="username" autocomplete="username" required autofocus />
+      <label for="p">Пароль</label>
+      <input id="p" name="password" type="password" autocomplete="current-password" required />
+      <button type="submit" class="btn">Войти</button>
+      @@ERROR@@
+    </form>
+  </div></div>
+</div>
+</body></html>"""
+
+
+def _page_css() -> str:
+    start = PAGE_TEMPLATE.index("<style>") + len("<style>")
+    return PAGE_TEMPLATE[start:PAGE_TEMPLATE.index("</style>")]
+
+
+def render_login(error: str = "") -> str:
+    page = LOGIN_TEMPLATE.replace("@@CSS@@", _page_css())
+    page = page.replace("@@APP_NAME@@", html.escape(APP_NAME)).replace("@@APP_CODENAME@@", html.escape(APP_CODENAME))
+    err = f'<div class="login-error">{html.escape(error)}</div>' if error else ""
+    return page.replace("@@ERROR@@", err)
+
+
+@app.get(LOGIN_PATH, response_class=HTMLResponse)
+def login_page(request: Request):
+    if session_valid(request.cookies.get(SESSION_COOKIE)):
+        return RedirectResponse("/", status_code=status.HTTP_303_SEE_OTHER)
+    return HTMLResponse(render_login(), headers={"Cache-Control": "no-store"})
+
+
+@app.post(LOGIN_PATH)
+def login_submit(request: Request, username: str = Form(""), password: str = Form("")):
+    wait = login_blocked(request)
+    if wait:
+        return HTMLResponse(render_login(f"Слишком много неудачных попыток. Повторите через {wait} с."),
+                            status_code=status.HTTP_429_TOO_MANY_REQUESTS)
+    if not credentials_ok(username.strip(), password):
+        register_failed_login(request)
+        return HTMLResponse(render_login("Неверный логин или пароль"),
+                            status_code=status.HTTP_401_UNAUTHORIZED)
+    response = RedirectResponse("/", status_code=status.HTTP_303_SEE_OTHER)
+    response.set_cookie(SESSION_COOKIE, make_session(), max_age=SESSION_TTL_SECONDS,
+                        httponly=True, secure=True, samesite="strict", path="/")
+    return response
+
+
+@app.post(LOGOUT_PATH)
+def logout():
+    response = RedirectResponse(LOGIN_PATH, status_code=status.HTTP_303_SEE_OTHER)
+    response.delete_cookie(SESSION_COOKIE, path="/", secure=True, httponly=True, samesite="strict")
+    return response
 
 
 @app.get("/", response_class=HTMLResponse)

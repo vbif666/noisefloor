@@ -29,7 +29,7 @@ FROM python:3.12-slim
 ARG BUILD_VERSION=dev
 ARG BUILD_SHA=unknown
 ARG BUILD_DATE=unknown
-RUN apt-get update && apt-get install -y --no-install-recommends curl ca-certificates dumb-init && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y --no-install-recommends curl ca-certificates dumb-init openssl && rm -rf /var/lib/apt/lists/*
 COPY --from=xray-fetch /tmp/xray-out/xray /usr/local/bin/xray
 COPY --from=xray-fetch /tmp/xray-out/VERSION /opt/XRAY_VERSION
 RUN chmod +x /usr/local/bin/xray
@@ -38,6 +38,7 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 COPY src/ /app/
+COPY tls-cert.sh /usr/local/bin/tls-cert
 
 RUN mkdir -p /data /var/log/xray
 VOLUME ["/data"]
@@ -61,7 +62,10 @@ EXPOSE 8001 8443
 # Здоровье = xray запущен. По нему хостовый агент обновлений решает,
 # удалось ли обновление или пора откатываться.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
-    CMD curl -fsS -o /dev/null "http://127.0.0.1:${PANEL_PORT}/api/health" || exit 1
+    CMD curl -kfsS -o /dev/null "https://127.0.0.1:${PANEL_PORT}/api/health" || exit 1
 
 ENTRYPOINT ["dumb-init", "--"]
-CMD ["sh", "-c", "uvicorn app:app --host 0.0.0.0 --port ${PANEL_PORT}"]
+# Только HTTPS. tls_serve выпускает сертификат в томе данных, раз в 6 часов
+# проверяет срок и перед истечением перевыпускает его (с тем же ключом) без
+# перезапуска.
+CMD ["sh", "-c", "exec python -m tls_serve app:app 0.0.0.0 \"${PANEL_PORT}\" \"$DATA_DIR/tls\""]

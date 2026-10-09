@@ -21,7 +21,7 @@ NET=nf-proto-test
 SUBNET=172.29.99.0/24
 SERVER_IP=172.29.99.10
 SERVER=nf-proto-server
-PANEL="http://$SERVER_IP:8000"
+PANEL="https://$SERVER_IP:8000"
 
 WORKDIR="$(mktemp -d /tmp/noisefloor-proto.XXXXXX)"
 FAILED=0
@@ -63,17 +63,17 @@ docker run -d --name "$SERVER" --network "$NET" --ip "$SERVER_IP" \
     "$PANEL_IMAGE" >/dev/null
 
 if ! wait_for 60 test -s "$WORKDIR/data/INITIAL_ADMIN_PASSWORD.txt" \
-   || ! wait_for 45 curl -fsS -o /dev/null "$PANEL/"; then
+   || ! wait_for 45 curl -kfsS -o /dev/null "$PANEL/"; then
     fail "панель не поднялась"
     docker logs "$SERVER" 2>&1 | tail -20
     exit 1
 fi
 pw="$(grep -oE '[A-Za-z0-9_-]{12,}' "$WORKDIR/data/INITIAL_ADMIN_PASSWORD.txt" | head -1)"
-token="$(curl -fsS -X POST "$PANEL/api/auth/login" -H 'Content-Type: application/json' \
+token="$(curl -kfsS -X POST "$PANEL/api/auth/login" -H 'Content-Type: application/json' \
     -d "{\"username\":\"admin\",\"password\":\"$pw\"}" | json 'd["access_token"]')"
 api() {
     local method="$1" path="$2"; shift 2
-    curl -fsS -X "$method" "$PANEL/api$path" -H "Authorization: Bearer $token" \
+    curl -kfsS -X "$method" "$PANEL/api$path" -H "Authorization: Bearer $token" \
         -H 'Content-Type: application/json' "$@"
 }
 pass "панель поднялась с живым управлением"
@@ -132,7 +132,7 @@ for proto in awg2 awg1 wg; do
         >/dev/null 2>&1 || { fail "$proto: клиент не поднял интерфейс"; continue; }
 
     if wait_for 20 docker exec "nf-proto-c-$proto" python3 -c \
-        "import urllib.request; urllib.request.urlopen('http://$server_ip:8000/api/health', timeout=3)"; then
+        "import urllib.request; import ssl; urllib.request.urlopen('https://$server_ip:8000/api/health', timeout=3, context=ssl._create_unverified_context())"; then
         pass "$proto: рукопожатие прошло, панель отвечает через туннель ($server_ip)"
     else
         fail "$proto: через туннель до $server_ip не достучаться"
@@ -145,7 +145,7 @@ done
 wg_port="$(api GET /tunnels | json '[t["listen_port"] for t in d if t["protocol"]=="wg"][0]')"
 docker exec nf-proto-c-awg2 sh -c "awg-quick down c0 >/dev/null 2>&1; sed -i 's|^Endpoint = .*|Endpoint = $SERVER_IP:$wg_port|' /etc/amnezia/amneziawg/c0.conf && awg-quick up c0 >/dev/null 2>&1"
 if docker exec nf-proto-c-awg2 python3 -c \
-    "import urllib.request; urllib.request.urlopen('http://10.13.13.1:8000/api/health', timeout=5)" >/dev/null 2>&1; then
+    "import urllib.request; import ssl; urllib.request.urlopen('https://10.13.13.1:8000/api/health', timeout=5, context=ssl._create_unverified_context())" >/dev/null 2>&1; then
     fail "клиент AmneziaWG 2.0 прошёл на порт обычного WireGuard"
 else
     pass "клиент AmneziaWG 2.0 на порт обычного WireGuard не проходит"
@@ -175,7 +175,7 @@ if modinfo wireguard >/dev/null 2>&1; then
             ip addr add $addr dev wg0 && ip link set wg0 up
             ip route add 10.13.15.1/32 dev wg0
             for i in 1 2 3 4 5 6 7 8 9 10; do
-                wget -q -T 3 -O /dev/null http://10.13.15.1:8000/api/health && exit 0
+                wget -q -T 3 --no-check-certificate -O /dev/null https://10.13.15.1:8000/api/health && exit 0
                 sleep 1
             done
             wg show wg0; exit 1" >/dev/null 2>&1; then

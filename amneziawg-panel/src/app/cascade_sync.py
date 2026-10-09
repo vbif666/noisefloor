@@ -13,14 +13,22 @@ vless:// становится производной величиной, а не
 
 Токен отдельный от пароля администратора релея — панели-клиенту незачем
 иметь над ним полную власть.
+
+Связь только по HTTPS. Сертификат у релея самоподписанный (у сервера по IP
+другого обычно нет), поэтому цепочку не проверяем, а запоминаем отпечаток
+сертификата при первом успешном обращении и дальше требуем ровно его
+(TOFU, как ssh known_hosts). Отпечаток привязан к адресу: сменили адрес
+релея в настройках — запоминается заново.
 """
 from __future__ import annotations
 
+import hashlib
+import http.client
 import json
+import socket
+import ssl
 import threading
-import urllib.error
 import urllib.parse
-import urllib.request
 from datetime import datetime, timezone
 
 from . import cascade
@@ -28,6 +36,7 @@ from . import cascade
 SYNC_INTERVAL_SECONDS = 300
 REQUEST_TIMEOUT_SECONDS = 10
 ALLOWED_SCHEMES = ("http", "https")
+SYNC_PATH = "/api/sync"
 # Релей умеет менять SNI по расписанию и объявляет момент смены заранее.
 # Приходим за новыми параметрами чуть позже объявленного времени — релею
 # нужно несколько секунд, чтобы перезапустить свой xray. Если пришли, а он
@@ -44,46 +53,140 @@ class SyncError(Exception):
     """Ошибка, которую имеет смысл показать администратору в панели."""
 
 
-def _endpoint(base_url: str) -> str:
+def _normalise(base_url: str) -> urllib.parse.ParseResult:
     base = (base_url or "").strip().rstrip("/")
     if not base:
         raise SyncError("Не указан адрес релея")
     if "://" not in base:
         # Частый случай: вписали "1.2.3.4:8001" без схемы.
-        base = "http://" + base
+        base = "https://" + base
     parsed = urllib.parse.urlparse(base)
     if parsed.scheme not in ALLOWED_SCHEMES:
-        raise SyncError(f"Поддерживаются только http и https, а не {parsed.scheme}")
+        raise SyncError(f"Поддерживается только https, а не {parsed.scheme}")
     if not parsed.hostname:
         raise SyncError("В адресе релея не разобрать имя хоста")
-    return base + "/api/sync"
+    # Релей отдаёт панель только по HTTPS; старый адрес с http:// из
+    # прежних настроек молча поднимаем до https, а не ломаем каскад.
+    return parsed._replace(scheme="https")
 
 
-def fetch_params(base_url: str, token: str) -> dict:
-    """Спрашивает у релея его текущие параметры подключения."""
-    if not (token or "").strip():
-        raise SyncError("Не указан токен синхронизации")
+def _endpoint(base_url: str) -> str:
+    return _normalise(base_url).geturl() + SYNC_PATH
 
-    request = urllib.request.Request(
-        _endpoint(base_url),
-        headers={"Authorization": f"Bearer {token.strip()}", "Accept": "application/json"},
+
+KEY_PIN_PREFIX = "key:"
+
+
+def cert_fingerprint(der: bytes) -> str:
+    """Отпечаток всего сертификата - формат старых записей."""
+    return hashlib.sha256(der).hexdigest()
+
+
+def key_fingerprint(der: bytes) -> str:
+    """Отпечаток публичного ключа сертификата.
+
+    Релей перевыпускает сертификат перед истечением, но с тем же ключом, поэтому
+    запоминаем ключ: плановый перевыпуск не ломает каскад, а подмена ключа -
+    ловится."""
+    from cryptography import x509
+    from cryptography.hazmat.primitives import serialization
+
+    try:
+        cert = x509.load_der_x509_certificate(der)
+    except ValueError as exc:
+        raise SyncError("Релей прислал нечитаемый сертификат") from exc
+    spki = cert.public_key().public_bytes(
+        serialization.Encoding.DER,
+        serialization.PublicFormat.SubjectPublicKeyInfo,
+    )
+    return KEY_PIN_PREFIX + hashlib.sha256(spki).hexdigest()
+
+
+def pin_matches(pinned: str, der: bytes) -> bool:
+    if pinned.startswith(KEY_PIN_PREFIX):
+        return key_fingerprint(der) == pinned
+    # Запись старого формата (отпечаток сертификата): принимаем, после
+    # успешной синхронизации она перезапишется отпечатком ключа.
+    return cert_fingerprint(der) == pinned
+
+
+def _pin_for(pin_record: str, base_url: str) -> str:
+    """Запомненный отпечаток, если он записан для этого же адреса."""
+    fp, _, url = (pin_record or "").partition("|")
+    return fp if fp and url == _endpoint(base_url) else ""
+
+
+def make_pin_record(fingerprint: str, base_url: str) -> str:
+    return f"{fingerprint}|{_endpoint(base_url)}"
+
+
+def _request(base_url: str, token: str, pinned: str) -> tuple[int, bytes, str]:
+    parsed = _normalise(base_url)
+    path = (parsed.path or "") + SYNC_PATH
+    context = ssl.create_default_context()
+    context.check_hostname = False
+    context.verify_mode = ssl.CERT_NONE
+    conn = http.client.HTTPSConnection(
+        parsed.hostname, parsed.port or 443,
+        timeout=REQUEST_TIMEOUT_SECONDS, context=context,
     )
     try:
-        with urllib.request.urlopen(request, timeout=REQUEST_TIMEOUT_SECONDS) as response:
-            payload = json.loads(response.read().decode("utf-8"))
-    except urllib.error.HTTPError as exc:
-        if exc.code == 401:
-            raise SyncError("Релей не принял токен — проверьте, что скопирован целиком") from exc
-        raise SyncError(f"Релей ответил {exc.code}") from exc
-    except urllib.error.URLError as exc:
-        raise SyncError(f"Не удалось связаться с релеем: {exc.reason}") from exc
-    except json.JSONDecodeError as exc:
+        conn.connect()
+        der = conn.sock.getpeercert(binary_form=True) or b""
+        fingerprint = key_fingerprint(der)
+        # Отпечаток сверяем ДО отправки токена: иначе подменённый сервер
+        # получил бы токен синхронизации.
+        if pinned and not pin_matches(pinned, der):
+            raise SyncError(
+                "Ключ сертификата релея не совпадает с запомненным. Если вы "
+                "сменили ключ на релее - сохраните адрес релея заново; "
+                "если нет - возможна подмена, синхронизация остановлена"
+            )
+        conn.request("GET", path, headers={
+            "Authorization": f"Bearer {token.strip()}",
+            "Accept": "application/json",
+            "Host": parsed.netloc,
+        })
+        response = conn.getresponse()
+        return response.status, response.read(), fingerprint
+    finally:
+        conn.close()
+
+
+def fetch_params(base_url: str, token: str, pin_record: str = "") -> tuple[dict, str]:
+    """Спрашивает у релея его текущие параметры подключения.
+
+    Возвращает (параметры, отпечаток сертификата релея)."""
+    if not (token or "").strip():
+        raise SyncError("Не указан токен синхронизации")
+    pinned = _pin_for(pin_record, base_url)
+    try:
+        code, body, fingerprint = _request(base_url, token, pinned)
+    except SyncError:
+        raise
+    except ssl.SSLError as exc:
+        raise SyncError(
+            f"Не удалось установить HTTPS с релеем ({exc.reason or exc}). "
+            "Релей обновлён до версии с HTTPS?"
+        ) from exc
+    except (OSError, socket.timeout, http.client.HTTPException) as exc:
+        raise SyncError(f"Не удалось связаться с релеем: {exc}") from exc
+
+    if code == 401:
+        raise SyncError("Релей не принял токен — проверьте, что скопирован целиком")
+    if code != 200:
+        raise SyncError(f"Релей ответил {code}")
+    try:
+        payload = json.loads(body.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise SyncError("Релей вернул не JSON — это точно адрес его панели?") from exc
+    if not isinstance(payload, dict):
+        raise SyncError("Релей вернул не JSON-объект")
 
     missing = [f for f in ("uuid", "port", "public_key", "sni") if not payload.get(f)]
     if missing:
         raise SyncError(f"В ответе релея нет полей: {', '.join(missing)}")
-    return payload
+    return payload, fingerprint
 
 
 def build_url(params: dict, fallback_host: str = "") -> str:
@@ -145,7 +248,7 @@ def wait_seconds(next_at: datetime | None, now: datetime | None = None) -> float
 def host_of(base_url: str) -> str:
     base = (base_url or "").strip()
     if "://" not in base:
-        base = "http://" + base
+        base = "https://" + base
     return urllib.parse.urlparse(base).hostname or ""
 
 
@@ -164,7 +267,10 @@ def sync_once(db) -> tuple[bool, str | None]:
 
     global next_rotation_at
     try:
-        params = fetch_params(server.cascade_sync_url, server.cascade_sync_token or "")
+        params, fingerprint = fetch_params(
+            server.cascade_sync_url, server.cascade_sync_token or "",
+            server.cascade_sync_cert_pin or "",
+        )
         new_url = build_url(params, fallback_host=host_of(server.cascade_sync_url))
     except SyncError as exc:
         server.cascade_sync_error = str(exc)
@@ -175,6 +281,7 @@ def sync_once(db) -> tuple[bool, str | None]:
     next_rotation_at = parse_next_rotation(params)
     changed = new_url != (server.cascade_vless_url or "")
     server.cascade_sync_error = None
+    server.cascade_sync_cert_pin = make_pin_record(fingerprint, server.cascade_sync_url)
     server.cascade_synced_at = datetime.now(timezone.utc)
     relay_build = params.get("version") if isinstance(params, dict) else None
     if isinstance(relay_build, dict):

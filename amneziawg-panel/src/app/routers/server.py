@@ -59,6 +59,10 @@ def update_server(
     changed = {f for f, v in updates.items() if getattr(server, f) != v}
     for field, value in updates.items():
         setattr(server, field, value)
+    # Повторное сохранение адреса релея - способ принять его новый
+    # сертификат: забываем отпечаток, при следующей синхронизации запомнится.
+    if "cascade_sync_url" in updates:
+        server.cascade_sync_cert_pin = None
     db.add(server)
     db.commit()
     db.refresh(server)

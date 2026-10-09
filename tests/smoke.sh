@@ -91,24 +91,40 @@ EOF
     fi
     pass "поднялся и сам сгенерировал ключи и пароль"
 
-    local pw auth
+    local pw jar
     pw="$(tr -d '[:space:]' < "$dir/data/INITIAL_ADMIN_PASSWORD.txt")"
-    auth="admin:$pw"
+    jar="$(mktemp)"
 
-    if ! wait_for 30 curl -fsS -u "$auth" "http://127.0.0.1:$RELAY_PANEL_PORT/api/status"; then
-        fail "панель не отвечает на /api/status"
+    if ! wait_for 30 curl -kfsS -o /dev/null "https://127.0.0.1:$RELAY_PANEL_PORT/login"; then
+        fail "страница релея не отвечает по HTTPS"
         return
     fi
-    pass "панель отвечает и требует авторизацию"
+    pass "страница релея отвечает по HTTPS"
 
-    if curl -fsS -o /dev/null "http://127.0.0.1:$RELAY_PANEL_PORT/api/status" 2>/dev/null; then
+    if curl -fsS -o /dev/null --max-time 5 "http://127.0.0.1:$RELAY_PANEL_PORT/login" 2>/dev/null; then
+        fail "страница релея отвечает и по голому HTTP"
+    else
+        pass "по HTTP страница релея не отдаётся"
+    fi
+
+    if curl -kfsS -o /dev/null -u "admin:$pw" "https://127.0.0.1:$RELAY_PANEL_PORT/api/status" 2>/dev/null; then
+        fail "релей принимает Basic-авторизацию"
+    else
+        pass "Basic-авторизация не принимается"
+    fi
+
+    curl -kfsS -o /dev/null -c "$jar" --data-urlencode "username=admin" --data-urlencode "password=$pw" \
+        "https://127.0.0.1:$RELAY_PANEL_PORT/login" \
+        && pass "вход через форму работает" || { fail "вход через форму не прошёл"; return; }
+
+    if curl -kfsS -o /dev/null "https://127.0.0.1:$RELAY_PANEL_PORT/api/status" 2>/dev/null; then
         fail "панель отдаёт статус БЕЗ авторизации"
     else
-        pass "без пароля панель не пускает"
+        pass "без входа панель не пускает"
     fi
 
     local status dest
-    status="$(curl -fsS -u "$auth" "http://127.0.0.1:$RELAY_PANEL_PORT/api/status")"
+    status="$(curl -kfsS -b "$jar" "https://127.0.0.1:$RELAY_PANEL_PORT/api/status")"
     dest="$(printf '%s' "$status" | python3 -c 'import json,sys; print(json.load(sys.stdin)["dest"])')"
 
     # Регрессия на #6356: этот дефолт молча ломает КАЖДОГО реального клиента.
@@ -194,37 +210,37 @@ EOF
     local pw token
     pw="$(grep -oE '[A-Za-z0-9_-]{12,}' "$dir/data/INITIAL_ADMIN_PASSWORD.txt" | head -1)"
 
-    if ! wait_for 45 curl -fsS -o /dev/null "http://127.0.0.1:$PANEL_PORT/"; then
+    if ! wait_for 45 curl -kfsS -o /dev/null "https://127.0.0.1:$PANEL_PORT/"; then
         fail "панель не отдаёт страницу входа"
         return
     fi
     pass "страница входа отдаётся"
 
-    token="$(curl -fsS -X POST "http://127.0.0.1:$PANEL_PORT/api/auth/login" \
+    token="$(curl -kfsS -X POST "https://127.0.0.1:$PANEL_PORT/api/auth/login" \
         -H 'Content-Type: application/json' \
         -d "{\"username\":\"admin\",\"password\":\"$pw\"}" \
         | python3 -c 'import json,sys; print(json.load(sys.stdin)["access_token"])' 2>/dev/null || true)"
     [ -n "$token" ] && pass "вход по сгенерированному паролю работает" \
                     || { fail "не удалось войти сгенерированным паролем"; return; }
 
-    curl -fsS -o /dev/null "http://127.0.0.1:$PANEL_PORT/api/server" 2>/dev/null \
+    curl -kfsS -o /dev/null "https://127.0.0.1:$PANEL_PORT/api/server" 2>/dev/null \
         && fail "API отдаёт настройки сервера БЕЗ токена" \
         || pass "без токена API закрыт"
 
     local server
-    server="$(curl -fsS -H "Authorization: Bearer $token" "http://127.0.0.1:$PANEL_PORT/api/server")"
+    server="$(curl -kfsS -H "Authorization: Bearer $token" "https://127.0.0.1:$PANEL_PORT/api/server")"
     printf '%s' "$server" | grep -q '"public_key": *"[A-Za-z0-9+/=]\{40,\}"' \
         && pass "ключи сервера сгенерированы" || fail "ключи сервера не сгенерированы"
     printf '%s' "$server" | grep -q '"address": *"10.77.0.1/24"' \
         && pass "настройки из окружения применились" || fail "настройки из окружения проигнорированы"
 
-    curl -fsS -o /dev/null -H "Authorization: Bearer $token" \
-        "http://127.0.0.1:$PANEL_PORT/api/status/traffic-history" \
+    curl -kfsS -o /dev/null -H "Authorization: Bearer $token" \
+        "https://127.0.0.1:$PANEL_PORT/api/status/traffic-history" \
         && pass "история трафика отдаётся" || fail "история трафика недоступна"
 
     # Сквозная проверка: создание клиента должно давать импортируемый конфиг.
     local peer
-    peer="$(curl -fsS -X POST "http://127.0.0.1:$PANEL_PORT/api/peers" \
+    peer="$(curl -kfsS -X POST "https://127.0.0.1:$PANEL_PORT/api/peers" \
         -H "Authorization: Bearer $token" -H 'Content-Type: application/json' \
         -d '{"name":"smoke-client"}' || true)"
     if printf '%s' "$peer" | grep -q '"config_text"'; then

@@ -324,16 +324,25 @@ docker compose pull -q 2>/dev/null || docker compose pull
 log "запускаю релей"
 docker compose up -d
 
+# Страница релея только по HTTPS (самоподписанный сертификат - отсюда -k) и
+# с входом через форму: Basic-авторизации больше нет.
+COOKIES="$(mktemp)"
+trap 'rm -f "$COOKIES"' EXIT
+relay_login() {
+    curl -kfsS -o /dev/null -c "$COOKIES" \
+        --data-urlencode "username=admin" --data-urlencode "password=$ADMIN_PASSWORD" \
+        "https://127.0.0.1:$PANEL_PORT/login" 2>/dev/null
+}
+
 log "жду, пока релей ответит"
 ADMIN_PASSWORD=""
 for _ in $(seq 1 60); do
     ADMIN_PASSWORD="$(docker exec "$CONTAINER" cat /data/INITIAL_ADMIN_PASSWORD.txt 2>/dev/null | tr -d '\r\n' || true)"
-    [ -n "$ADMIN_PASSWORD" ] && curl -fsS -o /dev/null -u "admin:$ADMIN_PASSWORD" \
-        "http://127.0.0.1:$PANEL_PORT/api/status" 2>/dev/null && break
+    [ -n "$ADMIN_PASSWORD" ] && relay_login && break
     sleep 1
 done
 [ -n "$ADMIN_PASSWORD" ] || die "релей не поднялся; смотрите: docker logs $CONTAINER --tail 50"
-curl -fsS -o /dev/null -u "admin:$ADMIN_PASSWORD" "http://127.0.0.1:$PANEL_PORT/api/status" 2>/dev/null \
+relay_login && curl -kfsS -o /dev/null -b "$COOKIES" "https://127.0.0.1:$PANEL_PORT/api/status" 2>/dev/null \
     || die "релей не отвечает на $PANEL_PORT; смотрите: docker logs $CONTAINER --tail 50"
 
 SYNC_TOKEN="$(docker exec "$CONTAINER" python3 -c \
@@ -362,7 +371,7 @@ fi
 
 echo
 printf '\033[1;32m=== Релей установлен ===\033[0m\n\n'
-printf '  Страница:  http://%s:%s\n' "${PUBLIC_HOST:-АДРЕС_СЕРВЕРА}" "$PANEL_PORT"
+printf '  Страница:  https://%s:%s  (сертификат самоподписанный - браузер предупредит)\n' "${PUBLIC_HOST:-АДРЕС_СЕРВЕРА}" "$PANEL_PORT"
 printf '  Логин:     admin\n'
 printf '  Пароль:    %s\n' "$ADMIN_PASSWORD"
 printf '  Каталог:   %s\n' "$INSTALL_DIR"
@@ -372,7 +381,7 @@ if [ -n "$SYNC_TOKEN" ]; then
     printf '  Токен синхронизации (его вводят в панели, блок «Каскад»):\n    %s\n\n' "$SYNC_TOKEN"
     printf '  Осталось связать узлы: вернитесь на сервер 1 (панель) и запустите\n'
     printf '  её установщик ещё раз, теперь с этими параметрами:\n'
-    printf '    ./install.sh --relay http://%s:%s --relay-token %s\n' \
+    printf '    ./install.sh --relay https://%s:%s --relay-token %s\n' \
         "${PUBLIC_HOST:-АДРЕС_ЭТОГО_СЕРВЕРА}" "$PANEL_PORT" "$SYNC_TOKEN"
 else
     warn "токен синхронизации не прочитался — он есть на странице релея"
@@ -381,10 +390,12 @@ echo
 printf '  Ссылки подключения и QR на странице нет намеренно: в ссылке лежит UUID,\n'
 printf '  то есть готовый доступ к релею. Если релей нужен как самостоятельный\n'
 printf '  эндпоинт, ссылку отдаёт API:\n'
-printf '    curl -s -u admin:ПАРОЛЬ http://127.0.0.1:%s/api/status | python3 -c '"'"'import json,sys; print(json.load(sys.stdin)["vless_url"])'"'"'\n' "$PANEL_PORT"
+printf '    c=$(mktemp); curl -sk -c "$c" -d username=admin --data-urlencode password=ПАРОЛЬ https://127.0.0.1:%s/login >/dev/null\n' "$PANEL_PORT"
+printf '    curl -sk -b "$c" https://127.0.0.1:%s/api/status | python3 -c '"'"'import json,sys; print(json.load(sys.stdin)["vless_url"])'"'"'\n' "$PANEL_PORT"
 echo
-printf '\033[1;33m  Страница релея открыта в интернет по HTTP без шифрования.\033[0m Закройте её\n'
-printf '  фаерволом — снаружи нужен только порт %s (VLESS).\n' "$VLESS_PORT"
+printf '  Страница релея работает по HTTPS с самоподписанным сертификатом. Порт %s\n' "$PANEL_PORT"
+printf '  нужен панели сервера 1 для синхронизации каскада - по возможности откройте\n'
+printf '  его фаерволом только для её адреса. Клиентам нужен лишь порт %s (VLESS).\n' "$VLESS_PORT"
 echo
 printf '  Обновления: noisefloor check / noisefloor update / noisefloor rollback на этом сервере.\n'
 echo

@@ -115,7 +115,7 @@ DEFAULT_TUNNELS = (
 
 
 def ensure_tunnels(db: Session) -> None:
-    """Создать выключенные записи дополнительных интерфейсов, если их нет.
+    """Создать записи дополнительных интерфейсов (включены по умолчанию), если их нет.
     Ключи и профиль обфускации генерируются сразу, чтобы включение в панели
     было одной галочкой."""
     existing = {t.protocol for t in db.query(Tunnel).all()}
@@ -127,7 +127,7 @@ def ensure_tunnels(db: Session) -> None:
         db.add(Tunnel(
             protocol=protocol,
             interface_name=iface,
-            enabled=False,
+            enabled=True,
             private_key=priv,
             public_key=pub,
             address=address,
