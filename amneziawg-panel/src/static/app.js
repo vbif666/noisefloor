@@ -1013,6 +1013,19 @@ $("peer-copy-btn").addEventListener("click", async () => {
   }
 });
 
+// Поддержка проекта: копирование адреса кошелька.
+document.querySelectorAll(".wallet-copy").forEach((btn) => {
+  btn.addEventListener("click", async () => {
+    const addr = btn.parentElement.querySelector(".wallet-addr").textContent.trim();
+    try {
+      await navigator.clipboard.writeText(addr);
+      showToast("Адрес скопирован");
+    } catch (_) {
+      showToast("Не удалось скопировать - выделите адрес вручную", true);
+    }
+  });
+});
+
 $("peer-download-btn").addEventListener("click", async () => {
   try {
     const res = await apiBlob(`/peers/${activePeerId}/config`);

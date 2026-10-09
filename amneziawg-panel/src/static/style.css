@@ -785,6 +785,31 @@ main {
   word-break: break-all;
 }
 
+/* Поддержать проект */
+.support-panel {
+  margin-top: 16px;
+}
+
+.wallet-list {
+  display: grid;
+  gap: 12px;
+}
+
+.wallet .key-display {
+  margin-top: 6px;
+}
+
+.wallet-addr {
+  flex: 1;
+  min-width: 0;
+  color: var(--text);
+  user-select: all;
+}
+
+.wallet-copy {
+  flex-shrink: 0;
+}
+
 /* ==========================================================================
    Модалки
    ========================================================================== */
