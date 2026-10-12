@@ -7,6 +7,7 @@ test_postup_and_postdown_are_symmetric закрывает класс дефек�
 """
 import contextlib
 import unittest
+from unittest import mock
 
 from app import awg_config, cascade
 
@@ -116,11 +117,22 @@ class PostUpDownTests(unittest.TestCase):
     def test_cascade_enabled_passes_mode_and_port(self):
         server = _Server()
         server.cascade_enabled = True
-        up = _hook("PostUp", awg_config.server_interface_block(server))
-        # По умолчанию tproxy: только он заворачивает ещё и UDP/QUIC/DNS,
-        # то есть делает то, что каскад обещает пользователю.
+        # По умолчанию (auto) на ядре 6.x — tproxy: только он заворачивает ещё
+        # и UDP/QUIC/DNS, то есть делает то, что каскад обещает пользователю.
+        with mock.patch.object(cascade.platform, "release", return_value="6.8.0-138-generic"):
+            up = _hook("PostUp", awg_config.server_interface_block(server))
         self.assertIn("--mode tproxy", up)
         self.assertIn(f"--cascade-port {cascade.REDIRECT_PORT}", up)
+
+    def test_auto_mode_on_old_kernel_falls_back_to_redirect(self):
+        """На 5.15 TPROXY для TCP не работает — auto обязан выбрать redirect
+        (и закрыть QUIC), иначе клиенты останутся без TCP вовсе."""
+        server = _Server()
+        server.cascade_enabled = True
+        with mock.patch.object(cascade.platform, "release", return_value="5.15.0-119-generic"):
+            up = _hook("PostUp", awg_config.server_interface_block(server))
+        self.assertIn("--mode redirect", up)
+        self.assertIn("--block-quic", up)
 
 
 class ServerConfigTests(unittest.TestCase):

@@ -54,8 +54,11 @@ ip route add local default dev lo table 100
 Со стороны xray вход должен принимать `tcp,udp` и иметь `sockopt.tproxy` —
 иначе он не увидит исходного адреса назначения.
 
-Режим переключается настройкой `cascade_intercept_mode`: `tproxy` (по
-умолчанию), `redirect` (запасной путь, только TCP) и `off`.
+Режим переключается настройкой `cascade_intercept_mode`: `auto` (по
+умолчанию — `tproxy` на ядре 6.x+, `redirect` на старом; решает
+`cascade.intercept_mode()` при каждом применении правил), `tproxy`,
+`redirect` (запасной путь, только TCP). Когда каскад выключен, в
+noisefloor-rules уходит `off`.
 
 ---
 

@@ -1,7 +1,10 @@
+import platform
+
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 
 from .. import cascade, cascade_sync, config_sync
+from ..config import settings
 from ..database import get_db
 from ..obfuscation import random_obfuscation_profile
 from ..schemas import ApplyResult, CascadeStatus, ServerRead, ServerUpdate
@@ -181,4 +184,8 @@ def cascade_status(db: Session = Depends(get_db), _admin: str = Depends(get_curr
         restarts=health.get("restarts", 0),
         uplink=stats.get("uplink", 0),
         downlink=stats.get("downlink", 0),
+        intercept_mode=cascade.intercept_mode(),
+        intercept_mode_setting=settings.cascade_intercept_mode,
+        kernel=platform.release(),
+        kernel_supports_tproxy=cascade.kernel_supports_tproxy(),
     )

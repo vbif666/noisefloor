@@ -103,7 +103,7 @@ def rules_commands(server: ServerConfig, interfaces: list[str]) -> tuple[list[st
     iface_args: list[str] = []
     for name in interfaces:
         iface_args += ["--iface", name]
-    mode = settings.cascade_intercept_mode if server.cascade_enabled else "off"
+    mode = cascade.intercept_mode() if server.cascade_enabled else "off"
     up = [
         RULES_SCRIPT, "up",
         *iface_args,

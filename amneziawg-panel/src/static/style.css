@@ -1228,6 +1228,7 @@ canvas.chart-canvas {
 .check-row.is-ok .check-mark { color: var(--good); }
 .check-row.is-bad { color: var(--danger-strong); }
 .check-row.is-wait .check-mark { color: var(--signal); }
+.check-row.is-warn { color: var(--signal-strong); }
 .check-row.is-todo, .check-row.is-off { color: var(--text-dim); }
 
 .check-detail {

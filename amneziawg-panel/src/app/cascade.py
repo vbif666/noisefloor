@@ -29,6 +29,7 @@ TCP), а DNS при желании заворачивают в каскад от
 from __future__ import annotations
 
 import json
+import platform
 import shutil
 import time
 import subprocess
@@ -141,14 +142,45 @@ def parse_vless_url(url: str) -> dict:
     }
 
 
+def kernel_supports_tproxy(release: str | None = None) -> bool:
+    """Тянет ли ядро TPROXY для TCP-слушателя xray.
+
+    На ядрах младше 6.0 xray не может выставить IP_TRANSPARENT на
+    TCP-слушателе, и xt_TPROXY молча дропает весь клиентский TCP. Контейнер
+    работает на ядре хоста, так что platform.release() — это ядро сервера.
+    Нераспознанную строку считаем новым ядром: сломанный tproxy панель
+    заметит сама (_tproxy_sockopt_error), а молча терять UDP хуже.
+    """
+    release = release if release is not None else platform.release()
+    try:
+        return int(release.split(".", 1)[0]) >= 6
+    except ValueError:
+        return True
+
+
+def intercept_mode() -> str:
+    """Режим перехвата, которым панель реально пользуется: tproxy или redirect.
+
+    CASCADE_INTERCEPT_MODE=auto (по умолчанию) выбирает по ядру: tproxy на
+    6.x+, redirect на старых. Явные tproxy/redirect не переопределяются.
+    Выбор по ядру, а не раз навсегда при установке, нужен, чтобы после
+    обновления ядра и перезагрузки UDP (звонки Telegram/WhatsApp, QUIC, DNS)
+    сам вернулся в каскад, без правки .env.
+    """
+    mode = (getattr(settings, "cascade_intercept_mode", "auto") or "auto").strip().lower()
+    if mode in ("tproxy", "redirect"):
+        return mode
+    return "tproxy" if kernel_supports_tproxy() else "redirect"
+
+
 def _tproxy_mode() -> bool:
     """Перехват идёт через TPROXY (а не через nat REDIRECT)?
 
     От этого зависит, как xray узнаёт исходный адрес назначения, и потому —
-    какой у входа cascade-in должен быть streamSettings. Настройка одна и та
-    же, что и у noisefloor-rules: CASCADE_INTERCEPT_MODE.
+    какой у входа cascade-in должен быть streamSettings. Режим один и тот
+    же, что передаётся noisefloor-rules: intercept_mode().
     """
-    return getattr(settings, "cascade_intercept_mode", "tproxy") != "redirect"
+    return intercept_mode() == "tproxy"
 
 
 def dns_via_cascade() -> bool:

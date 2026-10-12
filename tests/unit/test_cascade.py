@@ -139,6 +139,44 @@ class RedirectModeConfigTests(unittest.TestCase):
         self.assertIn("udp", inbound["settings"]["network"])
 
 
+class InterceptModeTests(unittest.TestCase):
+    """CASCADE_INTERCEPT_MODE=auto выбирает режим по ядру при каждом старте.
+
+    Закрывает случай 2026-10-12: на сервере с ядром 5.15 установщик записал
+    в .env redirect, и после обновления ядра до 6.8 каскад так и остался без
+    UDP — звонки Telegram выходили с российского адреса сервера и не
+    соединялись, пока .env не поправили руками."""
+
+    def _mode(self, setting, kernel):
+        with mock.patch.object(cascade.settings, "cascade_intercept_mode", setting), \
+                mock.patch.object(cascade.platform, "release", return_value=kernel):
+            return cascade.intercept_mode()
+
+    def test_auto_picks_tproxy_on_new_kernel(self):
+        self.assertEqual(self._mode("auto", "6.8.0-138-generic"), "tproxy")
+        self.assertEqual(self._mode("auto", "7.0.0-30-generic"), "tproxy")
+
+    def test_auto_picks_redirect_on_old_kernel(self):
+        self.assertEqual(self._mode("auto", "5.15.0-119-generic"), "redirect")
+        self.assertEqual(self._mode("auto", "4.19.0-21-amd64"), "redirect")
+
+    def test_explicit_mode_is_not_overridden(self):
+        self.assertEqual(self._mode("redirect", "6.8.0-138-generic"), "redirect")
+        self.assertEqual(self._mode("tproxy", "5.15.0-119-generic"), "tproxy")
+
+    def test_unknown_value_behaves_as_auto(self):
+        self.assertEqual(self._mode("", "5.15.0-119-generic"), "redirect")
+        self.assertEqual(self._mode("AUTO", "6.8.0"), "tproxy")
+
+    def test_unparsable_kernel_counts_as_new(self):
+        self.assertTrue(cascade.kernel_supports_tproxy("weird"))
+
+    def test_auto_drives_xray_inbound(self):
+        with mock.patch.object(cascade.settings, "cascade_intercept_mode", "auto"), \
+                mock.patch.object(cascade.platform, "release", return_value="5.15.0-119-generic"):
+            self.assertFalse(cascade._tproxy_mode())
+
+
 class TproxySockoptCheckTests(unittest.TestCase):
     """Если движок не смог включить IP_TRANSPARENT, ядро дропает весь TCP
     клиентов — а снаружи каскад выглядит здоровым. Панель обязана это

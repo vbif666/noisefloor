@@ -145,6 +145,13 @@ class CascadeStatus(BaseModel):
     relay_port: int | None = None
     relay_sni: str | None = None
     relay_label: str | None = None
+    # Как трафик клиентов заворачивается в каскад. В режиме redirect UDP
+    # (звонки Telegram/WhatsApp, QUIC, DNS) уходит мимо каскада с адресом
+    # этого сервера — панель показывает это предупреждением.
+    intercept_mode: Literal["tproxy", "redirect"] = "tproxy"
+    intercept_mode_setting: str = "auto"  # что стоит в CASCADE_INTERCEPT_MODE
+    kernel: str = ""
+    kernel_supports_tproxy: bool = True
 
 
 # --- Дополнительные протоколы (AWG 2.0, AWG 1.x, обычный WireGuard) ---

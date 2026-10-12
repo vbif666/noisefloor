@@ -1362,7 +1362,7 @@ function renderCascadeChecklist(c) {
   }
   const rows = [];
   const row = (state, text, detail = "") =>
-    rows.push(`<div class="check-row is-${state}"><span class="check-mark">${{ ok: "✓", bad: "✕", wait: "…", todo: "○" }[state]}</span><span>${text}${detail ? ` <span class="check-detail">${detail}</span>` : ""}</span></div>`);
+    rows.push(`<div class="check-row is-${state}"><span class="check-mark">${{ ok: "✓", bad: "✕", wait: "…", todo: "○", warn: "!" }[state]}</span><span>${text}${detail ? ` <span class="check-detail">${detail}</span>` : ""}</span></div>`);
 
   const hasRelay = !!(currentServer.cascade_sync_url && currentServer.cascade_sync_token);
   if (hasRelay) row("ok", "Релей указан", escapeHtml(currentServer.cascade_sync_url));
@@ -1386,6 +1386,15 @@ function renderCascadeChecklist(c) {
   else if (c.verified_ok === true) row("ok", "Трафик проходит через релей", c.verified_at ? `проверено ${timeAgo(new Date(c.verified_at))}` : "");
   else if (c.verified_ok === false) row("bad", "Трафик через релей не проходит", escapeHtml(c.verify_error || ""));
   else if (c.running) row("todo", "Трафик ещё не проверялся", "нажмите «Проверить связь сейчас»");
+
+  // В режиме redirect UDP уходит мимо каскада с адресом этого сервера:
+  // сайты открываются, а звонки Telegram/WhatsApp из РФ не соединяются.
+  if (c.intercept_mode === "redirect") {
+    const fix = c.kernel_supports_tproxy
+      ? "в .env стоит CASCADE_INTERCEPT_MODE=redirect — поставьте auto и пересоздайте контейнер: docker compose up -d"
+      : `ядро ${c.kernel} не тянет TPROXY — обновите до 6.x: apt install linux-generic-hwe-22.04 && reboot`;
+    row("warn", "UDP идёт мимо каскада: звонки Telegram/WhatsApp, QUIC и DNS выходят с адреса этого сервера", escapeHtml(fix));
+  }
 
   box.innerHTML = rows.join("");
 }

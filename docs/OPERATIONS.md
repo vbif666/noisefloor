@@ -208,8 +208,9 @@ apt install linux-generic-hwe-22.04 && reboot
 прежнее поведение можно одной переменной (только TCP, UDP пойдёт напрямую):
 
 ```bash
+sed -i '/^CASCADE_INTERCEPT_MODE=/d' /opt/noisefloor-panel/.env
 echo 'CASCADE_INTERCEPT_MODE=redirect' >> /opt/noisefloor-panel/.env
-cd /opt/noisefloor-panel && docker compose up -d
+cd /opt/noisefloor-panel && docker compose up -d   # именно up -d: restart берёт старое окружение
 # затем в панели: Сервер → Перезапустить интерфейс
 ```
 
@@ -218,6 +219,34 @@ iptables, но и конфиг движка. Вход каскада получ�
 режиме `tproxy`; если оставить этот флаг при перехвате через nat REDIRECT,
 xray примет соединение, определит «исходный» адрес назначения как самого себя
 и оборвёт его с `loopback connection detected` в логе.
+
+### Не работают звонки Telegram / WhatsApp, а сайты и сообщения — да
+
+Почти всегда это режим `redirect`: в каскад заворачивается только TCP, а медиа
+звонков идёт по UDP и выходит с адреса самого сервера. Если сервер в РФ,
+звонки режутся — сообщения (TCP) при этом ходят через релей нормально.
+Панель показывает это строкой «UDP идёт мимо каскада» в блоке «Каскад».
+
+```bash
+uname -r                                                  # 5.x — tproxy недоступен
+grep CASCADE_INTERCEPT_MODE /opt/noisefloor-panel/.env    # auto | tproxy | redirect
+docker exec NOISEFLOOR-amneziawg-panel iptables-save -t mangle | grep -c TPROXY   # 0 = redirect
+```
+
+Лечение — ядро 6.x и режим `auto` (или `tproxy`):
+
+```bash
+apt install linux-generic-hwe-22.04
+sed -i 's/^CASCADE_INTERCEPT_MODE=.*/CASCADE_INTERCEPT_MODE=auto/' /opt/noisefloor-panel/.env
+reboot
+# после загрузки — обязательно пересоздать контейнер, иначе останется старый .env:
+cd /opt/noisefloor-panel && docker compose up -d
+```
+
+Проверка: в mangle есть цепочка `NOISEFLOOR-TPROXY` с правилами `-p udp`, в
+`data/cascade-xray.log` нет `IP_TRANSPARENT`, а
+`conntrack -L -p udp | grep src=10.13.` не показывает прямых потоков клиентов
+наружу (UDP теперь уходит через xray внутри TCP-соединения к релею).
 
 ---
 

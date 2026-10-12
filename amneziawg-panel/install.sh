@@ -35,6 +35,7 @@ SERVER_ADDRESS="${SERVER_ADDRESS:-10.13.13.1/24}"
 DNS="${DNS:-1.1.1.1}"
 BACKUP_PASSPHRASE="${BACKUP_PASSPHRASE:-}"
 NO_BACKUP_PASSPHRASE=0
+UPGRADE_KERNEL=0
 FORCE=0
 SKIP_DOCKER=0
 
@@ -45,7 +46,8 @@ usage() {
   --public-host АДРЕС      IP или домен этого сервера (по умолчанию IPv4, при нескольких — спросит)
   --relay URL              адрес панели релея, например https://203.0.113.10:8001
   --relay-token ТОКЕН      токен синхронизации со страницы релея
-  --intercept-mode РЕЖИМ   tproxy | redirect (по умолчанию выбирается по ядру)
+  --intercept-mode РЕЖИМ   auto | tproxy | redirect (по умолчанию auto: по ядру при каждом старте)
+  --upgrade-kernel         на ядре старше 6.x поставить HWE-ядро (Ubuntu); нужна перезагрузка
   --interface ИМЯ          имя VPN-интерфейса (по умолчанию awg0)
   --listen-port ПОРТ       UDP-порт VPN (по умолчанию 443)
   --address CIDR           адрес сервера внутри туннеля (по умолчанию 10.13.13.1/24)
@@ -73,6 +75,7 @@ while [ $# -gt 0 ]; do
         --dns)                  DNS="$2"; shift 2 ;;
         --backup-passphrase)    BACKUP_PASSPHRASE="$2"; shift 2 ;;
         --no-backup-passphrase) NO_BACKUP_PASSPHRASE=1; shift ;;
+        --upgrade-kernel)       UPGRADE_KERNEL=1; shift ;;
         --dir)                  INSTALL_DIR="$2"; shift 2 ;;
         --force)                FORCE=1; shift ;;
         --skip-docker)          SKIP_DOCKER=1; shift ;;
@@ -191,22 +194,34 @@ fi
 #
 # На ядрах младше 6.0 xray не может выставить IP_TRANSPARENT на TCP-слушателе,
 # и TPROXY молча дропает весь клиентский TCP: DNS работает, сайты не
-# открываются. Поэтому на старом ядре по умолчанию берём redirect — он
-# заворачивает в каскад только TCP, зато работает.
-kernel_major="$(uname -r | cut -d. -f1)"
-if [ -z "$INTERCEPT_MODE" ]; then
-    if [ "${kernel_major:-0}" -ge 6 ] 2>/dev/null; then
-        INTERCEPT_MODE=tproxy
-    else
-        INTERCEPT_MODE=redirect
-        warn "ядро $(uname -r) не тянет TPROXY для TCP — режим каскада: redirect (UDP пойдёт мимо каскада)"
-        warn "полное покрытие вернёт обновление ядра: apt install linux-generic-hwe-22.04 && reboot"
-    fi
-fi
+# открываются. Поэтому на старом ядре панель (режим auto) берёт redirect — он
+# заворачивает в каскад только TCP. UDP тогда выходит с адреса этого сервера,
+# и звонки Telegram/WhatsApp из РФ не соединяются. Режим выбирается при
+# каждом старте панели, поэтому после обновления ядра и перезагрузки UDP сам
+# вернётся в каскад — .env править не нужно.
+INTERCEPT_MODE="${INTERCEPT_MODE:-auto}"
 case "$INTERCEPT_MODE" in
-    tproxy|redirect) : ;;
-    *) die "режим перехвата бывает только tproxy или redirect, а не '$INTERCEPT_MODE'" ;;
+    auto|tproxy|redirect) : ;;
+    *) die "режим перехвата бывает только auto, tproxy или redirect, а не '$INTERCEPT_MODE'" ;;
 esac
+kernel_major="$(uname -r | cut -d. -f1)"
+if ! [ "${kernel_major:-0}" -ge 6 ] 2>/dev/null; then
+    hwe_pkg=""
+    [ "${ID:-}" = ubuntu ] && [ -n "${VERSION_ID:-}" ] && hwe_pkg="linux-generic-hwe-${VERSION_ID}"
+    if [ "$UPGRADE_KERNEL" -eq 1 ] && [ -n "$hwe_pkg" ]; then
+        log "ставлю ядро 6.x ($hwe_pkg)"
+        DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "$hwe_pkg" >/dev/null \
+            || die "не удалось поставить $hwe_pkg"
+        KERNEL_REBOOT_NEEDED=1
+    elif [ "$UPGRADE_KERNEL" -eq 1 ]; then
+        warn "--upgrade-kernel умеет только Ubuntu — обновите ядро до 6.x вручную"
+    fi
+    if [ "$INTERCEPT_MODE" != redirect ] && [ -z "${KERNEL_REBOOT_NEEDED:-}" ]; then
+        warn "ядро $(uname -r) не тянет TPROXY для TCP — каскад пока в режиме redirect: UDP пойдёт мимо него"
+        warn "звонки Telegram/WhatsApp из РФ при этом не соединяются; лечится ядром 6.x: ${hwe_pkg:+apt install $hwe_pkg && }reboot (или ./install.sh --upgrade-kernel)"
+    fi
+    [ "$INTERCEPT_MODE" = tproxy ] && warn "на этом ядре режим tproxy уронит весь TCP клиентов — оставьте auto"
+fi
 
 # --- Публичный адрес --------------------------------------------------------
 #
@@ -362,7 +377,8 @@ DEFAULT_LISTEN_PORT=$LISTEN_PORT
 DEFAULT_DNS=$DNS
 
 # tproxy — TCP и UDP через каскад, требует ядро 6.x+;
-# redirect — только TCP, работает везде.
+# redirect — только TCP, работает везде (UDP и звонки — мимо каскада);
+# auto — tproxy на ядре 6.x+, иначе redirect; выбирается при каждом старте.
 CASCADE_INTERCEPT_MODE=$INTERCEPT_MODE
 
 ISOLATE_CLIENTS=true
@@ -483,6 +499,11 @@ printf '  Устройства: вкладка «Пиры» → «+ Добави
 printf '  Обновления: панель сама скажет, когда выйдет новая версия; кнопка «Обновить»\n'
 printf '  там же, либо на сервере: noisefloor check / noisefloor update / noisefloor rollback.\n'
 echo
+if [ -n "${KERNEL_REBOOT_NEEDED:-}" ]; then
+    printf '\033[1;33m  Поставлено ядро 6.x — перезагрузите сервер (reboot).\033[0m После этого панель\n'
+    printf '  сама переключит каскад на tproxy, и UDP (звонки, QUIC, DNS) пойдёт через релей.\n'
+    echo
+fi
 printf '\033[1;33m  Панель открыта в интернет по HTTP без шифрования.\033[0m Закройте её фаерволом\n'
 printf '  или обратным прокси с сертификатом — см. docs/DEPLOY.md, «Закройте панель от посторонних».\n'
 echo
