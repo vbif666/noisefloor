@@ -5,8 +5,9 @@
 ### Добавлено
 
 **fail2ban для SSH — отдельный сервис `fail2ban/`.** Образ
-`vbif666/noisefloor-fail2ban` (Debian trixie, fail2ban 1.1, понимает
-`sshd-session` из OpenSSH 9.8+), свой `docker-compose.yml` и установщик.
+`vbif666/noisefloor-fail2ban` (Debian bookworm, fail2ban 1.0.2 с фильтром,
+понимающим `sshd-session` из OpenSSH 9.8+), свой `docker-compose.yml` и
+установщик.
 Банит после 5 неудачных входов за 10 минут: час, повторно — вдвое дольше,
 до недели. Баны — в отдельной таблице nftables, правила Docker и панели не
 затрагиваются. Журнал берётся из `/var/log/auth.log` или из journald.

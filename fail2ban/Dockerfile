@@ -5,16 +5,18 @@
 # nftables (inet f2b-table) в сети хоста — правила Docker, панели и zapret
 # она не трогает.
 #
-# Версии закреплены явно, как в остальных образах проекта. trixie, а не
-# bookworm: fail2ban 1.1 понимает sshd-session — так подписывается sshd в
-# OpenSSH 9.8+ (Debian 13, Ubuntu 24.10+), и 1.0.x такие строки пропускает.
+# Версии закреплены явно, как в остальных образах проекта. bookworm, а не
+# trixie: таблицу кладёт в ядро nft из контейнера, а читает её потом nft
+# хоста. Таблица от nft 1.1 (trixie) роняет segfault-ом nft 1.0.2 из
+# Ubuntu 22.04 — и вместе с ним `nft list ruleset` и всё, что его зовёт
+# (zapret). От 1.0.6 из bookworm старый nft не падает.
 
-ARG DEBIAN_TAG=trixie-slim
+ARG DEBIAN_TAG=bookworm-slim
 
 FROM debian:${DEBIAN_TAG}
 
-ARG FAIL2BAN_VERSION=1.1.0-8
-ARG NFTABLES_VERSION=1.1.3-1
+ARG FAIL2BAN_VERSION=1.0.2-2
+ARG NFTABLES_VERSION=1.0.6-2+deb12u2
 ARG BUILD_VERSION=dev
 ARG BUILD_SHA=unknown
 ARG BUILD_DATE=unknown
@@ -32,6 +34,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 COPY jail.local /etc/fail2ban/jail.local
 COPY fail2ban.local /etc/fail2ban/fail2ban.local
+COPY sshd.local /etc/fail2ban/filter.d/sshd.local
 COPY entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh
 

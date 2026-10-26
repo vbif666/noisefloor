@@ -22,6 +22,9 @@ services:
       MAXRETRY: ${MAXRETRY:-5}
       IGNOREIP: ${IGNOREIP:-}
     volumes:
+      # auth.log пишется в местном времени без пояса — без часового пояса
+      # хоста fail2ban сдвигает все записи на разницу с UTC.
+      - /etc/localtime:/etc/localtime:ro
       - /var/log:/host/log:ro
       - /run/log/journal:/host/run/log/journal:ro
       - ./data:/var/lib/fail2ban

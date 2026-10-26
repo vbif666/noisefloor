@@ -1,0 +1,8 @@
+# OpenSSH 9.8+ (Debian 13, Ubuntu 24.10+) пишет в журнал от имени
+# sshd-session, а не sshd. fail2ban 1.0.2 знает только sshd — без этого
+# на новых системах он молча не видит ни одной попытки.
+[DEFAULT]
+_daemon = sshd(?:-session)?
+
+[Init]
+journalmatch = _SYSTEMD_UNIT=sshd.service + _SYSTEMD_UNIT=ssh.service + _COMM=sshd + _COMM=sshd-session

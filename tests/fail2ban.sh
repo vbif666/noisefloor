@@ -68,6 +68,7 @@ fail_lines 192.0.2.1 sshd 1   # чтобы файл не был пустым и 
 
 docker run -d --name "$NAME" --cap-add NET_ADMIN --cap-add NET_RAW \
     -e MAXRETRY=3 -e IGNOREIP="$FRIEND" \
+    -v /etc/localtime:/etc/localtime:ro \
     -v "$WORKDIR/log:/host/log:ro" -v "$WORKDIR/data:/var/lib/fail2ban" \
     "$F2B_IMAGE" >/dev/null
 
@@ -91,6 +92,23 @@ if in_nft "$ATTACKER"; then
 else
     fail "в nftables адреса нет"
     docker exec "$NAME" nft list ruleset | sed 's/^/    /'
+fi
+# Таблицу пишет nft контейнера, читать её будет nft хоста — и старые версии
+# на чужих таблицах падают (nft 1.0.2 из Ubuntu 22.04 на таблице от 1.1).
+if command -v nft >/dev/null && command -v nsenter >/dev/null; then
+    pid=$(docker inspect -f '{{.State.Pid}}' "$NAME")
+    if nsenter -t "$pid" -n nft list ruleset >/dev/null 2>&1; then
+        pass "nft хоста ($(nft --version | awk '{print $2}')) читает таблицу"
+    else
+        fail "nft хоста не читает таблицу fail2ban"
+    fi
+else
+    dim "  (nft или nsenter на хосте нет — совместимость с nft хоста не проверена)"
+fi
+if grep -q "timezone problem" <<<"$(docker logs "$NAME" 2>&1)"; then
+    fail "время записей разъехалось с часовым поясом"
+else
+    pass "время журнала совпадает с часовым поясом"
 fi
 if banned "$FRIEND"; then fail "$FRIEND из IGNOREIP забанен"; else pass "IGNOREIP не банится"; fi
 if banned "$VPN_CLIENT"; then fail "клиент VPN $VPN_CLIENT забанен"; else pass "сеть VPN не банится"; fi

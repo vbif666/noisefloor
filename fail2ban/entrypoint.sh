@@ -48,8 +48,8 @@ logpath = $source_path"
 else
     dir=$(journal_dirs | head -1)
     [ -n "$dir" ] || die "журнала systemd не видно ни в /host/log/journal, ни в /host/run/log/journal, и нет /host/log/auth.log"
-    # journalmatch берётся из sshd.conf 1.1: юнит ssh.service и процессы
-    # sshd и sshd-session.
+    # journalmatch — из filter.d/sshd.local: юниты ssh/sshd, процессы sshd
+    # и sshd-session.
     backend="backend = systemd[journalpath=$dir]"
     log "sshd: журнал systemd в $dir"
 fi
