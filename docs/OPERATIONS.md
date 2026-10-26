@@ -136,6 +136,33 @@ Docker-логи ограничены в `docker-compose.yml` (10 МБ × 3). Е�
 
 ---
 
+## fail2ban: перебор паролей SSH
+
+Отдельный контейнер `NOISEFLOOR-fail2ban` в `/opt/noisefloor-fail2ban`,
+ставится `fail2ban/install.sh`. Читает журнал sshd хоста (`/var/log/auth.log`,
+а где его нет — журнал systemd) и банит адрес после 5 неудачных входов за
+10 минут: на час, повторно — вдвое дольше, до недели. Баны лежат в своей
+таблице nftables `inet f2b-table` и правила Docker, панели и zapret не
+трогают. Сеть клиентов VPN (10.13.0.0/16) и адрес, с которого запускали
+установщик, не банятся никогда.
+
+```bash
+docker exec NOISEFLOOR-fail2ban fail2ban-client status sshd            # кто в бане
+docker exec NOISEFLOOR-fail2ban fail2ban-client set sshd unbanip АДРЕС # разбанить
+docker logs NOISEFLOOR-fail2ban --tail 50
+nft list table inet f2b-table                                           # сами правила
+```
+
+Настройки — `.env` рядом с `docker-compose.yml` (`SSH_PORT`, `MAXRETRY`,
+`FINDTIME`, `BANTIME`, `IGNOREIP`), после правки `docker compose up -d`.
+Обновление — `docker compose pull && docker compose up -d` в том же
+каталоге; `noisefloor update` этот сервис не обновляет.
+
+Заперли себя (вход по паролю с другого адреса): зайдите через консоль
+хостинга или через туннель VPN — его сеть в исключениях — и разбаньте адрес.
+
+---
+
 ## Диагностика каскада
 
 Каскад — самая сложная часть, и ломается он чаще остального.
@@ -570,6 +597,10 @@ rm /opt/noisefloor-panel/data/INITIAL_ADMIN_PASSWORD.txt
 поэтому раньше порт был виден снаружи: в логе это выглядело как поток
 `loopback connection detected` от сканеров. Использовать его как прокси и
 тогда было нельзя, но лишняя точка входа ни к чему.
+
+**SSH по паролю.** Перебор паролей закрывает fail2ban (раздел выше), если
+он установлен. Надёжнее вообще выключить вход по паролю
+(`PasswordAuthentication no` в sshd), когда есть вход по ключу.
 
 **Вход в панель блокируется по имени пользователя.** Пять неверных паролей
 для `admin` закрывают вход на пять минут — в том числе вам. Ограничение по IP

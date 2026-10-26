@@ -23,6 +23,7 @@ permissions:
 env:
   PANEL_IMAGE: vbif666/noisefloor-amneziawg-panel
   RELAY_IMAGE: vbif666/noisefloor-vless-reality
+  F2B_IMAGE: vbif666/noisefloor-fail2ban
   # Секреты в условиях шага напрямую не читаются — только через env.
   # Пока их нет в настройках репозитория, публикация просто пропускается,
   # а тесты и сборка всё равно идут.
@@ -80,6 +81,19 @@ jobs:
           cache-from: type=gha,scope=relay
           cache-to: type=gha,scope=relay,mode=max
 
+      - name: Сборка fail2ban
+        uses: docker/build-push-action@v6
+        with:
+          context: fail2ban
+          load: true
+          tags: ${{ env.F2B_IMAGE }}:ci
+          build-args: |
+            BUILD_VERSION=${{ steps.meta.outputs.version }}
+            BUILD_SHA=${{ steps.meta.outputs.sha }}
+            BUILD_DATE=${{ steps.meta.outputs.date }}
+          cache-from: type=gha,scope=fail2ban
+          cache-to: type=gha,scope=fail2ban,mode=max
+
       # Тесты гоняются в собранном образе: зависимости и бинарники в нём те
       # же, с которыми код поедет на сервер.
       - name: Юнит-тесты
@@ -110,6 +124,11 @@ jobs:
           sudo modprobe wireguard || true
           sudo -E env PATH="$PATH" PANEL_IMAGE="$PANEL_IMAGE:ci" bash tests/protocols.sh
 
+      # Перебор паролей SSH по поддельному auth.log → бан в nftables
+      # пространства имён контейнера (сеть раннера не трогается).
+      - name: fail2ban
+        run: sudo -E env PATH="$PATH" F2B_IMAGE="$F2B_IMAGE:ci" bash tests/fail2ban.sh
+
       - name: Вход в Docker Hub
         if: github.event_name == 'push' && env.DOCKERHUB_TOKEN != ''
         uses: docker/login-action@v3
@@ -124,7 +143,7 @@ jobs:
       - name: Публикация (master → latest + sha)
         if: github.event_name == 'push' && github.ref == 'refs/heads/master' && env.DOCKERHUB_TOKEN != ''
         run: |
-          for img in "$PANEL_IMAGE" "$RELAY_IMAGE"; do
+          for img in "$PANEL_IMAGE" "$RELAY_IMAGE" "$F2B_IMAGE"; do
             docker tag "$img:ci" "$img:latest"
             docker tag "$img:ci" "$img:sha-${{ steps.meta.outputs.sha }}"
             docker push -q "$img:latest"
@@ -134,7 +153,7 @@ jobs:
       - name: Публикация (тег → версия + stable)
         if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') && env.DOCKERHUB_TOKEN != ''
         run: |
-          for img in "$PANEL_IMAGE" "$RELAY_IMAGE"; do
+          for img in "$PANEL_IMAGE" "$RELAY_IMAGE" "$F2B_IMAGE"; do
             docker tag "$img:ci" "$img:${{ steps.meta.outputs.version }}"
             docker tag "$img:ci" "$img:stable"
             docker push -q "$img:${{ steps.meta.outputs.version }}"
@@ -150,7 +169,7 @@ jobs:
           [ -s /tmp/notes.md ] || echo "Версия ${{ steps.meta.outputs.version }}." > /tmp/notes.md
           {
             echo
-            echo "Образы: \`$PANEL_IMAGE:${{ steps.meta.outputs.version }}\`, \`$RELAY_IMAGE:${{ steps.meta.outputs.version }}\` (коммит ${{ steps.meta.outputs.sha }})."
+            echo "Образы: \`$PANEL_IMAGE:${{ steps.meta.outputs.version }}\`, \`$RELAY_IMAGE:${{ steps.meta.outputs.version }}\`, \`$F2B_IMAGE:${{ steps.meta.outputs.version }}\` (коммит ${{ steps.meta.outputs.sha }})."
             echo
             echo "Обновиться: кнопка «Обновить» в панели или \`noisefloor update\` на сервере."
           } >> /tmp/notes.md

@@ -240,6 +240,17 @@ bash install.sh --label "Амстердам"
 bash install.sh --relay http://АДРЕС_СЕРВЕРА_2:8001 --relay-token ТОКЕН
 ```
 
+**Любой из серверов — fail2ban.** Отдельный контейнер, банит адреса, которые
+перебирают пароли SSH (на открытом в интернет сервере это тысячи попыток в
+сутки). Ставится по желанию, панель и релей о нём не знают.
+
+```bash
+curl -fsSLO https://raw.githubusercontent.com/vbif666/noisefloor/master/fail2ban/install.sh
+bash install.sh
+```
+
+Подробности — в [`docs/OPERATIONS.md`](docs/OPERATIONS.md), раздел «fail2ban».
+
 Повторный запуск безопасен: он обновляет установку, а не сносит её. То же
 самое можно сделать мышью — в панели, вкладка «Сервер», блок «Каскад». Что и
 почему делает каждый шаг — в [`docs/DEPLOY.md`](docs/DEPLOY.md).
@@ -401,6 +412,8 @@ amneziawg-panel/          панель: FastAPI + SQLite + статика без
 vless-reality/            релей: FastAPI + xray, одно приложение в одном файле
   src/app.py
 
+fail2ban/                 fail2ban для SSH хоста: свой образ, compose, установщик
+
 tools/
   noisefloor              команда на хосте: status / check / update / rollback,
                           агент для кнопки «Обновить» (кладётся установщиком)
@@ -408,6 +421,7 @@ tools/
 tests/
   unit/                   131 тест, stdlib unittest, без зависимостей
   smoke.sh                приёмочный: поднимает оба сервиса с нуля
+  fail2ban.sh             перебор паролей по поддельному auth.log → бан в nftables
 
 .github/workflows/ci.yml  сборка по коммиту, публикация образов, релизы по тегу
 

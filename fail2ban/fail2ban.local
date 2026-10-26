@@ -1,0 +1,6 @@
+[Definition]
+# В docker logs, а не в файл внутри контейнера.
+logtarget = STDOUT
+# Повторным нарушителям бан растёт (bantime.increment) — для этого история
+# банов должна жить дольше суток по умолчанию.
+dbpurgeage = 30d

@@ -1,0 +1,27 @@
+services:
+  fail2ban:
+    image: vbif666/noisefloor-fail2ban:latest
+    container_name: NOISEFLOOR-fail2ban
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    # Баны ставятся в nftables хоста — нужна его сеть и NET_ADMIN.
+    network_mode: host
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+    # Значения берутся из .env рядом с этим файлом, если он есть.
+    environment:
+      SSH_PORT: ${SSH_PORT:-22}
+      SSH_LOG: ${SSH_LOG:-auto}
+      BANTIME: ${BANTIME:-1h}
+      FINDTIME: ${FINDTIME:-10m}
+      MAXRETRY: ${MAXRETRY:-5}
+      IGNOREIP: ${IGNOREIP:-}
+    volumes:
+      - /var/log:/host/log:ro
+      - /run/log/journal:/host/run/log/journal:ro
+      - ./data:/var/lib/fail2ban

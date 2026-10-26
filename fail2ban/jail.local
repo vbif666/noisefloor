@@ -1,0 +1,16 @@
+# Постоянная часть настроек. То, что меняется от сервера к серверу (порт SSH,
+# сроки, свои адреса в исключениях, откуда читать журнал), entrypoint.sh
+# дописывает в jail.d/50-noisefloor.local из переменных окружения.
+
+[DEFAULT]
+# Таблица inet f2b-table в nftables хоста, отдельно от правил Docker и панели.
+banaction = nftables-multiport
+banaction_allports = nftables-allports
+
+# Каждый следующий бан того же адреса вдвое длиннее, но не больше недели.
+bantime.increment = true
+bantime.maxtime = 1w
+
+[sshd]
+enabled = true
+mode = normal
