@@ -114,10 +114,10 @@ def rules_commands(server: ServerConfig, interfaces: list[str]) -> tuple[list[st
         up += ["--cascade-port", str(cascade.REDIRECT_PORT)]
         if cascade.dns_via_cascade():
             up += ["--cascade-dns-port", str(cascade.DNS_REDIRECT_PORT)]
-        # QUIC в режиме redirect не перехватывается вовсе, поэтому его
-        # либо режем, либо сознательно выпускаем мимо каскада с
-        # настоящим адресом сервера.
-        if mode == "redirect" and settings.cascade_block_quic:
+        # QUIC режем в обоих режимах: в redirect он ушёл бы мимо каскада
+        # с настоящим адресом сервера, в tproxy — поехал бы поверх
+        # TCP-туннеля до релея и тормозил бы страницы сильнее, чем TCP.
+        if settings.cascade_block_quic:
             up.append("--block-quic")
     if settings.isolate_clients:
         up.append("--isolate-clients")

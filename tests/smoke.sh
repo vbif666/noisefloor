@@ -271,13 +271,18 @@ test_rules() {
         set -e
         ip link add awg0 type dummy && ip addr add 10.13.13.1/24 dev awg0 && ip link set awg0 up
         for i in 1 2 3; do
-            noisefloor-rules up --iface awg0 --egress eth0 --cascade-port 12345 --mode tproxy >/dev/null
+            noisefloor-rules up --iface awg0 --egress eth0 --cascade-port 12345 --mode tproxy --block-quic >/dev/null
         done
         echo "fwd=$(iptables -S NOISEFLOOR-FWD | grep -c "^-A")"
         echo "fwd_jumps=$(iptables -S FORWARD | grep -c NOISEFLOOR-FWD)"
         echo "nat_jumps=$(iptables -t nat -S POSTROUTING | grep -c NOISEFLOOR-POST)"
         echo "tproxy_tcp=$(iptables -t mangle -S NOISEFLOOR-TPROXY | grep -c "p tcp -j TPROXY")"
         echo "tproxy_udp=$(iptables -t mangle -S NOISEFLOOR-TPROXY | grep -c "p udp -j TPROXY")"
+        # Закрытый QUIC обязан обойти TPROXY (стоять раньше перехвата UDP)
+        # и упереться в REJECT в FORWARD.
+        echo "quic_return=$(iptables -t mangle -S NOISEFLOOR-TPROXY | grep -n "dport 443 -j RETURN" | head -1 | cut -d: -f1)"
+        echo "udp_tproxy=$(iptables -t mangle -S NOISEFLOOR-TPROXY | grep -n "p udp -j TPROXY" | head -1 | cut -d: -f1)"
+        echo "tproxy_quic=$(iptables -S NOISEFLOOR-FWD | grep -c "dport 443 -j REJECT")"
         echo "iprules=$(ip rule list | grep -c "lookup 100")"
         noisefloor-rules down --iface awg0 --egress eth0 >/dev/null
         echo "left=$(iptables-save | grep -c NOISEFLOOR || true)"
@@ -299,8 +304,18 @@ test_rules() {
     fi
 
     check tproxy_tcp 1 && check tproxy_udp 1 \
-        && pass "перехват настроен и на TCP, и на UDP (QUIC и DNS в каскаде)" \
-        || fail "UDP не перехватывается — QUIC и DNS пойдут мимо каскада"
+        && pass "перехват настроен и на TCP, и на UDP (звонки и DNS в каскаде)" \
+        || fail "UDP не перехватывается — звонки и DNS пойдут мимо каскада"
+
+    local quic_return udp_tproxy
+    quic_return="$(printf '%s' "$out" | grep "^quic_return=" | cut -d= -f2)"
+    udp_tproxy="$(printf '%s' "$out" | grep "^udp_tproxy=" | cut -d= -f2)"
+    if [ -n "$quic_return" ] && [ -n "$udp_tproxy" ] && [ "$quic_return" -lt "$udp_tproxy" ] \
+        && check tproxy_quic 1; then
+        pass "в tproxy QUIC минует перехват и закрыт отказом — браузер сразу возьмёт TCP"
+    else
+        fail "в tproxy QUIC поедет через каскад поверх TCP и затормозит страницы"
+    fi
 
     if check left 0 && check left_iprules 0; then
         pass "down убирает правила и маршрут метки полностью"

@@ -24,7 +24,8 @@ vless-reality-docker), конфиг генерируется из ссылки v
 (CASCADE_BLOCK_QUIC, отказ по icmp-port-unreachable — браузер сразу берёт
 TCP), а DNS при желании заворачивают в каскад отдельным слушателем
 (CASCADE_DNS_VIA_CASCADE). Правильное решение всё равно одно — ядро 6.x+
-и режим tproxy.
+и режим tproxy. QUIC закрыт и там: через каскад он едет поверх TCP до
+релея и тормозит страницы сильнее, чем TCP (см. noisefloor-rules).
 """
 from __future__ import annotations
 

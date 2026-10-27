@@ -147,12 +147,21 @@ class ServerConfigTests(unittest.TestCase):
         with _setting("cascade_intercept_mode", "redirect"), _setting("cascade_block_quic", False):
             self.assertNotIn("--block-quic", _hook("PostUp", awg_config.server_interface_block(server)))
 
-    def test_quic_is_not_blocked_in_tproxy_mode(self):
-        # Там QUIC проходит через каскад, резать нечего.
+    def test_quic_is_blocked_in_tproxy_mode_too(self):
+        """В tproxy QUIC едет через каскад поверх TCP-туннеля до релея:
+        страницы грузились в 3-4 раза медленнее, чем по TCP, а иногда
+        вставали до таймаута. Отказ сразу переводит браузер на TCP."""
         server = _Server()
         server.cascade_enabled = True
         with _setting("cascade_intercept_mode", "tproxy"), _setting("cascade_block_quic", True):
+            self.assertIn("--block-quic", _hook("PostUp", awg_config.server_interface_block(server)))
+        with _setting("cascade_intercept_mode", "tproxy"), _setting("cascade_block_quic", False):
             self.assertNotIn("--block-quic", _hook("PostUp", awg_config.server_interface_block(server)))
+
+    def test_quic_is_not_blocked_without_cascade(self):
+        # Без каскада клиент и так выходит с адреса сервера — резать незачем.
+        with _setting("cascade_block_quic", True):
+            self.assertNotIn("--block-quic", _hook("PostUp", awg_config.server_interface_block(_Server())))
 
     def test_dns_port_passed_only_when_dns_goes_through_cascade(self):
         server = _Server()

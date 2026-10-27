@@ -67,6 +67,16 @@ class RulesScriptTests(unittest.TestCase):
         # DROP заставил бы браузер ждать таймаута, прежде чем взять TCP.
         self.assertRegex(self.up, r'--dport 443 \\\n\s+-j REJECT --reject-with icmp-port-unreachable')
 
+    def test_blocked_quic_bypasses_tproxy(self):
+        # TPROXY в mangle/PREROUTING срабатывает раньше FORWARD: без
+        # исключения закрытый QUIC всё равно уехал бы в каскад.
+        tproxy = self.up.split("tproxy)", 1)[1].split(";;", 1)[0]
+        self.assertIn('-p udp --dport 443 -j RETURN', tproxy)
+        self.assertLess(
+            tproxy.index("--dport 443 -j RETURN"), tproxy.index("-p udp \\\n"),
+            "исключение QUIC обязано стоять раньше правила перехвата UDP",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
