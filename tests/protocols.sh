@@ -176,7 +176,8 @@ online="$(api GET /peers | json 'sorted(p["protocol"] for p in d if p["online"])
 # контейнера, хост не затрагивается. Без модуля в ядре — пропускаем.
 if modinfo wireguard >/dev/null 2>&1; then
     cfg="$(api POST /peers -d '{"name":"proto-vanilla","protocol":"wg"}' | json 'd["config_text"]')"
-    addr="$(printf '%s\n' "$cfg" | sed -n 's/^Address = //p')"
+    # В Address может быть и IPv6-адрес, а ip addr add принимает только один.
+    addr="$(printf '%s\n' "$cfg" | sed -n 's/^Address = \([^,]*\).*/\1/p')"
     printf '%s\n' "$cfg" \
         | sed -e '/^Address = /d' -e '/^DNS = /d' -e '/^MTU = /d' \
               -e "s|^AllowedIPs = .*|AllowedIPs = 10.13.15.1/32|" \
