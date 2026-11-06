@@ -7,8 +7,10 @@
 без предела.
 """
 import os
+import sqlite3
 import tarfile
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -18,7 +20,8 @@ class BackupTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.data = Path(self.tmp.name)
-        (self.data / "awg_panel.db").write_text("база")
+        with sqlite3.connect(self.data / "awg_panel.db") as db:
+            db.execute("create table t (id integer primary key, value text)")
         (self.data / "secret_key").write_text("секрет")
         (self.data / "logs").mkdir()
         (self.data / "logs" / "xray.log").write_text("шум" * 1000)
@@ -43,6 +46,60 @@ class BackupTests(unittest.TestCase):
             names = tar.getnames()
         self.assertIn("awg_panel.db", names)
         self.assertIn("secret_key", names)
+
+    def restored(self, path):
+        restore = Path(self.tmp.name) / "restored"
+        with tarfile.open(path) as tar:
+            tar.extractall(restore, filter="data")
+        return restore
+
+    def test_restores_under_continuous_writes(self):
+        stop = threading.Event()
+
+        def writer():
+            db = sqlite3.connect(self.data / "awg_panel.db", timeout=30)
+            while not stop.is_set():
+                with db:
+                    db.executemany("insert into t (value) values (?)", [("x" * 500,)] * 50)
+                stop.wait(0.005)
+            db.close()
+
+        thread = threading.Thread(target=writer)
+        thread.start()
+        try:
+            paths = [self.backup.create() for _ in range(5)]
+        finally:
+            stop.set()
+            thread.join()
+        counts = []
+        for path in paths:
+            restore = self.restored(path)
+            db = sqlite3.connect(restore / "awg_panel.db")
+            self.assertEqual(db.execute("pragma integrity_check").fetchall(), [("ok",)])
+            counts.append(db.execute("select count(*) from t").fetchone()[0])
+            db.close()
+            self.assertEqual(counts[-1] % 50, 0, "снимок застал транзакцию на середине")
+            self.assertFalse(list(restore.glob("*.db-*")))
+        self.assertGreater(counts[-1], counts[0], "запись шла параллельно с копиями")
+
+    def test_broken_database_gives_error_and_no_archive(self):
+        with sqlite3.connect(self.data / "awg_panel.db") as db:
+            db.executemany("insert into t (value) values (?)", [("x" * 500,)] * 500)
+        with open(self.data / "awg_panel.db", "r+b") as raw:
+            raw.seek(4096 * 2)
+            raw.write(b"\xff" * 4096 * 3)
+        self.addCleanup(self.backup._status.update, last_error=None, last_success_at=None)
+        with self.assertRaises(self.backup.BackupError):
+            self.backup.create()
+        self.assertFalse(list((self.data / "backups").glob("noisefloor-*")))
+        self.assertIn("awg_panel.db", self.backup.status()["last_error"])
+
+    def test_error_clears_after_success(self):
+        self.backup._status["last_error"] = "старая"
+        self.addCleanup(self.backup._status.update, last_error=None, last_success_at=None)
+        self.backup.create()
+        self.assertIsNone(self.backup.status()["last_error"])
+        self.assertIsNotNone(self.backup.status()["last_success_at"])
 
     def test_logs_and_backups_are_excluded(self):
         path = self.backup.create()

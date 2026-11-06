@@ -869,7 +869,11 @@ async function loadBackups() {
   const el = $("backup-list");
   if (!el) return;
   try {
-    const items = await api("/backup");
+    const [items, backupState] = await Promise.all([api("/backup"), api("/backup/status")]);
+    if (backupState.last_error) {
+      $("backup-status").textContent = `Копия не создана: ${backupState.last_error}`;
+      $("backup-status").classList.add("is-error");
+    }
     if (items.length === 0) {
       el.textContent = "копий пока нет";
       return;

@@ -640,6 +640,16 @@ test_canary() {
     canary_stand canary 15 || return
     local diag='cat "$dir/data/canary/result.json"; docker logs smoke-canary 2>&1 | tail -5'
 
+    # Настоящая база работающей панели: снимок обязан проходить проверку.
+    local api="https://127.0.0.1:$CANARY_PANEL_PORT/api" backup
+    curl -kfsS -o /dev/null -X POST -H "Authorization: Bearer $CANARY_TOKEN" "$api/backup" || true
+    backup=$(curl -kfsS -H "Authorization: Bearer $CANARY_TOKEN" "$api/backup/status" || true)
+    if [[ "$backup" == *'"last_error":null'* && "$backup" != *'"last_success_at":null'* ]]; then
+        pass "снимок базы панели проходит integrity_check"
+    else
+        fail "бэкап панели: $backup"
+    fi
+
     # --- снесённое правило TPROXY ---
     docker exec "$c" touch /tmp/nf-fail
     docker exec "$c" sh -c 'iptables-save -t mangle | grep -e "-j TPROXY" | sed "s/^-A /-D /" \

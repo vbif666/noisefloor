@@ -4,7 +4,7 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.responses import FileResponse
 
 from .. import backup
-from ..schemas import BackupInfo
+from ..schemas import BackupInfo, BackupStatus
 from ..security import get_current_admin
 
 router = APIRouter()
@@ -13,6 +13,11 @@ router = APIRouter()
 @router.get("", response_model=list[BackupInfo])
 def list_backups(_admin: str = Depends(get_current_admin)):
     return backup.listing()
+
+
+@router.get("/status", response_model=BackupStatus)
+def backup_status(_admin: str = Depends(get_current_admin)):
+    return backup.status()
 
 
 @router.post("", response_model=BackupInfo, status_code=status.HTTP_201_CREATED)

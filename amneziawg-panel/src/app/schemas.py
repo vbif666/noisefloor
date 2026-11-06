@@ -337,6 +337,11 @@ class TrafficHistoryPoint(BaseModel):
 
 # --- Резервные копии ---
 
+class BackupStatus(BaseModel):
+    last_success_at: str | None
+    last_error: str | None
+
+
 class BackupInfo(BaseModel):
     name: str
     size: int
