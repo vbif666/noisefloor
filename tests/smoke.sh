@@ -19,6 +19,7 @@
 #   tests/smoke.sh --canary-only
 #   tests/smoke.sh --failover-only
 #   tests/smoke.sh --mtu-only
+#   tests/smoke.sh --ipv6-only
 #   tests/smoke.sh --split-only
 #   tests/smoke.sh --xudp-only
 #   tests/smoke.sh --rotation-only [секунд загрузки, по умолчанию 60]
@@ -606,7 +607,7 @@ STUB
         --cap-drop ALL --cap-add NET_ADMIN --device /dev/net/tun \
         -e CANARY_INTERVAL_SECONDS="$interval" -e CANARY_ENDPOINT_HOST=100.64.78.30 \
         -e CANARY_TRACE_URL=http://5.5.77.10/cdn-cgi/trace \
-        -e CANARY_DOWNLOAD_URL=http://5.5.77.10/1mb -e CANARY_DNS_SERVER=5.5.77.10 \
+        -e CANARY_DOWNLOAD_URL=http://5.5.77.10/1mb -e CANARY_DNS_SERVER=5.5.77.10 ${CANARY_ARGS:-} \
         -v "$dir/data/canary:/canary" --entrypoint python "$PANEL_IMAGE" -m app.canary_probe >/dev/null
 
     if wait_for 90 canary_status_has '"canary_ok":true'; then
@@ -1262,6 +1263,89 @@ test_xudp() {
     canary_cleanup
 }
 
+# Подключение с клиента к адресу IPv6: "<секунды> <исход>".
+v6_try() {
+    docker exec smoke-canary python -c '
+import socket, sys, time
+proto = sys.argv[1]
+sock = socket.socket(socket.AF_INET6, socket.SOCK_STREAM if proto == "tcp" else socket.SOCK_DGRAM)
+sock.settimeout(4)
+start = time.time()
+try:
+    sock.connect((sys.argv[2], 443))
+    if proto == "udp":
+        sock.send(b"x")
+        sock.recv(1)
+    result = "ok"
+except OSError as error:
+    result = type(error).__name__
+print(round(time.time() - start, 2), result)
+' "$1" "$2"
+}
+
+v6_refused() {
+    local got
+    got="$(v6_try tcp 2001:db8::1)"
+    [ "${got#* }" = ConnectionRefusedError ]
+}
+
+test_ipv6() {
+    echo
+    echo "IPv6 клиентов  ($PANEL_IMAGE)"
+    local v6="--sysctl net.ipv6.conf.all.disable_ipv6=0 --sysctl net.ipv6.conf.default.disable_ipv6=0"
+    local got ula c=smoke-canary-panel
+    CANARY_PANEL_ENV="$v6"
+    CANARY_ARGS="$v6"
+    canary_stand ipv6 5 || { CANARY_PANEL_ENV=; CANARY_ARGS=; return; }
+    CANARY_PANEL_ENV=
+    CANARY_ARGS=
+
+    [ "$(docker exec "$c" cat /proc/sys/net/ipv6/conf/all/forwarding)" = 0 ] \
+        && pass "глобальная пересылка IPv6 выключена" || fail "включена пересылка IPv6"
+    docker exec "$c" awg show awg0 allowed-ips | grep -q 'fd[0-9a-f:]*/128' \
+        && pass "у пира есть адрес ULA" || fail "у пира нет адреса ULA"
+
+    ula="$(docker exec smoke-canary python -c '
+import json, re
+print(re.search(r"fd[0-9a-f:]+/128", json.load(open("/canary/config.json"))["conf"]).group())')"
+    # Служебный пир идёт только по IPv4, обычный клиент получает и ::/0.
+    docker exec smoke-canary sh -c 'awg set canary0 peer "$(awg show canary0 peers)" allowed-ips 0.0.0.0/0,::/0'
+    docker exec smoke-canary ip -6 address add "$ula" dev canary0
+    docker exec smoke-canary ip -6 route add ::/0 dev canary0
+
+    # Отказ обязан дойти до клиента через туннель: иначе это не быстрый откат.
+    got="$(v6_try tcp 2001:db8::1)"
+    [ "${got#* }" = ConnectionRefusedError ] && [ "${got%%.*}" = 0 ] \
+        && pass "TCP по IPv6: сразу отказ ($got)" || fail "TCP по IPv6: $got"
+    got="$(v6_try udp 2001:db8::1)"
+    [ "${got#* }" = PermissionError ] && [ "${got%%.*}" -lt 2 ] \
+        && pass "UDP по IPv6: отказ без таймаута ($got)" || fail "UDP по IPv6: $got"
+
+    docker exec smoke-canary sh -c 'printf "5.5.77.10 dual.example\n2001:db8::10 dual.example\n" >> /etc/hosts'
+    docker exec smoke-canary-relay sh -c 'echo "5.5.77.10 dual.example" >> /etc/hosts'
+    got="$(docker exec smoke-canary curl -sS -m 5 -o /dev/null -w '%{http_code} %{time_total}' http://dual.example/ 2>&1 || true)"
+    [ "${got%% *}" = 200 ] && [ "${got#* }" \< 1 ] \
+        && pass "сайт с A и AAAA открывается без задержки ($got)" || fail "dual-stack: $got"
+
+    # Контроль: RST даёт именно наше правило. Без него отвечает маршрутизация
+    # панели, у стенда нет маршрута IPv6.
+    docker exec "$c" ip -6 rule del iif awg0 lookup 20231
+    got="$(v6_try tcp 2001:db8::1)"
+    [ "${got#* }" != ConnectionRefusedError ] && pass "контроль: без правила нет RST ($got)" \
+        || fail "контроль: RST и без правила"
+    wait_for 60 v6_refused && pass "надзор вернул снятое правило IPv6" \
+        || fail "надзор не вернул правило IPv6"
+
+    # Выключение настройки снимает всё, что ставили.
+    docker exec "$c" noisefloor-rules up --iface awg0 --egress eth0 --mode off >/dev/null
+    if docker exec "$c" sh -c 'ip6tables -S | grep -q NOISEFLOOR-V6 || ip -6 rule list | grep -q 20231'; then
+        fail "без флага остались правила IPv6"
+    else
+        pass "без флага правила IPv6 сняты"
+    fi
+    canary_cleanup
+}
+
 selfcheck_cleanup() {
     docker rm -f smoke-selfcheck smoke-agent-relay-1 >/dev/null 2>&1 || true
     docker image rm -f nf-smoke-agent-relay:broken nf-smoke-agent-relay:current \
@@ -1575,10 +1659,11 @@ case "${1:-}" in
     --failover-only) test_failover ;;
     --rotation-only) test_rotation "${2:-}" ;;
     --mtu-only) test_mtu ;;
+    --ipv6-only) test_ipv6 ;;
     --split-only) test_split ;;
     --xudp-only) test_xudp ;;
     --selfcheck-only) test_selfcheck ;;
-    "")           test_relay; test_panel; test_rules; test_rules_supervision; test_install; test_canary; test_failover; test_rotation; test_mtu; test_split; test_xudp; test_selfcheck ;;
+    "")           test_relay; test_panel; test_rules; test_rules_supervision; test_install; test_canary; test_failover; test_rotation; test_mtu; test_split; test_xudp; test_ipv6; test_selfcheck ;;
     *) echo "неизвестный аргумент: $1" >&2; exit 2 ;;
 esac
 

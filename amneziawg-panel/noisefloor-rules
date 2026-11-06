@@ -22,7 +22,8 @@
 # интерфейсов туннеля — AmneziaWG 2.0, 1.x и обычного WireGuard):
 #   noisefloor-rules up --iface awg0 [--iface awg-v1 ...] --egress eth0 \
 #       [--cascade-port 12345] [--cascade-dns-port 12353] \
-#       [--mode tproxy|redirect|off] [--isolate-clients] [--block-quic]
+#       [--mode tproxy|redirect|off] [--isolate-clients] [--block-quic] \
+#       [--ipv6-reject]
 #   noisefloor-rules down --iface awg0 [--iface ...] --egress eth0
 #   noisefloor-rules check <те же аргументы, что у up>
 #
@@ -48,6 +49,7 @@ CASCADE_DNS_PORT=""
 MODE="off"
 ISOLATE="no"
 BLOCK_QUIC="no"
+IPV6_REJECT="no"
 
 # Метка и таблица маршрутизации только наши. С меткой 1 и таблицей 100 легко
 # столкнуться с чужим TPROXY на том же хосте, а down вдобавок чистил таблицу
@@ -70,6 +72,9 @@ NAT_POST_CHAIN="NOISEFLOOR-POST"
 NAT_PRE_CHAIN="NOISEFLOOR-PRE"
 MANGLE_PRE_CHAIN="NOISEFLOOR-TPROXY"
 IN_CHAIN="NOISEFLOOR-IN"
+V6_CHAIN="NOISEFLOOR-V6"
+# Раньше таблицы main (32766).
+V6_RULE_PRIORITY=1000
 
 # Адреса, которые никогда не заворачиваем в каскад: сам туннель, локалхост,
 # служебные диапазоны. Иначе клиент не достучится ни до соседа по туннелю,
@@ -79,7 +84,15 @@ LOCAL_NETS="127.0.0.0/8 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 169.254.0.0/16 2
 log() { echo "[rules] $*"; }
 die() { echo "[rules] ОШИБКА: $*" >&2; exit 1; }
 
-ipt() { iptables -w 5 "$@"; }
+# filter6 - таблица filter для IPv6: файл рендера свой, команда ip6tables.
+ipt() {
+    if [ "${2:-}" = filter6 ]; then
+        shift 2
+        ip6tables -w 5 -t filter "$@"
+    else
+        iptables -w 5 "$@"
+    fi
+}
 
 # Правила сначала складываются в файлы по таблицам, а в ядро идут только
 # целиком. WORK создаётся в main.
@@ -145,12 +158,18 @@ finalize_table() {
 # таблицы не трогаются, эта остаётся в прежнем состоянии.
 restore_table() {
     [ -s "$WORK/$1" ] || return 0
+    _restore=iptables-restore
+    _table_header="$1"
+    if [ "$1" = filter6 ]; then
+        _restore=ip6tables-restore
+        _table_header=filter
+    fi
     {
-        printf '*%s\n' "$1"
+        printf '*%s\n' "$_table_header"
         cat "$WORK/$1"
         printf 'COMMIT\n'
     } > "$WORK/payload"
-    if ! _err="$(iptables-restore -w 5 --noflush < "$WORK/payload" 2>&1)"; then
+    if ! _err="$("$_restore" -w 5 --noflush < "$WORK/payload" 2>&1)"; then
         case "$_err" in
             *TPROXY*) die "таблица $1: ядро не приняло TPROXY (нет модуля xt_TPROXY?), клиенты не попадут в каскад: $_err" ;;
             *)        die "таблица $1 не применена: $_err" ;;
@@ -160,7 +179,8 @@ restore_table() {
 
 # Отпечаток считается по рендеру ДО finalize_table: тот зависит от ядра.
 signature() {
-    cat "$WORK/filter" "$WORK/nat" "$WORK/mangle" "$WORK/jumps" "$WORK/retired" 2>/dev/null | cksum
+    cat "$WORK/filter" "$WORK/nat" "$WORK/mangle" "$WORK/filter6" "$WORK/jumps" "$WORK/retired" \
+        2>/dev/null | cksum
 }
 
 parse_args() {
@@ -173,6 +193,7 @@ parse_args() {
             --mode)          MODE="$2"; shift 2 ;;
             --isolate-clients) ISOLATE="yes"; shift ;;
             --block-quic)    BLOCK_QUIC="yes"; shift ;;
+            --ipv6-reject)   IPV6_REJECT="yes"; shift ;;
             *) die "неизвестный аргумент: $1" ;;
         esac
     done
@@ -323,6 +344,27 @@ render_rules() {
     else
         retire_chain filter INPUT "$IN_CHAIN"
     fi
+
+    # --- быстрый отказ клиентскому IPv6 ---
+    # Клиент получает IPv6-адрес, чтобы приложение пробовало IPv6 и сразу
+    # откатывалось на IPv4, а не ждало таймаута. Пересылать этот трафик некуда.
+    #
+    # Отказ стоит в INPUT, а не в FORWARD: FORWARD требует all.forwarding=1, а
+    # это отключает приём RA, и VPS на SLAAC теряет собственный IPv6. Вместо
+    # этого пакеты с туннеля считаются местными (см. setup_v6_routing).
+    #
+    # TCP получает RST: ICMP ядро ограничивает примерно одним ответом в секунду
+    # на клиента (net.ipv6.icmp.ratelimit), и каждое соединение ждало бы секунду.
+    if [ "$IPV6_REJECT" = "yes" ]; then
+        ensure_chain filter6 "$V6_CHAIN"
+        for IFACE in $IFACES; do
+            rule filter6 -A "$V6_CHAIN" -i "$IFACE" -p tcp -j REJECT --reject-with tcp-reset
+            rule filter6 -A "$V6_CHAIN" -i "$IFACE" -j REJECT --reject-with icmp6-adm-prohibited
+        done
+        ensure_jump filter6 INPUT "$V6_CHAIN"
+    else
+        retire_chain filter6 INPUT "$V6_CHAIN"
+    fi
 }
 
 # --------------------------------------------------------------------- up ---
@@ -347,6 +389,17 @@ cmd_up() {
         finalize_table "$_table"
         restore_table "$_table"
     done
+
+    # Отказ ставится раньше маршрута, снимается позже: иначе клиенты на
+    # мгновение достали бы до служб хоста на IPv6.
+    if [ "$IPV6_REJECT" != "yes" ]; then
+        teardown_v6_routing
+    fi
+    finalize_table filter6
+    restore_table filter6
+    if [ "$IPV6_REJECT" = "yes" ]; then
+        setup_v6_routing
+    fi
 
     if [ "$MODE" != "tproxy" ]; then
         teardown_tproxy_routing
@@ -378,7 +431,7 @@ cmd_check() {
     fi
 
     _drift=""
-    for _table in filter nat mangle; do
+    for _table in filter nat mangle filter6; do
         [ -f "$WORK/$_table" ] || continue
         for _chain in $(sed -n 's/^:\([^ ]*\) .*/\1/p' "$WORK/$_table"); do
             _want="$(grep -c "^-A $_chain " "$WORK/$_table" || true)"
@@ -400,6 +453,17 @@ cmd_check() {
         ip route show table "$RT_TABLE" 2>/dev/null | grep -q "^local default" \
             || _drift="$_drift ip-route"
     fi
+    if [ "$IPV6_REJECT" = "yes" ]; then
+        _have=" $(v6_rule_ifaces | tr '\n' ' ') "
+        for IFACE in $IFACES; do
+            case "$_have" in
+                *" $IFACE "*) ;;
+                *) _drift="$_drift ip6-rule:$IFACE" ;;
+            esac
+        done
+        ip -6 route show table "$RT_TABLE" 2>/dev/null | grep -q "^local default" \
+            || _drift="$_drift ip6-route"
+    fi
 
     if [ -n "$_drift" ]; then
         log "правила расходятся с ожидаемыми:$_drift"
@@ -416,6 +480,42 @@ setup_tproxy_routing() {
     ip route show table "$RT_TABLE" 2>/dev/null | grep -q "^local default" \
         || ip route add local default dev lo table "$RT_TABLE" \
         || die "не удалось добавить маршрут в таблицу $RT_TABLE"
+}
+
+# Интерфейсы, для которых стоит наше правило IPv6. В выводе ip после имени может
+# идти [detached], если интерфейса ещё нет.
+v6_rule_ifaces() {
+    ip -6 rule list 2>/dev/null | sed -n "s/.*iif \([^ ]*\).*lookup $RT_TABLE.*/\1/p"
+}
+
+# Весь IPv6 с туннеля считается местным и доходит до отказа в INPUT. Таблица
+# RT_TABLE у IPv4 и IPv6 отдельная, с TPROXY маршрут не пересекается.
+setup_v6_routing() {
+    ip -6 route show table "$RT_TABLE" 2>/dev/null | grep -q "^local default" \
+        || ip -6 route add local ::/0 dev lo table "$RT_TABLE" \
+        || die "не удалось добавить маршрут IPv6 в таблицу $RT_TABLE"
+    _have=" $(v6_rule_ifaces | tr '\n' ' ') "
+    for IFACE in $IFACES; do
+        case "$_have" in
+            *" $IFACE "*) ;;
+            *) ip -6 rule add iif "$IFACE" lookup "$RT_TABLE" priority "$V6_RULE_PRIORITY" \
+                || die "не удалось добавить ip -6 rule для $IFACE" ;;
+        esac
+    done
+    # Интерфейс, которого больше нет в списке (выключили протокол).
+    for _old in $_have; do
+        case " $IFACES " in
+            *" $_old "*) ;;
+            *) ip -6 rule del iif "$_old" lookup "$RT_TABLE" 2>/dev/null || true ;;
+        esac
+    done
+}
+
+teardown_v6_routing() {
+    for _old in $(v6_rule_ifaces); do
+        ip -6 rule del iif "$_old" lookup "$RT_TABLE" 2>/dev/null || true
+    done
+    ip -6 route del local ::/0 dev lo table "$RT_TABLE" 2>/dev/null || true
 }
 
 # Только своё правило и свой маршрут. "ip route flush table" здесь нельзя: он
@@ -439,6 +539,8 @@ teardown_legacy_routing() {
 # ------------------------------------------------------------------- down ---
 
 cmd_down() {
+    teardown_v6_routing
+    drop_chain filter6 INPUT "$V6_CHAIN"
     drop_chain filter FORWARD "$FWD_CHAIN"
     drop_chain filter INPUT "$IN_CHAIN"
     drop_chain nat POSTROUTING "$NAT_POST_CHAIN"

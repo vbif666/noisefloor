@@ -6,7 +6,10 @@ test_postup_and_postdown_are_symmetric закрывает класс дефек�
 добавленное в PostUp, обязано иметь парное удаление в PostDown.
 """
 import contextlib
+import ipaddress
+import tempfile
 import unittest
+from pathlib import Path
 from unittest import mock
 
 from app import awg_config, cascade
@@ -213,6 +216,101 @@ class MtuTests(unittest.TestCase):
         server = self.server(mtu=1280)
         self.assertIn("MTU = 1280", awg_config.server_interface_block(server))
         self.assertIn("MTU = 1280", awg_config.client_config(_Peer(), server))
+
+
+class Ipv6Tests(unittest.TestCase):
+    def ready(self):
+        patcher = mock.patch.object(awg_config, "ipv6_ready", return_value=True)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_address_pairs_with_ipv4(self):
+        self.ready()
+        address = awg_config.with_ipv6("10.13.13.1/24", _Server())
+        ipv4, ipv6 = address.split(", ")
+        self.assertEqual(ipv4, "10.13.13.1/24")
+        interface = ipaddress.IPv6Interface(ipv6)
+        self.assertEqual(interface.network.prefixlen, 120)
+        self.assertEqual(int(interface.ip) & 0xffffffff, int(ipaddress.IPv4Address("10.13.13.1")))
+        self.assertTrue(str(interface.ip).startswith("fd"))
+        self.assertTrue(awg_config.with_ipv6("10.13.13.2/32", _Server()).endswith("/128"))
+
+    def test_client_and_server_share_prefix(self):
+        self.ready()
+        server = ipaddress.IPv6Interface(awg_config.with_ipv6("10.13.13.1/24", _Server()).split(", ")[1])
+        client = ipaddress.IPv6Interface(awg_config.with_ipv6("10.13.13.2/32", _Server()).split(", ")[1])
+        self.assertIn(client.ip, server.network)
+
+    def test_prefix_depends_only_on_server_key(self):
+        other = _Server()
+        other.private_key = "OTHER_KEY="
+        self.assertEqual(awg_config.ula_prefix(_Server()), awg_config.ula_prefix(_Server()))
+        self.assertNotEqual(awg_config.ula_prefix(_Server()), awg_config.ula_prefix(other))
+
+    def test_in_all_configs(self):
+        self.ready()
+        peer = _Peer()
+        server = _Server()
+        self.assertRegex(awg_config.server_interface_block(server), r"Address = 10\.13\.13\.1/24, fd.*/120")
+        self.assertRegex(awg_config.server_peer_block(peer, server), r"AllowedIPs = \S+, fd.*/128")
+        client = awg_config.client_config(peer, server)
+        self.assertRegex(client, r"Address = \S+, fd.*/128")
+        self.assertIn("::/0", client)
+        self.assertIn("--ipv6-reject", awg_config.server_interface_block(server))
+
+    def test_not_ready_keeps_config(self):
+        with mock.patch.object(awg_config, "ipv6_ready", return_value=False):
+            block = awg_config.server_interface_block(_Server())
+            client = awg_config.client_config(_Peer(), _Server())
+        self.assertNotIn("fd", block.split("Address = ")[1].split("\n")[0])
+        self.assertNotIn("--ipv6-reject", block)
+        self.assertNotIn(", fd", client)
+
+    def test_bad_address_is_left_alone(self):
+        self.ready()
+        self.assertEqual(awg_config.with_ipv6("not-an-ip", _Server()), "not-an-ip")
+
+
+class Ipv6ReadyTests(unittest.TestCase):
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.proc = Path(tmp.name)
+        for scope in ("all", "default"):
+            (self.proc / scope).mkdir()
+            (self.proc / scope / "disable_ipv6").write_text("0\n")
+        for target, name, value in (
+            (awg_config, "_PROC_IPV6", self.proc),
+            (awg_config.shutil, "which", lambda name: "/usr/sbin/ip6tables"),
+            (awg_config.settings, "client_ipv6_reject", True),
+        ):
+            patcher = mock.patch.object(target, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def test_ready(self):
+        self.assertTrue(awg_config.ipv6_ready(_Server()))
+
+    def test_setting_turns_it_off(self):
+        with mock.patch.object(awg_config.settings, "client_ipv6_reject", False):
+            self.assertFalse(awg_config.ipv6_ready(_Server()))
+
+    def test_disabled_on_host(self):
+        (self.proc / "default" / "disable_ipv6").write_text("1\n")
+        self.assertFalse(awg_config.ipv6_ready(_Server()))
+
+    def test_ipv6_module_absent(self):
+        (self.proc / "all" / "disable_ipv6").unlink()
+        self.assertFalse(awg_config.ipv6_ready(_Server()))
+
+    def test_no_ip6tables(self):
+        with mock.patch.object(awg_config.shutil, "which", lambda name: None):
+            self.assertFalse(awg_config.ipv6_ready(_Server()))
+
+    def test_mtu_below_ipv6_minimum(self):
+        server = _Server()
+        server.mtu = 1279
+        self.assertFalse(awg_config.ipv6_ready(server))
 
 
 class ClientConfigTests(unittest.TestCase):

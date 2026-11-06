@@ -90,6 +90,9 @@ class Settings(BaseSettings):
     # TCP остаётся без mux и совместим с Vision. Выключено, пока не проверено на
     # настоящей сети.
     cascade_xudp: bool = False
+    # Адрес ULA клиентам и быстрый отказ их IPv6 на сервере. Нужно, чтобы
+    # приложения не ждали таймаута IPv6. Без IPv6 на хосте не применяется.
+    client_ipv6_reject: bool = True
     # Адрес проб через каскад: кнопка «Проверить» и выбор живого релея. Ответ
     # должен быть 204.
     cascade_probe_url: str = "https://www.gstatic.com/generate_204"

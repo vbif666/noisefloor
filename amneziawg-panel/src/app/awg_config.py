@@ -10,6 +10,11 @@ ServerConfig, а не из собственных полей Peer.
 """
 from __future__ import annotations
 
+import hashlib
+import ipaddress
+import shutil
+from pathlib import Path
+
 from . import cascade
 from .config import settings
 from .models import PROTOCOL_AWG1, PROTOCOL_AWG2, PROTOCOL_AWG20, Peer, ServerConfig, Tunnel
@@ -45,6 +50,46 @@ def profile_mtu(s4: int | None) -> int:
 def effective_mtu(server) -> int:
     """Явный MTU или рассчитанный из профиля основного интерфейса."""
     return server.mtu or profile_mtu(getattr(server, "s4", None))
+
+
+_PROC_IPV6 = Path("/proc/sys/net/ipv6/conf")
+_IPV6_MIN_MTU = 1280
+
+
+def ipv6_ready(server) -> bool:
+    """Можно ли выдавать адреса ULA. Если нет, конфиги остаются только с IPv4:
+    awg-quick снимает интерфейс, когда адрес IPv6 не добавляется."""
+    if not settings.client_ipv6_reject or effective_mtu(server) < _IPV6_MIN_MTU:
+        return False
+    if shutil.which("ip6tables") is None:
+        return False
+    try:
+        return all(
+            (_PROC_IPV6 / scope / "disable_ipv6").read_text().strip() == "0"
+            for scope in ("all", "default")
+        )
+    except OSError:
+        return False
+
+
+def ula_prefix(server) -> int:
+    """Префикс fdXX:XXXX:XXXX::/64. Выводится из ключа сервера, поэтому один раз
+    и без миграции БД. Сменился ключ - клиенты всё равно получают новые конфиги."""
+    digest = hashlib.sha256(b"noisefloor-ula:" + server.private_key.encode()).digest()
+    return int.from_bytes(b"\xfd" + digest[:5] + bytes(10), "big")
+
+
+def with_ipv6(address: str, server) -> str:
+    """IPv4-адрес с парным ULA: младшие 32 бита равны IPv4, а длина префикса
+    повторяет его. 10.13.13.1/24 -> fdXX::a0d:d01/120, клиентский /32 -> /128."""
+    if not ipv6_ready(server):
+        return address
+    try:
+        interface = ipaddress.IPv4Interface(address)
+    except ValueError:
+        return address
+    pair = ipaddress.IPv6Address(ula_prefix(server) | int(interface.ip))
+    return f"{address}, {pair}/{96 + interface.network.prefixlen}"
 
 
 def _obfuscation_lines(obj) -> list[str]:
@@ -146,6 +191,8 @@ def rules_commands(server: ServerConfig, interfaces: list[str]) -> tuple[list[st
             up.append("--block-quic")
     if settings.isolate_clients:
         up.append("--isolate-clients")
+    if ipv6_ready(server):
+        up.append("--ipv6-reject")
     down = [
         RULES_SCRIPT, "down",
         *iface_args,
@@ -158,7 +205,7 @@ def server_interface_block(server: ServerConfig, extra_interfaces: list[str] | t
     lines = [
         "[Interface]",
         f"PrivateKey = {server.private_key}",
-        f"Address = {server.address}",
+        f"Address = {with_ipv6(server.address, server)}",
         f"ListenPort = {server.listen_port}",
         f"MTU = {effective_mtu(server)}",
     ]
@@ -183,13 +230,13 @@ def server_interface_block(server: ServerConfig, extra_interfaces: list[str] | t
     return "\n".join(lines)
 
 
-def server_peer_block(peer: Peer) -> str:
+def server_peer_block(peer: Peer, server: ServerConfig) -> str:
     lines = [
         "[Peer]",
         f"# {peer.name}",
         f"PublicKey = {peer.public_key}",
         f"PresharedKey = {peer.preshared_key}",
-        f"AllowedIPs = {peer.address}",
+        f"AllowedIPs = {with_ipv6(peer.address, server)}",
     ]
     return "\n".join(lines)
 
@@ -203,7 +250,7 @@ def full_server_config(
     blocks = [server_interface_block(server, extra_interfaces)]
     for peer in peers:
         if peer.enabled and _peer_protocol(peer) == PROTOCOL_AWG2:
-            blocks.append(server_peer_block(peer))
+            blocks.append(server_peer_block(peer, server))
     return "\n\n".join(blocks) + "\n"
 
 
@@ -215,7 +262,7 @@ def tunnel_config(tunnel: Tunnel, server: ServerConfig, peers: list[Peer]) -> st
     lines = [
         "[Interface]",
         f"PrivateKey = {tunnel.private_key}",
-        f"Address = {tunnel.address}",
+        f"Address = {with_ipv6(tunnel.address, server)}",
         f"ListenPort = {tunnel.listen_port}",
     ]
     if server.mtu:
@@ -224,7 +271,7 @@ def tunnel_config(tunnel: Tunnel, server: ServerConfig, peers: list[Peer]) -> st
     blocks = ["\n".join(lines)]
     for peer in peers:
         if peer.enabled and _peer_protocol(peer) == tunnel.protocol:
-            blocks.append(server_peer_block(peer))
+            blocks.append(server_peer_block(peer, server))
     return "\n\n".join(blocks) + "\n"
 
 
@@ -236,7 +283,7 @@ def client_config(peer: Peer, server: ServerConfig, tunnel: Tunnel | None = None
     lines = [
         "[Interface]",
         f"PrivateKey = {peer.private_key}",
-        f"Address = {peer.address}",
+        f"Address = {with_ipv6(peer.address, server)}",
     ]
     # Явный MTU (тот же, что на сервере) вместо автоопределения клиентом:
     # без него часть клиентов сама угадывает MTU по своему аплинку и на

@@ -107,6 +107,30 @@ if __name__ == "__main__":
     unittest.main()
 
 
+class Ipv6RejectTests(unittest.TestCase):
+    def setUp(self):
+        self.text = SCRIPT.read_text(encoding="utf-8")
+        self.up = self.text.split("cmd_up() {", 1)[1].split("# ---", 1)[0]
+
+    def test_no_global_forwarding(self):
+        # all.forwarding=1 отключает приём RA, и хост теряет свой IPv6 на SLAAC.
+        self.assertNotIn("forwarding", self.up)
+        self.assertNotRegex(self.text, r"ip6tables.*FORWARD|filter6 FORWARD")
+
+    def test_reject_is_set_before_route_and_removed_after(self):
+        self.assertLess(self.up.index("restore_table filter6"), self.up.index("setup_v6_routing"))
+        self.assertLess(self.up.index("teardown_v6_routing"), self.up.index("restore_table filter6"))
+
+    def test_chain_is_retired_without_flag(self):
+        self.assertIn('retire_chain filter6 INPUT "$V6_CHAIN"', self.text)
+
+    def test_drift_is_checked(self):
+        check = self.text.split("cmd_check() {", 1)[1].split("# ---", 1)[0]
+        self.assertIn("filter nat mangle filter6", check)
+        self.assertIn("ip6-rule", check)
+        self.assertIn("ip6-route", check)
+
+
 class MultipleInterfacesTests(unittest.TestCase):
     """Один вызов ставит правила для всех протоколов (awg0, awg-v1,
     wg-plain). Цепочки общие и очищаются перед заполнением, поэтому
