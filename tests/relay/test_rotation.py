@@ -395,5 +395,45 @@ class PortProvisioningTests(unittest.TestCase):
             self.assertEqual(app.provision()["vless_port"], 443)
 
 
+class TailAccessLogTests(unittest.TestCase):
+    """Обрезка лога ротацией не должна останавливать учёт подключений."""
+    LINE = "2026/11/06 10:00:00 from 198.51.100.7:443 accepted tcp:example.com:443 [vless-in >> direct]\n"
+
+    def _wait_for_count(self, count):
+        deadline = time.time() + 5
+        while time.time() < deadline:
+            with app.state_lock:
+                if app.state["connect_count"] >= count:
+                    return True
+            time.sleep(0.05)
+        return False
+
+    def test_keeps_reading_after_truncation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            log = Path(tmp) / "access.log"
+            log.write_text("старые строки\n" * 50, encoding="utf-8")
+            stop = threading.Event()
+            with app.state_lock:
+                app.state["connect_count"] = 0
+            with mock.patch.object(app, "ACCESS_LOG", log):
+                thread = threading.Thread(target=app.tail_access_log, args=(stop,), daemon=True)
+                thread.start()
+                try:
+                    time.sleep(0.2)
+                    with log.open("a") as f:
+                        f.write(self.LINE)
+                    self.assertTrue(self._wait_for_count(1), "обычная строка не прочитана")
+
+                    with log.open("w"):
+                        pass
+                    time.sleep(1.2)
+                    with log.open("a") as f:
+                        f.write(self.LINE)
+                    self.assertTrue(self._wait_for_count(2), "после обрезки лог перестал читаться")
+                finally:
+                    stop.set()
+                    thread.join(timeout=3)
+
+
 if __name__ == "__main__":
     unittest.main()

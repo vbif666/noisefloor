@@ -15,6 +15,7 @@
 #   tests/smoke.sh --relay-only
 #   tests/smoke.sh --panel-only
 #   tests/smoke.sh --rules-only
+#   tests/smoke.sh --install-only
 #   RELAY_IMAGE=... PANEL_IMAGE=... tests/smoke.sh
 #
 # Работает на bridge-сети с портами из диапазона 291xx, поэтому безопасен
@@ -399,6 +400,49 @@ STUB
         || fail "перехват не встал, а клиенты всё равно выходят напрямую"
 }
 
+# --------------------------------------------------------------- установка ----
+
+# Логику swap проверяем без настоящего swapon: ядро здесь общее с хостом.
+test_install() {
+    echo
+    echo "Установщик"
+    local root
+    root="$(cd "$(dirname "$0")/.." && pwd)"
+
+    grep -q 'oom_score_adj: -500' "$root/amneziawg-panel/docker-compose.yml" \
+        && [ "$(grep -c 'oom_score_adj: -500' "$root/amneziawg-panel/install.sh")" = 1 ] \
+        && pass "панель защищена от OOM в обоих compose" \
+        || fail "нет oom_score_adj в compose панели"
+
+    local fn out
+    fn="$WORKDIR/swap.sh"
+    {
+        echo 'NO_SWAP=0; SWAP_FILE=/tmp/swapfile; FSTAB=/tmp/fstab'
+        echo 'log() { :; }; warn() { echo "WARN $*"; }'
+        sed -n '/^swap_size_mb() {/,/^ensure_swap$/p' "$root/amneziawg-panel/install.sh" | sed '$d'
+    } > "$fn"
+
+    out="$(bash -c ". '$fn'; swap_size_mb 1000000 0 20000; swap_size_mb 2097152 0 4000; \
+        swap_size_mb 2097152 0 1000; swap_size_mb 2097153 0 20000; swap_size_mb 1000000 1024 20000" | tr '\n' ' ')"
+    [ "$out" = "2048 1024 0 0 0 " ] \
+        && pass "размер swap выбирается по памяти, swap и месту на диске" \
+        || fail "swap_size_mb вернул: $out"
+
+    out="$(docker run --rm -v "$fn:/swap.sh:ro" --entrypoint bash "$PANEL_IMAGE" -c '
+        mkdir -p /tmp/bin; printf "#!/bin/sh\nexit 0\n" > /tmp/bin/swapon; chmod +x /tmp/bin/swapon
+        export PATH=/tmp/bin:$PATH
+        . /swap.sh
+        swap_size_mb() { echo 16; }
+        ensure_swap </dev/null
+        ensure_swap </dev/null
+        echo "mode=$(stat -c %a /tmp/swapfile) fstab=$(grep -c swapfile /tmp/fstab)"
+        rm -f /tmp/swapfile; NO_SWAP=1; ensure_swap; echo "skipped=$([ -e /tmp/swapfile ] && echo no || echo yes)"
+    ' 2>&1 | tail -2 | tr '\n' ' ')"
+    [ "$out" = "mode=600 fstab=1 skipped=yes " ] \
+        && pass "swap-файл с правами 600, в fstab один раз, --no-swap уважается" \
+        || fail "ensure_swap: $out"
+}
+
 # ------------------------------------------- надзор за правилами, вживую ----
 
 # Настоящая панель с живым управлением: свой netns, свой awg-интерфейс на
@@ -524,9 +568,10 @@ dim "рабочий каталог: $WORKDIR"
 
 case "${1:-}" in
     --relay-only) test_relay ;;
-    --panel-only) test_panel; test_rules; test_rules_supervision ;;
+    --panel-only) test_panel; test_rules; test_rules_supervision; test_install ;;
     --rules-only) test_rules; test_rules_supervision ;;
-    "")           test_relay; test_panel; test_rules; test_rules_supervision ;;
+    --install-only) test_install ;;
+    "")           test_relay; test_panel; test_rules; test_rules_supervision; test_install ;;
     *) echo "неизвестный аргумент: $1" >&2; exit 2 ;;
 esac
 

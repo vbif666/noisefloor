@@ -1031,13 +1031,23 @@ IP_RE = re.compile(r"(\d{1,3}(?:\.\d{1,3}){3}|\[[0-9a-fA-F:]+\]):\d+ accepted")
 
 def tail_access_log(stop_event: threading.Event):
     ACCESS_LOG.touch(exist_ok=True)
-    with ACCESS_LOG.open("r") as f:
+    # Двоичный режим: нужен tell() как настоящая позиция в байтах.
+    with ACCESS_LOG.open("rb") as f:
         f.seek(0, io.SEEK_END)
         while not stop_event.is_set():
-            line = f.readline()
-            if not line:
+            raw = f.readline()
+            if not raw:
+                # rotate_access_log обрезает файл на месте. Позиция остаётся
+                # за его концом, и без этой проверки новые строки не читаются.
+                try:
+                    if ACCESS_LOG.stat().st_size < f.tell():
+                        f.seek(0)
+                        continue
+                except OSError:
+                    pass
                 time.sleep(1)
                 continue
+            line = raw.decode("utf-8", "replace")
             m = IP_RE.search(line)
             if m and "vless-in" in line:
                 with state_lock:

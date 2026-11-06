@@ -38,6 +38,9 @@ NO_BACKUP_PASSPHRASE=0
 UPGRADE_KERNEL=0
 FORCE=0
 SKIP_DOCKER=0
+NO_SWAP=0
+SWAP_FILE="${SWAP_FILE:-/swapfile}"
+FSTAB="${FSTAB:-/etc/fstab}"
 
 usage() {
     cat <<'EOF'
@@ -57,6 +60,7 @@ usage() {
   --dir ПУТЬ               каталог установки (по умолчанию /opt/noisefloor-panel)
   --force                  перезаписать существующий .env
   --skip-docker            не устанавливать Docker, считать что он есть
+  --no-swap                не создавать swap-файл на сервере с памятью до 2 ГБ
   -h, --help               эта справка
 
 Каскад можно включить и потом — в панели, вкладка «Сервер».
@@ -79,6 +83,7 @@ while [ $# -gt 0 ]; do
         --dir)                  INSTALL_DIR="$2"; shift 2 ;;
         --force)                FORCE=1; shift ;;
         --skip-docker)          SKIP_DOCKER=1; shift ;;
+        --no-swap)              NO_SWAP=1; shift ;;
         -h|--help)              usage; exit 0 ;;
         *) echo "Неизвестный аргумент: $1" >&2; usage >&2; exit 2 ;;
     esac
@@ -97,6 +102,68 @@ if [ -r /etc/os-release ]; then
         *) warn "система ${PRETTY_NAME:-неизвестная} не проверялась — ставим как на Debian/Ubuntu" ;;
     esac
 fi
+
+# --- Swap -------------------------------------------------------------------
+#
+# Панель, xray и amneziawg-go на сервере с 1 ГБ памяти живут впритык: без swap
+# любой всплеск заканчивается OOM killer, а с ним падает туннель.
+
+# swap_size_mb ПАМЯТЬ_КБ SWAP_КБ СВОБОДНО_НА_ДИСКЕ_МБ: размер файла или 0.
+swap_size_mb() {
+    [ "$1" -le 2097152 ] || { echo 0; return; }
+    [ "$2" -eq 0 ] || { echo 0; return; }
+    if [ "$3" -ge 6144 ]; then
+        echo 2048
+    elif [ "$3" -ge 3072 ]; then
+        echo 1024
+    else
+        echo 0
+    fi
+}
+
+ensure_swap() {
+    [ "$NO_SWAP" -eq 0 ] || return 0
+    [ ! -e "$SWAP_FILE" ] || return 0
+
+    local mem_kb swap_kb free_mb size_mb
+    mem_kb="$(awk '/^MemTotal:/ {print $2}' /proc/meminfo)"
+    swap_kb="$(awk '/^SwapTotal:/ {print $2}' /proc/meminfo)"
+    free_mb="$(df -Pm "$(dirname "$SWAP_FILE")" | awk 'NR==2 {print $4}')"
+    size_mb="$(swap_size_mb "${mem_kb:-0}" "${swap_kb:-0}" "${free_mb:-0}")"
+    if [ "$size_mb" -eq 0 ]; then
+        if [ "${mem_kb:-0}" -le 2097152 ] && [ "${swap_kb:-0}" -eq 0 ]; then
+            warn "памяти мало, swap нет, а места на диске под него не хватает ($free_mb МБ)"
+        fi
+        return 0
+    fi
+
+    # Без терминала (cloud-init) вопрос задать некому, отказ - через --no-swap.
+    if { : </dev/tty; } 2>/dev/null; then
+        printf 'Памяти %s МБ и нет swap. Создать %s на %s МБ? [Y/n] ' \
+            "$((mem_kb / 1024))" "$SWAP_FILE" "$size_mb" >/dev/tty
+        local answer=""
+        read -r -t 60 answer </dev/tty || true
+        case "$answer" in
+            n|N|no|нет) log "swap не создаю"; return 0 ;;
+        esac
+    fi
+
+    log "создаю $SWAP_FILE на $size_mb МБ"
+    # Сбой swap не повод бросать установку: в OpenVZ и LXC он просто недоступен.
+    if ! { fallocate -l "${size_mb}M" "$SWAP_FILE" 2>/dev/null \
+            || dd if=/dev/zero of="$SWAP_FILE" bs=1M count="$size_mb" status=none; } \
+        || ! chmod 600 "$SWAP_FILE" \
+        || ! mkswap "$SWAP_FILE" >/dev/null \
+        || ! swapon "$SWAP_FILE" 2>/dev/null; then
+        rm -f "$SWAP_FILE"
+        warn "swap создать не удалось, продолжаю без него"
+        return 0
+    fi
+    grep -qF "$SWAP_FILE " "$FSTAB" 2>/dev/null \
+        || printf '%s none swap sw 0 0\n' "$SWAP_FILE" >> "$FSTAB"
+}
+
+ensure_swap
 
 # --- Docker -----------------------------------------------------------------
 
@@ -326,6 +393,7 @@ services:
     image: $IMAGE
     container_name: $CONTAINER
     restart: unless-stopped
+    oom_score_adj: -500
     # Без лимита json-лог растёт бесконечно: панель пишет строку на каждый
     # запрос дашборда, а дашборд опрашивает сервер каждые несколько секунд.
     logging:

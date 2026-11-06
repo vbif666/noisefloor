@@ -3,6 +3,9 @@ services:
     image: vbif666/noisefloor-amneziawg-panel:latest
     container_name: NOISEFLOOR-amneziawg-panel
     restart: unless-stopped
+    # На маленьком сервере под нехваткой памяти ядро должно выбирать не панель:
+    # с ней уходят туннель и все клиенты.
+    oom_score_adj: -500
     # Без лимита json-лог растёт бесконечно: панель пишет строку на каждый
     # запрос дашборда, а дашборд опрашивает сервер каждые несколько секунд.
     logging:
