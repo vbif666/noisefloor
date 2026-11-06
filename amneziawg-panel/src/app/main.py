@@ -6,7 +6,7 @@ from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 
-from . import awg_supervisor, backup, bootstrap, canary, cascade, cascade_sync, config_sync, self_update, traffic_history
+from . import awg_supervisor, backup, bootstrap, canary, cascade, cascade_sync, config_sync, relays, self_update, traffic_history
 from .config import settings
 from .database import Base, SessionLocal, engine, run_migrations
 from .models import ServerConfig, Tunnel
@@ -48,6 +48,9 @@ async def lifespan(app: FastAPI):
     db = SessionLocal()
     try:
         bootstrap.run(db)
+        # Перенос релея из server_config в список. После отката на старую
+        # версию и обратно столбцы могли измениться: тут они и подхватываются.
+        relays.pull_primary(db, config_sync.get_server(db))
         if settings.auto_apply_on_start:
             # Docker-шаблон: поднимаем awg0 сразу при старте, без ручного
             # клика "Apply" в UI. best-effort — если утилит awg нет в PATH
@@ -61,9 +64,12 @@ async def lifespan(app: FastAPI):
     finally:
         db.close()
     threading.Thread(target=traffic_history.run, args=(_traffic_history_stop,), daemon=True).start()
-    # Надзор за каскадом: перезапускает упавший xray и регулярно проверяет
-    # реальной пробой, что через каскад вообще идёт трафик.
+    # Надзор за каскадом: регулярно проверяет реальной пробой, что через каскад
+    # вообще идёт трафик.
     threading.Thread(target=cascade.supervise, args=(_cascade_supervisor_stop,), daemon=True).start()
+    # Сторож процесса xray: упавший поднимается за секунды, а не к следующей
+    # проверке.
+    threading.Thread(target=cascade.watch, args=(_cascade_supervisor_stop,), daemon=True).start()
     # Надзор за самим туннелем: если amneziawg-go убит (OOM, 2026-09-20) и
     # awg0 исчез — поднимает его заново. Без этого панель жива, VPN мёртв,
     # и HEALTHCHECK этого не видит.

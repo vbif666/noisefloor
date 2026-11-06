@@ -123,7 +123,7 @@ def apply_current_config(db: Session, *, restart: bool = False,
     # Если настроена синхронизация, сначала забираем у релея актуальные
     # параметры — иначе применим заведомо устаревшую ссылку. Это сетевой
     # запрос, поэтому до замка: недоступный релей не должен держать всю панель.
-    if server.cascade_enabled and (server.cascade_sync_url or "").strip():
+    if server.cascade_enabled:
         from . import cascade_sync
         cascade_sync.sync_once(db)
 

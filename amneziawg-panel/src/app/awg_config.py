@@ -103,14 +103,15 @@ def rules_commands(server: ServerConfig, interfaces: list[str]) -> tuple[list[st
     iface_args: list[str] = []
     for name in interfaces:
         iface_args += ["--iface", name]
-    mode = cascade.intercept_mode() if server.cascade_enabled else "off"
+    intercept = server.cascade_enabled and not cascade.intercept_suspended(server)
+    mode = cascade.intercept_mode() if intercept else "off"
     up = [
         RULES_SCRIPT, "up",
         *iface_args,
         "--egress", server.egress_interface,
         "--mode", mode,
     ]
-    if server.cascade_enabled:
+    if intercept:
         up += ["--cascade-port", str(cascade.REDIRECT_PORT)]
         if cascade.dns_via_cascade():
             up += ["--cascade-dns-port", str(cascade.DNS_REDIRECT_PORT)]

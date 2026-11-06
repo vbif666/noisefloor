@@ -22,6 +22,10 @@ class _Server:
     cascade_vless_url = ""
     cascade_sync_url = ""
     cascade_sync_token = ""
+    cascade_sync_error = None
+    cascade_synced_at = None
+    cascade_relay_version = None
+    cascade_sync_cert_pin = ""
     jc = 5
     s1, s2, s3, s4 = 20, 30, 40, 12
     header_protection_key = "HPK="
@@ -35,6 +39,7 @@ class _Tunnel:
 
 def _save(server=None, **changes):
     server = server or _Server()
+    server.relays = []
     with mock.patch.object(server_router.config_sync, "get_server", return_value=server), \
          mock.patch.object(server_router.config_sync, "get_tunnels",
                            return_value=[_Tunnel("awg1", 51821), _Tunnel("wg", 51822)]), \

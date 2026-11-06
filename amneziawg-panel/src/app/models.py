@@ -1,6 +1,7 @@
 from datetime import datetime, timezone
 
-from sqlalchemy import Boolean, Column, DateTime, Integer, String, Text
+from sqlalchemy import Boolean, Column, DateTime, ForeignKey, Integer, String, Text
+from sqlalchemy.orm import relationship
 
 from .database import Base
 
@@ -16,6 +17,24 @@ class AdminUser(Base):
     username = Column(String(64), unique=True, nullable=False, index=True)
     password_hash = Column(String(128), nullable=False)
     created_at = Column(DateTime, default=_utcnow)
+
+
+class CascadeRelay(Base):
+    """Релей каскада. position 0 - основной, он же повторён в столбцах
+    server_config (см. app/relays.py), остальные - резервные."""
+
+    __tablename__ = "cascade_relays"
+
+    id = Column(Integer, primary_key=True, index=True)
+    server_id = Column(Integer, ForeignKey("server_config.id"), nullable=False, index=True)
+    position = Column(Integer, nullable=False, default=0)
+    vless_url = Column(Text, default="")
+    sync_url = Column(String(255), default="")
+    sync_token = Column(Text, default="")
+    sync_error = Column(Text, nullable=True)
+    synced_at = Column(DateTime, nullable=True)
+    relay_version = Column(String(64), nullable=True)
+    sync_cert_pin = Column(String(400), nullable=True)
 
 
 class ServerConfig(Base):
@@ -70,6 +89,14 @@ class ServerConfig(Base):
     cascade_relay_version = Column(String(64), nullable=True)
     # Отпечаток HTTPS-сертификата релея и адрес, для которого он запомнен.
     cascade_sync_cert_pin = Column(String(400), nullable=True)
+
+    # Что делать, когда ни один релей не отвечает. block: не выпускать никого
+    # (сайты недоступны, адрес сервера не светится). direct: выпускать с адреса
+    # этого сервера (сайты открываются, но видят его адрес).
+    cascade_all_down = Column(String(8), default="block", nullable=False)
+    relays = relationship(
+        CascadeRelay, order_by=CascadeRelay.position, cascade="all, delete-orphan",
+    )
 
     # --- Параметры обфускации AmneziaWG 2.0 ---
     jc = Column(Integer, default=6)

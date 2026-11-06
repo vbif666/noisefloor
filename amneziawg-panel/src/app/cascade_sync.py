@@ -7,6 +7,9 @@ SNI или camouflage dest — и каскад молча перестаёт п�
 кто-нибудь не обновит ссылку здесь вручную. Ровно так проект однажды провёл
 несколько дней: обе стороны выглядели исправными, трафика не было.
 
+Релеев может быть несколько (app/relays.py). У каждого свой адрес, токен и
+запомненный отпечаток, и опрашивается каждый отдельно.
+
 Теперь достаточно указать адрес релея и его токен: панель периодически
 спрашивает у релея, что у него сейчас, и подстраивается сама. Ссылка
 vless:// становится производной величиной, а не второй копией настроек.
@@ -29,9 +32,10 @@ import socket
 import ssl
 import threading
 import urllib.parse
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 
-from . import cascade
+from . import cascade, relays
 
 SYNC_INTERVAL_SECONDS = 300
 REQUEST_TIMEOUT_SECONDS = 10
@@ -44,9 +48,10 @@ SYNC_PATH = "/api/sync"
 ROTATION_GRACE_SECONDS = 5
 MIN_WAIT_SECONDS = 10
 
-# Когда релей сменит SNI в следующий раз (по его последнему ответу). Только
-# в памяти: после перезапуска панели узнаем заново на первом же опросе.
+# Когда один из релеев сменит SNI в следующий раз (по их последним ответам).
+# Только в памяти: после перезапуска панели узнаем заново на первом же опросе.
 next_rotation_at: datetime | None = None
+_rotations: dict[int, datetime] = {}
 
 
 class SyncError(Exception):
@@ -68,6 +73,11 @@ def _normalise(base_url: str) -> urllib.parse.ParseResult:
     # Релей отдаёт панель только по HTTPS; старый адрес с http:// из
     # прежних настроек молча поднимаем до https, а не ломаем каскад.
     return parsed._replace(scheme="https")
+
+
+def endpoint_base(base_url: str) -> str:
+    """Проверенный адрес релея. SyncError, если он негодный."""
+    return _normalise(base_url).geturl()
 
 
 def _endpoint(base_url: str) -> str:
@@ -252,8 +262,37 @@ def host_of(base_url: str) -> str:
     return urllib.parse.urlparse(base).hostname or ""
 
 
+def _fetch(sync_url: str, token: str, pin: str) -> tuple[dict, str, str] | SyncError:
+    """Ответ одного релея или ошибка. Без обращения к БД: работает в своём потоке."""
+    try:
+        params, fingerprint = fetch_params(sync_url, token, pin)
+        return params, fingerprint, build_url(params, fallback_host=host_of(sync_url))
+    except SyncError as exc:
+        return exc
+
+
+def _apply_answer(relay, answer: tuple[dict, str, str]) -> bool:
+    """Записать ответ релея. True, если его ссылка изменилась."""
+    params, fingerprint, new_url = answer
+    rotation = parse_next_rotation(params)
+    if rotation is None:
+        _rotations.pop(relay.id, None)
+    else:
+        _rotations[relay.id] = rotation
+    changed = new_url != (relay.vless_url or "")
+    relay.sync_error = None
+    relay.sync_cert_pin = make_pin_record(fingerprint, relay.sync_url)
+    relay.synced_at = datetime.now(timezone.utc)
+    relay_build = params.get("version") if isinstance(params, dict) else None
+    if isinstance(relay_build, dict):
+        relay.relay_version = str(relay_build.get("version") or "")[:64] or None
+    if changed:
+        relay.vless_url = new_url
+    return changed
+
+
 def sync_once(db) -> tuple[bool, str | None]:
-    """Один цикл синхронизации.
+    """Один цикл синхронизации по всем релеям.
 
     Возвращает (изменилось ли, текст ошибки). Ошибку не бросаем: она должна
     доехать до панели и стать видимой, а не уронить фоновый поток."""
@@ -262,34 +301,38 @@ def sync_once(db) -> tuple[bool, str | None]:
     server = get_server(db)
     if not server.cascade_enabled:
         return False, None
-    if not (server.cascade_sync_url or "").strip():
-        return False, None  # синхронизация не настроена — работаем по ручной ссылке
+    relays.pull_primary(db, server)
+    # Без адреса синхронизация не настроена: работаем по ручной ссылке.
+    targets = [r for r in server.relays if (r.sync_url or "").strip()]
+    if not targets:
+        return False, None
 
+    # Параллельно: сюда приходит сохранение настроек, и один лежащий релей с
+    # таймаутом 10 с не должен умножаться на число релеев.
+    requests = [(r.sync_url, r.sync_token or "", r.sync_cert_pin or "") for r in targets]
+    with ThreadPoolExecutor(max_workers=len(requests)) as pool:
+        answers = list(pool.map(lambda args: _fetch(*args), requests))
+
+    changed = False
+    errors: list[str] = []
+    for relay, answer in zip(targets, answers):
+        if isinstance(answer, SyncError):
+            relay.sync_error = str(answer)
+            prefix = f"{host_of(relay.sync_url)}: " if len(targets) > 1 else ""
+            errors.append(prefix + str(answer))
+        elif _apply_answer(relay, answer):
+            changed = True
+
+    known = {r.id for r in server.relays}
+    for relay_id in set(_rotations) - known:
+        del _rotations[relay_id]
     global next_rotation_at
-    try:
-        params, fingerprint = fetch_params(
-            server.cascade_sync_url, server.cascade_sync_token or "",
-            server.cascade_sync_cert_pin or "",
-        )
-        new_url = build_url(params, fallback_host=host_of(server.cascade_sync_url))
-    except SyncError as exc:
-        server.cascade_sync_error = str(exc)
-        db.add(server)
-        db.commit()
-        return False, str(exc)
+    next_rotation_at = min(_rotations.values(), default=None)
 
-    next_rotation_at = parse_next_rotation(params)
-    changed = new_url != (server.cascade_vless_url or "")
-    server.cascade_sync_error = None
-    server.cascade_sync_cert_pin = make_pin_record(fingerprint, server.cascade_sync_url)
-    server.cascade_synced_at = datetime.now(timezone.utc)
-    relay_build = params.get("version") if isinstance(params, dict) else None
-    if isinstance(relay_build, dict):
-        server.cascade_relay_version = str(relay_build.get("version") or "")[:64] or None
-    if changed:
-        server.cascade_vless_url = new_url
+    relays.push_primary(server)
     db.add(server)
     db.commit()
+    sync_error = "; ".join(errors) or None
 
     if changed:
         # Достаточно перезапустить каскадный xray: правила фаервола от
@@ -302,7 +345,7 @@ def sync_once(db) -> tuple[bool, str | None]:
             db.add(server)
             db.commit()
             return True, error
-    return changed, None
+    return changed, sync_error
 
 
 def run(stop_event: threading.Event) -> None:

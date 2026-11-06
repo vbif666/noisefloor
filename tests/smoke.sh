@@ -17,6 +17,7 @@
 #   tests/smoke.sh --rules-only
 #   tests/smoke.sh --install-only
 #   tests/smoke.sh --canary-only
+#   tests/smoke.sh --failover-only
 #   tests/smoke.sh --selfcheck-only
 #   RELAY_IMAGE=... PANEL_IMAGE=... tests/smoke.sh
 #
@@ -414,15 +415,36 @@ canary_status_has() {
     [[ "$body" == *$1* ]]
 }
 
+canary_field() {
+    curl -kfsS -H "Authorization: Bearer $CANARY_TOKEN" \
+        "https://127.0.0.1:$CANARY_PANEL_PORT/api/server/cascade/status" \
+        | python3 -c 'import json,sys; print(json.load(sys.stdin).get(sys.argv[1]) or "")' "$1"
+}
+
+# Свежий успешный результат с нужного адреса. Для адреса панели успеха не будет:
+# канарейка красная на exit_ip, поэтому смотрим только на адрес.
+canary_exits_via() {
+    canary_status_has "\"canary_exit_ip\":\"$1\""
+}
+
+panel_xray_pid_any() {
+    panel_xray_pid
+}
+
+sleep_seconds() {
+    local until=$(( $(date +%s) + $1 ))
+    while [ "$(date +%s)" -lt "$until" ]; do read -r -t 1 <> <(:) || true; done
+}
+
 canary_cleanup() {
-    docker rm -f smoke-canary smoke-canary-panel smoke-canary-relay smoke-canary-web >/dev/null 2>&1 || true
+    docker rm -f smoke-canary smoke-canary-panel smoke-canary-relay smoke-canary-relay2 smoke-canary-web >/dev/null 2>&1 || true
     docker network rm smoke-canary-net smoke-canary-lan >/dev/null 2>&1 || true
 }
 
-test_canary() {
-    echo
-    echo "Канарейка  ($PANEL_IMAGE)"
-    local dir="$WORKDIR/canary" c=smoke-canary-panel net=smoke-canary-net
+# Стенд: поддельный интернет, релей 5.5.77.20, панель 5.5.77.30, канарейка.
+# Второй аргумент - интервал канарейки. Ошибки возвращает кодом.
+canary_stand() {
+    local dir="$WORKDIR/$1" interval="$2" c=smoke-canary-panel net=smoke-canary-net
     CANARY_PANEL_PORT=29103
     mkdir -p "$dir/data/canary" "$dir/awg_config" "$dir/relay" "$dir/bin"
     canary_cleanup
@@ -440,7 +462,20 @@ BODY = os.urandom(1048576)
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, *args):
         pass
+    def do_HEAD(self):
+        self.remember()
+        self.send_response(204)
+        self.end_headers()
+    def remember(self):
+        # Журнал адресов: кто на самом деле дошёл до "интернета". Канарейка про
+        # неверный адрес выхода сообщает текстом ошибки, этому журналу проще верить.
+        with open("/tmp/seen", "a") as seen:
+            seen.write(self.client_address[0] + "\n")
     def do_GET(self):
+        if self.path == "/generate_204":
+            self.do_HEAD()
+            return
+        self.remember()
         body = BODY if self.path == "/1mb" else f"ip={self.client_address[0]}\n".encode()
         self.send_response(200)
         self.send_header("Content-Length", str(len(body)))
@@ -466,7 +501,7 @@ PY
     if ! wait_for 45 test -s "$dir/relay/creds.json"; then
         fail "релей стенда не поднялся"
         docker logs smoke-canary-relay 2>&1 | tail -10
-        return
+        return 1
     fi
 
     local url
@@ -496,6 +531,7 @@ STUB
         -e LIVE_MANAGEMENT_ENABLED=true -e AUTO_APPLY_ON_START=true \
         -e AWG_AUTO_UPDATE_ENABLED=false -e DEFAULT_SERVER_ADDRESS=10.79.0.1/24 \
         -e DEFAULT_LISTEN_PORT=51997 -e PUBLIC_HOST=5.5.77.30 \
+        -e CASCADE_PROBE_URL=http://5.5.77.10/generate_204 \
         -v "$dir/data:/opt/panel/data" -v "$dir/awg_config:/etc/amnezia/amneziawg" \
         "$PANEL_IMAGE" >/dev/null
     docker cp "$dir/bin/iptables-restore" "$c:/usr/local/bin/iptables-restore" >/dev/null
@@ -505,7 +541,7 @@ STUB
         || ! wait_for 45 curl -kfsS -o /dev/null "https://127.0.0.1:$CANARY_PANEL_PORT/"; then
         fail "панель стенда не поднялась"
         docker logs "$c" 2>&1 | tail -20
-        return
+        return 1
     fi
 
     local pw
@@ -518,7 +554,7 @@ STUB
     body="$(python3 -c 'import json,sys; print(json.dumps({"cascade_enabled": True, "cascade_vless_url": sys.argv[1]}))' "$url")"
     curl -kfsS -o /dev/null -X PUT "https://127.0.0.1:$CANARY_PANEL_PORT/api/server" \
         -H "Authorization: Bearer $CANARY_TOKEN" -H 'Content-Type: application/json' -d "$body" \
-        || { fail "панель не приняла ссылку на релей"; return; }
+        || { fail "панель не приняла ссылку на релей"; return 1; }
     curl -kfsS -o /dev/null -X POST "https://127.0.0.1:$CANARY_PANEL_PORT/api/server/apply" \
         -H "Authorization: Bearer $CANARY_TOKEN" || true
 
@@ -527,24 +563,24 @@ STUB
     else
         fail "каскад стенда не поднялся"
         docker exec "$c" tail -8 /opt/panel/data/cascade.log 2>/dev/null || true
-        return
+        return 1
     fi
 
     # Как в compose: из привилегий только NET_ADMIN.
     docker run -d --name smoke-canary --network smoke-canary-lan --ip 100.64.78.40 --init --no-healthcheck \
         --cap-drop ALL --cap-add NET_ADMIN --device /dev/net/tun \
-        -e CANARY_INTERVAL_SECONDS=15 -e CANARY_ENDPOINT_HOST=100.64.78.30 \
+        -e CANARY_INTERVAL_SECONDS="$interval" -e CANARY_ENDPOINT_HOST=100.64.78.30 \
         -e CANARY_TRACE_URL=http://5.5.77.10/cdn-cgi/trace \
         -e CANARY_DOWNLOAD_URL=http://5.5.77.10/1mb -e CANARY_DNS_SERVER=5.5.77.10 \
         -v "$dir/data/canary:/canary" --entrypoint python "$PANEL_IMAGE" -m app.canary_probe >/dev/null
 
-    local diag='cat "$dir/data/canary/result.json"; docker logs smoke-canary 2>&1 | tail -5'
     if wait_for 90 canary_status_has '"canary_ok":true'; then
         pass "канарейка зелёная на рабочем стенде"
     else
         fail "канарейка не позеленела за 90 с"
-        eval "$diag"
-        return
+        cat "$dir/data/canary/result.json"
+        docker logs smoke-canary 2>&1 | tail -5
+        return 1
     fi
 
     canary_status_has '"canary_exit_ip":"5.5.77.20"' \
@@ -559,6 +595,14 @@ STUB
     curl -kfsS -H "Authorization: Bearer $CANARY_TOKEN" "https://127.0.0.1:$CANARY_PANEL_PORT/api/status/metrics" \
         | grep -q '^noisefloor_canary_ok 1$' \
         && pass "noisefloor_canary_ok 1 в метриках" || fail "нет noisefloor_canary_ok 1 в метриках"
+}
+
+test_canary() {
+    echo
+    echo "Канарейка  ($PANEL_IMAGE)"
+    local dir="$WORKDIR/canary" c=smoke-canary-panel
+    canary_stand canary 15 || return
+    local diag='cat "$dir/data/canary/result.json"; docker logs smoke-canary 2>&1 | tail -5'
 
     # --- снесённое правило TPROXY ---
     docker exec "$c" touch /tmp/nf-fail
@@ -605,6 +649,173 @@ STUB
         && pass "после возврата MTU канарейка зелёная" \
         || { fail "канарейка не вернулась после возврата MTU"; eval "$diag"; }
 
+    canary_cleanup
+}
+
+# ------------------------------------------- два релея и падение xray панели ---
+
+api_put_server() {
+    curl -kfsS -o /dev/null -X PUT "https://127.0.0.1:$CANARY_PANEL_PORT/api/server" \
+        -H "Authorization: Bearer $CANARY_TOKEN" -H 'Content-Type: application/json' -d "$1"
+}
+
+panel_xray_pid() {
+    docker exec smoke-canary-panel python -c '
+import os
+for pid in filter(str.isdigit, os.listdir("/proc")):
+    try:
+        cmd = open(f"/proc/{pid}/cmdline", "rb").read()
+    except OSError:
+        continue
+    if cmd.startswith(b"/usr/local/bin/xray\0run"):
+        print(pid)
+        break
+' 2>/dev/null
+}
+
+panel_xray_started() {
+    local pid
+    pid="$(panel_xray_pid)"
+    [ -n "$pid" ] && [ "$pid" != "$1" ]
+}
+
+panel_has_tproxy() {
+    docker exec smoke-canary-panel iptables-save -t mangle | grep -q -e '-j TPROXY'
+}
+
+panel_no_tproxy() {
+    ! panel_has_tproxy
+}
+
+web_forget() {
+    docker exec smoke-canary-web sh -c ': > /tmp/seen'
+}
+
+web_saw() {
+    docker exec smoke-canary-web grep -qxF "$1" /tmp/seen
+}
+
+panel_config_falls_back_to() {
+    docker exec smoke-canary-panel grep -q "\"fallbackTag\": \"$1\"" /opt/panel/data/cascade-xray-config.json
+}
+
+test_failover() {
+    echo
+    echo "Два релея  ($PANEL_IMAGE)"
+    local dir="$WORKDIR/failover" c=smoke-canary-panel
+    canary_stand failover 5 || return
+
+    mkdir -p "$dir/relay2"
+    docker run -d --name smoke-canary-relay2 --network smoke-canary-net --ip 5.5.77.21 \
+        -e LABEL=smoke-canary2 -e APP_CODENAME=SmokeCanary2 -e PUBLIC_HOST=5.5.77.21 \
+        -v "$dir/relay2:/data" "$RELAY_IMAGE" >/dev/null
+    if ! wait_for 45 test -s "$dir/relay2/creds.json"; then
+        fail "второй релей не поднялся"
+        return
+    fi
+    local body
+    body="$(python3 - "$dir/relay2/creds.json" <<'PY'
+import json, sys
+c = json.load(open(sys.argv[1]))
+print(json.dumps({"vless_url": f"vless://{c['uuid']}@5.5.77.21:{c['vless_port']}?security=reality&sni={c['sni']}"
+      f"&pbk={c['public_key']}&sid={c['short_id']}&fp=chrome&flow=xtls-rprx-vision&type=tcp#smoke2"}))
+PY
+)"
+    curl -kfsS -o /dev/null -X POST "https://127.0.0.1:$CANARY_PANEL_PORT/api/server/cascade/relays" \
+        -H "Authorization: Bearer $CANARY_TOKEN" -H 'Content-Type: application/json' -d "$body" \
+        && pass "резервный релей добавлен" || { fail "панель не приняла резервный релей"; return; }
+
+    docker exec "$c" python -c '
+import json
+config = json.load(open("/opt/panel/data/cascade-xray-config.json"))
+assert [b["tag"] for b in config["routing"]["balancers"]] == ["relays", "relays-probe"]
+' && pass "в конфиге xray балансировщик" || fail "в конфиге xray нет балансировщика"
+
+    if ! wait_for 60 canary_status_has '"active":true' \
+        || ! wait_for 60 canary_status_has '"canary_ok":true'; then
+        fail "xray не выбрал живой релей"
+        docker exec "$c" tail -8 /opt/panel/data/cascade-xray.log
+        docker exec "$c" xray api bi -server=127.0.0.1:10086 relays
+        curl -kfsS -H "Authorization: Bearer $CANARY_TOKEN" "https://127.0.0.1:$CANARY_PANEL_PORT/api/server/cascade/status"; echo
+        return
+    fi
+    pass "xray выбрал живой релей, канарейка зелёная"
+
+    # Останавливаем тот, через который идёт трафик сейчас: иначе проверять нечего.
+    local exit_ip standby t0
+    exit_ip="$(canary_field canary_exit_ip)"
+    case "$exit_ip" in
+        5.5.77.20) standby=5.5.77.21; docker stop -t 0 smoke-canary-relay >/dev/null ;;
+        5.5.77.21) standby=5.5.77.20; docker stop -t 0 smoke-canary-relay2 >/dev/null ;;
+        *) fail "адрес выхода не адрес релея: $exit_ip"; return ;;
+    esac
+    t0="$(date +%s)"
+    if wait_for 30 canary_exits_via "$standby"; then
+        pass "канарейка восстановилась через второй релей за $(( $(date +%s) - t0 )) с"
+    else
+        fail "за 30 с канарейка не перешла на второй релей"
+        canary_field canary_exit_ip; canary_field canary_error
+        cat "$dir/data/canary/result.json"
+        docker exec "$c" xray api bi -server=127.0.0.1:10086 relays
+    fi
+
+    # --- смерть xray панели ---
+    local pid
+    pid="$(panel_xray_pid)"
+    docker exec "$c" kill -9 "$pid"
+    t0="$(date +%s)"
+    if wait_for 10 panel_xray_started "$pid"; then
+        pass "xray панели перезапущен за $(( $(date +%s) - t0 )) с"
+    else
+        fail "xray панели не перезапущен за 10 с"
+    fi
+
+    # --- block: xray не поднимается, перехват на месте ---
+    docker exec "$c" mv /usr/local/bin/xray /usr/local/bin/xray.off
+    docker exec "$c" kill -9 "$(panel_xray_pid_any)"
+    wait_for 10 canary_status_has '"running":false' || fail "стенд: xray не остановился"
+    panel_has_tproxy && pass "block: без xray перехват остаётся" || fail "block: перехват снят"
+
+    # --- direct: перехват снимается и возвращается ---
+    api_put_server '{"cascade_all_down":"direct"}' || fail "панель не приняла direct"
+    wait_for 15 panel_no_tproxy && pass "direct: без xray перехват снят" || fail "direct: перехват остался"
+    web_forget
+    wait_for 30 web_saw 5.5.77.30 \
+        && pass "direct: клиенты выходят с адреса панели" \
+        || fail "direct: клиенты не вышли с адреса панели"
+    canary_status_has '"intercept_suspended":true' \
+        && pass "панель показывает снятый перехват" || fail "панель не показывает снятый перехват"
+
+    docker exec "$c" mv /usr/local/bin/xray.off /usr/local/bin/xray
+    wait_for 70 canary_status_has '"running":true' || fail "xray не вернулся"
+    wait_for 15 panel_has_tproxy && pass "xray вернулся, перехват на месте" || fail "перехват не вернулся"
+    wait_for 30 canary_exits_via "$standby" \
+        && pass "клиенты снова идут через релей" \
+        || fail "клиенты не вернулись на релей"
+
+    # --- direct, релеи мертвы, xray жив ---
+    case "$standby" in
+        5.5.77.20) docker stop -t 0 smoke-canary-relay >/dev/null ;;
+        5.5.77.21) docker stop -t 0 smoke-canary-relay2 >/dev/null ;;
+    esac
+    web_forget
+    wait_for 40 web_saw 5.5.77.30 \
+        && pass "direct: все релеи мертвы, выход с адреса панели" \
+        || fail "direct: при мёртвых релеях нет выхода"
+
+    # --- block, релеи мертвы, xray жив: наружу ни байта ---
+    api_put_server '{"cascade_all_down":"block"}' || fail "панель не приняла block"
+    # Прежний процесс xray ещё мог выпустить запрос: забываем адреса после смены.
+    wait_for 15 panel_config_falls_back_to cascade-out || fail "стенд: конфиг не сменился"
+    wait_for 15 canary_status_has '"running":true' || fail "стенд: xray не вернулся"
+    sleep_seconds 3
+    web_forget
+    sleep_seconds 15
+    web_saw 5.5.77.30 \
+        && fail "block: трафик вышел с адреса панели" \
+        || pass "block: все релеи мертвы, с адреса панели никто не вышел"
+
+    docker rm -f smoke-canary-relay2 >/dev/null 2>&1 || true
     canary_cleanup
 }
 
@@ -920,8 +1131,9 @@ case "${1:-}" in
     --rules-only) test_rules; test_rules_supervision ;;
     --install-only) test_install ;;
     --canary-only) test_canary ;;
+    --failover-only) test_failover ;;
     --selfcheck-only) test_selfcheck ;;
-    "")           test_relay; test_panel; test_rules; test_rules_supervision; test_install; test_canary; test_selfcheck ;;
+    "")           test_relay; test_panel; test_rules; test_rules_supervision; test_install; test_canary; test_failover; test_selfcheck ;;
     *) echo "неизвестный аргумент: $1" >&2; exit 2 ;;
 esac
 

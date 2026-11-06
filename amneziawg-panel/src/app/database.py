@@ -34,6 +34,7 @@ _SERVER_CONFIG_MIGRATIONS = [
     ("cascade_relay_version", "ALTER TABLE server_config ADD COLUMN cascade_relay_version VARCHAR(64)"),
     ("cascade_sync_cert_pin", "ALTER TABLE server_config ADD COLUMN cascade_sync_cert_pin VARCHAR(400)"),
     ("header_protection_key", "ALTER TABLE server_config ADD COLUMN header_protection_key VARCHAR(64) DEFAULT ''"),
+    ("cascade_all_down", "ALTER TABLE server_config ADD COLUMN cascade_all_down VARCHAR(8) NOT NULL DEFAULT 'block'"),
 ]
 
 

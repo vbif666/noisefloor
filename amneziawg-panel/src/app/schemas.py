@@ -62,6 +62,7 @@ class ServerRead(BaseModel):
     cascade_sync_error: str | None = None
     cascade_synced_at: UtcDatetime | None = None
     cascade_relay_version: str | None = None
+    cascade_all_down: str = "block"
     jc: int
     jmin: int
     jmax: int
@@ -96,6 +97,7 @@ class ServerUpdate(BaseModel):
     split_ru_direct: bool | None = None
     cascade_sync_url: str | None = None
     cascade_sync_token: str | None = None
+    cascade_all_down: Literal["block", "direct"] | None = None
     jc: int | None = Field(default=None, ge=0, le=128)
     jmin: int | None = Field(default=None, ge=0)
     jmax: int | None = Field(default=None, ge=0)
@@ -120,6 +122,27 @@ class ApplyResult(BaseModel):
     live_management_available: bool
 
 
+class RelayCreate(BaseModel):
+    vless_url: str = ""
+    sync_url: str = ""
+    sync_token: str = ""
+
+
+class RelayStatus(BaseModel):
+    """Без uuid, ключей и токена: это готовый доступ к релею."""
+    id: int
+    primary: bool
+    host: str | None = None
+    port: int | None = None
+    sni: str | None = None
+    label: str | None = None
+    sync_enabled: bool = False
+    sync_error: str | None = None
+    synced_at: UtcDatetime | None = None
+    version: str | None = None
+    active: bool = False  # через него сейчас идёт трафик
+
+
 class CascadeStatus(BaseModel):
     enabled: bool
     configured: bool  # ссылка указана и разобралась без ошибок
@@ -132,7 +155,11 @@ class CascadeStatus(BaseModel):
     verified_ok: bool | None = None  # None — проверки ещё не было
     verified_at: UtcDatetime | None = None
     verify_error: str | None = None
-    restarts: int = 0  # сколько раз супервизор поднимал упавший xray
+    restarts: int = 0  # сколько раз сторож поднимал упавший xray
+    relays: list[RelayStatus] = []
+    all_down: str = "block"
+    # xray не работает, и клиенты сейчас выходят с адреса этого сервера.
+    intercept_suspended: bool = False
     # Проба через настоящий туннель. Отдельно от verified_ok: та минует awg0,
     # iptables и MTU. None - контейнер канарейки не запущен или ещё не проверял.
     canary_ok: bool | None = None

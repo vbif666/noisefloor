@@ -3,11 +3,12 @@ import platform
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 
-from .. import canary, cascade, cascade_sync, config_sync
+from .. import canary, cascade, cascade_sync, config_sync, relays
 from ..config import settings
 from ..database import get_db
 from ..obfuscation import random_obfuscation_profile
-from ..schemas import ApplyResult, CascadeStatus, ServerRead, ServerUpdate
+from ..models import CascadeRelay
+from ..schemas import ApplyResult, CascadeStatus, RelayCreate, RelayStatus, ServerRead, ServerUpdate
 from ..security import get_current_admin
 
 router = APIRouter()
@@ -69,6 +70,7 @@ def update_server(
     db.add(server)
     db.commit()
     db.refresh(server)
+    relays.pull_primary(db, server)
 
     # Сохранение сразу применяется к живому интерфейсу, иначе БД и
     # реальный интерфейс расходятся молча — так однажды уже потерялась
@@ -151,6 +153,80 @@ def cascade_verify_now(db: Session = Depends(get_db), _admin: str = Depends(get_
     return cascade_status(db=db, _admin=_admin)
 
 
+def _relay_status(relay: CascadeRelay, active_host: str | None) -> RelayStatus:
+    params: dict = {}
+    if (relay.vless_url or "").strip():
+        try:
+            params = cascade.parse_vless_url(relay.vless_url)
+        except cascade.VlessParseError:
+            params = {}
+    host = params.get("host")
+    return RelayStatus(
+        id=relay.id,
+        primary=relay.position == 0,
+        host=host or cascade_sync.host_of(relay.sync_url) or None,
+        port=params.get("port"),
+        sni=params.get("sni"),
+        label=params.get("label") or None,
+        sync_enabled=bool((relay.sync_url or "").strip()),
+        sync_error=relay.sync_error,
+        synced_at=relay.synced_at,
+        version=relay.relay_version,
+        active=bool(host) and host == active_host,
+    )
+
+
+@router.post("/cascade/relays", response_model=CascadeStatus)
+def add_relay(
+    payload: RelayCreate,
+    db: Session = Depends(get_db),
+    _admin: str = Depends(get_current_admin),
+):
+    """Добавить резервный релей. Основной меняется в настройках сервера."""
+    server = config_sync.get_server(db)
+    vless_url = payload.vless_url.strip()
+    sync_url = payload.sync_url.strip()
+    sync_token = payload.sync_token.strip()
+    if not vless_url and not sync_url:
+        raise HTTPException(status_code=400, detail="Укажите ссылку vless:// или адрес релея с токеном")
+    if vless_url:
+        try:
+            cascade.parse_vless_url(vless_url)
+        except cascade.VlessParseError as exc:
+            raise HTTPException(status_code=400, detail=f"Ссылка каскада: {exc}") from exc
+    if sync_url:
+        if not sync_token:
+            raise HTTPException(status_code=400, detail="Для синхронизации нужен токен релея")
+        try:
+            cascade_sync.host_of(cascade_sync.endpoint_base(sync_url))
+        except cascade_sync.SyncError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    relays.pull_primary(db, server)
+    relays.add_reserve(db, server, vless_url, sync_url, sync_token)
+    config_sync.apply_current_config(db)
+    return cascade_status(db=db, _admin=_admin)
+
+
+@router.delete("/cascade/relays/{relay_id}", response_model=CascadeStatus)
+def delete_relay(
+    relay_id: int,
+    db: Session = Depends(get_db),
+    _admin: str = Depends(get_current_admin),
+):
+    server = config_sync.get_server(db)
+    relay = next((r for r in server.relays if r.id == relay_id), None)
+    if relay is None:
+        raise HTTPException(status_code=404, detail="Такого релея нет")
+    if relay.position == 0:
+        raise HTTPException(status_code=400, detail="Основной релей меняется в настройках каскада")
+    server.relays.remove(relay)
+    db.add(server)
+    db.commit()
+    config_sync.apply_current_config(db)
+    return cascade_status(db=db, _admin=_admin)
+
+
 @router.get("/cascade/status", response_model=CascadeStatus)
 def cascade_status(db: Session = Depends(get_db), _admin: str = Depends(get_current_admin)):
     server = config_sync.get_server(db)
@@ -166,9 +242,13 @@ def cascade_status(db: Session = Depends(get_db), _admin: str = Depends(get_curr
             relay = cascade.parse_vless_url(server.cascade_vless_url)
         except cascade.VlessParseError:
             relay = {}
+    active_host = cascade.active_relay()
     return CascadeStatus(
         enabled=server.cascade_enabled,
-        configured=bool((server.cascade_vless_url or "").strip()),
+        configured=bool(cascade.relay_urls(server)),
+        relays=[_relay_status(r, active_host) for r in server.relays],
+        all_down=cascade.all_down_mode(server),
+        intercept_suspended=cascade.intercept_suspended(server),
         running=cascade.is_running(),
         error=server.cascade_last_error,
         relay_host=relay.get("host"),

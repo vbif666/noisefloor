@@ -108,21 +108,23 @@ def _create_service_peer(db, server: ServerConfig) -> Peer:
 
 
 def expected_exit_ips(server: ServerConfig) -> list[str]:
-    """С каких адресов должен выходить трафик: адрес релея или явная настройка.
+    """С каких адресов должен выходить трафик: адреса релеев или явная настройка.
 
     Пустой список значит, что сверять не с чем, тогда адрес только показываем."""
     override = (settings.canary_expected_exit_ip or "").strip()
     if override:
         return [ip.strip() for ip in override.split(",") if ip.strip()]
-    try:
-        host = cascade.parse_vless_url(server.cascade_vless_url or "")["host"]
-    except (cascade.VlessParseError, KeyError):
-        return []
-    try:
-        infos = socket.getaddrinfo(host, None, socket.AF_INET, socket.SOCK_STREAM)
-    except OSError:
-        return []
-    return sorted({info[4][0] for info in infos})
+    addresses: set[str] = set()
+    for url in cascade.relay_urls(server):
+        try:
+            host = cascade.parse_vless_url(url)["host"]
+            infos = socket.getaddrinfo(host, None, socket.AF_INET, socket.SOCK_STREAM)
+        except (cascade.VlessParseError, KeyError, OSError):
+            # Адрес одного релея не разрешился. Сверять только с остальными
+            # нельзя: выход через него выглядел бы утечкой.
+            return []
+        addresses.update(info[4][0] for info in infos)
+    return sorted(addresses)
 
 
 def build_config(peer: Peer, server: ServerConfig) -> dict:
@@ -145,7 +147,7 @@ def sync(db) -> None:
     wanted = (
         settings.canary_enabled
         and bool(server.cascade_enabled)
-        and bool((server.cascade_vless_url or "").strip())
+        and bool(cascade.relay_urls(server))
         and sidecar_present()
     )
     if not wanted:

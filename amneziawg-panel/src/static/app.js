@@ -511,6 +511,7 @@ const SERVER_FIELDS = [
   ["split_ru_direct", "f-split-ru-direct", "Каскад", false, "checkbox"],
   ["cascade_sync_url", "f-cascade-sync-url", "Каскад", false, "text"],
   ["cascade_sync_token", "f-cascade-sync-token", "Каскад", false, "text"],
+  ["cascade_all_down", "f-cascade-all-down", "Каскад", false, "text"],
   ["jc", "f-jc", "Обфускация", true, "number"],
   ["jmin", "f-jmin", "Обфускация", true, "number"],
   ["jmax", "f-jmax", "Обфускация", true, "number"],
@@ -760,6 +761,57 @@ $("restart-btn").addEventListener("click", () => {
       }
     },
   );
+});
+
+function renderCascadeRelays(c) {
+  const box = $("cascade-relays");
+  if (!box) return;
+  const reserves = (c.relays || []).filter((r) => !r.primary);
+  if (!reserves.length) {
+    box.textContent = "резервных нет";
+    return;
+  }
+  box.innerHTML = reserves.map((r) => {
+    const parts = [escapeHtml(r.host || "ждёт параметры")];
+    if (r.sni) parts.push(`sni ${escapeHtml(r.sni)}`);
+    if (r.active) parts.push("сейчас через него");
+    if (r.sync_error) parts.push(`синхронизация: ${escapeHtml(r.sync_error)}`);
+    return `<div>${parts.join("  ·  ")} <button type="button" class="btn btn-sm" data-relay-delete="${Number(r.id)}">Удалить</button></div>`;
+  }).join("");
+}
+
+$("cascade-relays").addEventListener("click", async (event) => {
+  const id = event.target.dataset && event.target.dataset.relayDelete;
+  if (!id) return;
+  event.target.disabled = true;
+  try {
+    renderCascadeStatus(await api(`/server/cascade/relays/${id}`, { method: "DELETE" }));
+    showToast("Резервный релей удалён");
+  } catch (err) {
+    showToast(err.message, true);
+    event.target.disabled = false;
+  }
+});
+
+$("relay-add-btn").addEventListener("click", async () => {
+  const btn = $("relay-add-btn");
+  btn.disabled = true;
+  try {
+    renderCascadeStatus(await api("/server/cascade/relays", {
+      method: "POST",
+      body: JSON.stringify({
+        vless_url: $("f-relay-vless").value.trim(),
+        sync_url: $("f-relay-sync-url").value.trim(),
+        sync_token: $("f-relay-sync-token").value.trim(),
+      }),
+    }));
+    for (const id of ["f-relay-vless", "f-relay-sync-url", "f-relay-sync-token"]) $(id).value = "";
+    showToast("Резервный релей добавлен");
+  } catch (err) {
+    showToast(err.message, true);
+  } finally {
+    btn.disabled = false;
+  }
 });
 
 function renderCascadeSummary(c) {
@@ -1419,6 +1471,7 @@ function renderCascadeStatus(c) {
   if (cascadeChecking && !c.checking) return;  // идёт проверка по кнопке — не мигаем фоновым опросом
   lastCascadeStatus = c;
   renderCascadeSummary(c);
+  renderCascadeRelays(c);
   renderCascadeChecklist(c);
   const el = $("cascade-status");
   if (!el) return;
@@ -1429,6 +1482,11 @@ function renderCascadeStatus(c) {
   }
   if (c.checking) {
     el.textContent = "проверяю…";
+    return;
+  }
+  if (c.intercept_suspended) {
+    el.textContent = "xray не работает, клиенты выходят напрямую";
+    el.classList.add("is-error");
     return;
   }
   if (c.running && c.canary_ok === false) {

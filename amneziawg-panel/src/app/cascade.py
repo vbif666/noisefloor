@@ -31,10 +31,12 @@ from __future__ import annotations
 
 import json
 import platform
+import re
 import shutil
 import time
 import subprocess
 import threading
+from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlparse
 
@@ -65,8 +67,26 @@ GEOIP_PATH = Path("/usr/local/share/xray/geoip.dat")
 # фактом живости процесса — а именно этот показатель месяц врал, показывая
 # running=true при нулевых счётчиках.
 PROBE_PORT = 10087
-PROBE_URL = "https://www.gstatic.com/generate_204"
 PROBE_TIMEOUT_SECONDS = 12
+
+# Несколько релеев. Первый сохраняет тег cascade-out, остальные получают
+# cascade-out-2, cascade-out-3: селектор балансировщика и запрос счётчиков в
+# traffic_stats совпадают по префиксу и видят их все.
+RELAY_TAG = "cascade-out"
+BALANCER_TAG = "relays"
+# Проба обязана проверять релеи: при «все недоступны - выпускать напрямую» она
+# через обычный балансировщик вышла бы мимо них и показала здоровый каскад.
+PROBE_BALANCER_TAG = "relays-probe"
+ALL_DOWN_MODES = ("block", "direct")
+
+# Как xray решает, какой релей жив. Мёртвый - у кого провалились все пробы за
+# последние два цикла (цикл - OBSERVE_INTERVAL * OBSERVE_SAMPLING). Интервал
+# короче 10 с xray молча поднимает до 10 с, поэтому sampling 1: при двух окно
+# выросло бы до 40 с, а релей обязан смениться за 30. Одна потерянная проба
+# релей не убивает: в окне их две.
+OBSERVE_INTERVAL = "10s"
+OBSERVE_SAMPLING = 1
+OBSERVE_TIMEOUT = "4s"
 
 # Логи xray: раньше уходили в DEVNULL, и при поломке смотреть было нечего.
 LOG_PATH = DATA_DIR / "cascade-xray.log"
@@ -77,11 +97,15 @@ LOG_MAX_BYTES = 5 * 1024 * 1024
 # этого флага ядро дропает весь клиентский TCP (см. _tproxy_sockopt_error).
 TPROXY_SOCKOPT_MARKER = "failed to set IP_TRANSPARENT"
 
-# Как часто супервизор проверяет каскад и как долго ждёт после неудач.
+# Как часто супервизор проверяет каскад.
 SUPERVISE_INTERVAL_SECONDS = 30
 VERIFY_EVERY_SECONDS = 300
-BACKOFF_START_SECONDS = 5
-BACKOFF_MAX_SECONDS = 300
+
+# Перезапуск упавшего xray: паузы перед попытками, последняя - потолок. Счёт
+# обнуляется, когда процесс прожил STABLE_SECONDS.
+RESTART_DELAYS_SECONDS = (1, 2, 5, 10, 20, 40, 60)
+STABLE_SECONDS = 60
+WATCH_POLL_SECONDS = 1
 
 _health: dict = {
     "verified_ok": None,      # None — ещё не проверяли
@@ -98,6 +122,11 @@ _proc: subprocess.Popen | None = None
 # чего смена любой ДРУГОЙ настройки (режим перехвата, разделение маршрутов,
 # DNS) до движка не доезжала: ссылка та же, значит «ничего не изменилось».
 _last_config: dict | None = None
+# Должен ли xray работать. Отличает падение от штатной остановки в sync().
+_wanted = False
+_verify_soon = threading.Event()
+# Тег исходящего -> адрес релея в запущенном конфиге.
+_running_relays: dict[str, str] = {}
 
 
 class VlessParseError(ValueError):
@@ -197,7 +226,88 @@ def geoip_available() -> bool:
     return GEOIP_PATH.exists()
 
 
-def _split_ru_rules() -> list[dict]:
+def relay_urls(server) -> list[str]:
+    """Ссылки релеев по порядку, основной первым. Записи без ссылки пропускаем:
+    релей с синхронизацией получает её при первом опросе."""
+    rows = getattr(server, "relays", None) or []
+    urls = [r.vless_url for r in rows] if rows else [getattr(server, "cascade_vless_url", "")]
+    return [url.strip() for url in urls if (url or "").strip()]
+
+
+def all_down_mode(server) -> str:
+    mode = getattr(server, "cascade_all_down", "block")
+    return mode if mode in ALL_DOWN_MODES else "block"
+
+
+def probe_url() -> str:
+    return getattr(settings, "cascade_probe_url", "") or "https://www.gstatic.com/generate_204"
+
+
+def _relay_tag(index: int) -> str:
+    return RELAY_TAG if index == 0 else f"{RELAY_TAG}-{index + 1}"
+
+
+def _relay_outbound(tag: str, params: dict) -> dict:
+    return {
+        "tag": tag,
+        "protocol": "vless",
+        "settings": {
+            "vnext": [
+                {
+                    "address": params["host"],
+                    "port": params["port"],
+                    "users": [{"id": params["uuid"], "encryption": "none", "flow": params["flow"]}],
+                }
+            ]
+        },
+        "streamSettings": {
+            "network": "tcp",
+            "security": "reality",
+            "realitySettings": {
+                "serverName": params["sni"],
+                "fingerprint": params["fp"],
+                "publicKey": params["pbk"],
+                "shortId": params.get("sid", ""),
+                "spiderX": "",
+            },
+        },
+    }
+
+
+def _balancing_block(all_down: str) -> dict:
+    """Выбор живого релея.
+
+    block тут не исходящий blackhole, а основной релей. До первых результатов
+    проб (секунды после старта xray) leastPing живых не знает и отдаёт
+    fallbackTag, и с blackhole каждый запуск обрывал бы клиентов. То же, если
+    адрес проб сам недоступен: релеи исправны, а все выглядят мёртвыми. Если же
+    релеи и правда лежат, соединение через основной просто не состоится, с
+    адреса сервера никто не выйдет."""
+    def balancer(tag: str, fallback: str) -> dict:
+        return {
+            "tag": tag,
+            "selector": [RELAY_TAG],
+            "strategy": {"type": "leastPing"},
+            "fallbackTag": fallback,
+        }
+
+    return {
+        "burstObservatory": {
+            "subjectSelector": [RELAY_TAG],
+            "pingConfig": {
+                "destination": probe_url(),
+                "interval": OBSERVE_INTERVAL,
+                "sampling": OBSERVE_SAMPLING,
+                "timeout": OBSERVE_TIMEOUT,
+            },
+        },
+    }, [
+        balancer(BALANCER_TAG, "direct" if all_down == "direct" else RELAY_TAG),
+        balancer(PROBE_BALANCER_TAG, RELAY_TAG),
+    ]
+
+
+def _split_ru_rules(route: dict | None = None) -> list[dict]:
     """Правила разделения: российские адреса — напрямую, остальное — в каскад.
 
     Порядок здесь не косметика, а суть механизма. Выученные исключения
@@ -208,17 +318,26 @@ def _split_ru_rules() -> list[dict]:
     Сам список исключений здесь пуст: его на ходу подменяет панель через
     `xray api adrules`, не перезапуская движок и не рвя соединения.
     """
+    route = route or {"outboundTag": RELAY_TAG}
     return [
         {"ruleTag": "nf-private", "type": "field", "inboundTag": ["cascade-in"],
          "ip": ["geoip:private"], "outboundTag": "direct"},
         {"ruleTag": "nf-fallback", "type": "field", "inboundTag": ["cascade-in"],
-         "ip": ["0.0.0.0/32"], "outboundTag": "cascade-out"},
+         "ip": ["0.0.0.0/32"], **route},
         {"ruleTag": "nf-ru", "type": "field", "inboundTag": ["cascade-in"],
          "ip": ["geoip:ru"], "outboundTag": "direct"},
     ]
 
 
-def build_xray_config(params: dict, dns_server: str = "1.1.1.1", split_ru_direct: bool = False) -> dict:
+def build_xray_config(params: dict, dns_server: str = "1.1.1.1", split_ru_direct: bool = False,
+                      reserves: list[dict] | tuple = (), all_down: str = "block") -> dict:
+    # Один релей без выпуска напрямую выбирать не из чего: конфиг и трафик
+    # остаются ровно такими, как до появления списка.
+    balanced = bool(reserves) or all_down == "direct"
+    observatory, balancers = _balancing_block(all_down) if balanced else ({}, [])
+    route = {"balancerTag": BALANCER_TAG} if balanced else {"outboundTag": RELAY_TAG}
+    probe_route = {"balancerTag": PROBE_BALANCER_TAG} if balanced else {"outboundTag": RELAY_TAG}
+
     dns_inbounds = []
     dns_outbounds = []
     dns_rules = []
@@ -231,15 +350,21 @@ def build_xray_config(params: dict, dns_server: str = "1.1.1.1", split_ru_direct
             "protocol": "dokodemo-door",
             "settings": {"address": dns_host, "port": int(dns_port or 53), "network": "udp"},
         })
-        dns_outbounds.append({
-            "tag": "dns-out",
-            "protocol": "dns",
-            "settings": {"network": "tcp", "address": dns_host, "port": int(dns_port or 53)},
-            # Запрос уходит не напрямую, а внутрь каскада — иначе смысл
-            # перехвата теряется: адрес сервера видел бы уже DNS-резолвер.
-            "proxySettings": {"tag": "cascade-out"},
-        })
-        dns_rules.append({"type": "field", "inboundTag": ["dns-in"], "outboundTag": "dns-out"})
+        if balanced:
+            # proxySettings знает только конкретный исходящий, не балансировщик.
+            # Поэтому при нескольких релеях запрос идёт обычным UDP через
+            # выбранный релей: важно лишь, что адрес сервера резолвер не увидит.
+            dns_rules.append({"type": "field", "inboundTag": ["dns-in"], **route})
+        else:
+            dns_outbounds.append({
+                "tag": "dns-out",
+                "protocol": "dns",
+                "settings": {"network": "tcp", "address": dns_host, "port": int(dns_port or 53)},
+                # Запрос уходит не напрямую, а внутрь каскада — иначе смысл
+                # перехвата теряется: адрес сервера видел бы уже DNS-резолвер.
+                "proxySettings": {"tag": RELAY_TAG},
+            })
+            dns_rules.append({"type": "field", "inboundTag": ["dns-in"], "outboundTag": "dns-out"})
 
     # Вход каскада разбирает домен из TLS/HTTP, поэтому до правил доезжает
     # имя, а не адрес, — и чтобы geoip:ru вообще срабатывал, движку нужно
@@ -256,6 +381,7 @@ def build_xray_config(params: dict, dns_server: str = "1.1.1.1", split_ru_direct
 
     return {
         **dns_block,
+        **observatory,
         # access: none — иначе движок пишет строку на КАЖДОЕ соединение
         # клиента в тот же файл, куда идут ошибки. На проде это 23 МБ за
         # четыре дня и постоянная запись на диск ради данных, которые
@@ -353,30 +479,7 @@ def build_xray_config(params: dict, dns_server: str = "1.1.1.1", split_ru_direct
             *dns_inbounds,
         ],
         "outbounds": [
-            {
-                "tag": "cascade-out",
-                "protocol": "vless",
-                "settings": {
-                    "vnext": [
-                        {
-                            "address": params["host"],
-                            "port": params["port"],
-                            "users": [{"id": params["uuid"], "encryption": "none", "flow": params["flow"]}],
-                        }
-                    ]
-                },
-                "streamSettings": {
-                    "network": "tcp",
-                    "security": "reality",
-                    "realitySettings": {
-                        "serverName": params["sni"],
-                        "fingerprint": params["fp"],
-                        "publicKey": params["pbk"],
-                        "shortId": params.get("sid", ""),
-                        "spiderX": "",
-                    },
-                },
-            },
+            *(_relay_outbound(_relay_tag(i), p) for i, p in enumerate([params, *reserves])),
             *dns_outbounds,
             # UseIPv4: адрес для прямого соединения берётся у DNS движка
             # (то есть из его кэша), и берётся именно v4. Без этого имя
@@ -395,14 +498,15 @@ def build_xray_config(params: dict, dns_server: str = "1.1.1.1", split_ru_direct
             # входа, и до geoip дело не доходит никогда. С этим разделение
             # выглядело работающим, а весь трафик шёл в каскад.
             **({"domainStrategy": "IPOnDemand"} if split_ru_direct else {}),
+            **({"balancers": balancers} if balanced else {}),
             "rules": [
                 {"ruleTag": "nf-api", "type": "field", "inboundTag": ["api-in"], "outboundTag": "api"},
-                *(_split_ru_rules() if split_ru_direct else []),
-                {"ruleTag": "nf-default", "type": "field", "inboundTag": ["cascade-in"], "outboundTag": "cascade-out"},
+                *(_split_ru_rules(route) if split_ru_direct else []),
+                {"ruleTag": "nf-default", "type": "field", "inboundTag": ["cascade-in"], **route},
                 # Проба обязана идти тем же путём, что и клиентский трафик,
                 # иначе она проверяет не то. Правил разделения она не
                 # касается: её задача — проверить именно каскад.
-                {"ruleTag": "nf-probe", "type": "field", "inboundTag": ["probe-in"], "outboundTag": "cascade-out"},
+                {"ruleTag": "nf-probe", "type": "field", "inboundTag": ["probe-in"], **probe_route},
                 *dns_rules,
             ]
         },
@@ -425,27 +529,52 @@ def is_running() -> bool:
     return _proc is not None and _proc.poll() is None
 
 
+def intercept_suspended(server) -> bool:
+    """Снят ли перехват клиентов на то время, пока xray не работает.
+
+    Только при «все недоступны - выпускать напрямую»: перехват без xray оставил
+    бы клиентов без сети. При block так и задумано, и перехват остаётся, иначе
+    клиенты вышли бы с адреса сервера.
+
+    Считается на месте, а не хранится: то же значение нужно и правилам в PostUp,
+    и сверке с ядром в надзоре."""
+    return bool(server.cascade_enabled) and all_down_mode(server) == "direct" and not is_running()
+
+
 def sync(server) -> str | None:
-    """Приводит фоновый процесс xray в соответствие с server.cascade_enabled /
-    server.cascade_vless_url. Возвращает текст ошибки (или None, если всё ок
+    """Приводит фоновый процесс xray в соответствие с server.cascade_enabled и
+    списком релеев. Возвращает текст ошибки (или None, если всё ок
     либо каскад просто выключен). Вызывается из config_sync.apply_current_config,
     то есть при каждом сохранении/apply/restart настроек сервера — best effort,
     как и всё остальное управление в этой панели."""
-    global _proc, _last_config
+    global _proc, _last_config, _wanted, _running_relays
     with _lock:
-        if not getattr(server, "cascade_enabled", False) or not (server.cascade_vless_url or "").strip():
+        urls = relay_urls(server)
+        if not getattr(server, "cascade_enabled", False) or not urls:
+            _wanted = False
             _stop_locked()
             return None
 
+        _wanted = True
         if not (XRAY_BIN and Path(XRAY_BIN).exists()):
             _stop_locked()
             return "Бинарник xray не найден в образе — пересоберите контейнер (см. Dockerfile)"
 
-        try:
-            params = parse_vless_url(server.cascade_vless_url)
-        except VlessParseError as exc:
+        # Испорченная ссылка резервного релея не повод оставлять клиентов без
+        # основного: работаем с теми, что разобрались, и говорим об остальных.
+        parsed: list[dict] = []
+        bad: list[str] = []
+        for url in urls:
+            try:
+                parsed.append(parse_vless_url(url))
+            except VlessParseError as exc:
+                bad.append(str(exc))
+        if not parsed:
+            # Без правки настроек повторять незачем.
+            _wanted = False
             _stop_locked()
-            return str(exc)
+            return bad[0]
+        partial_error = f"Часть релеев пропущена: {'; '.join(bad)}" if bad else None
 
         dns_server = (getattr(server, "dns", "") or "1.1.1.1").split(",")[0].strip()
 
@@ -458,13 +587,15 @@ def sync(server) -> str | None:
         if geoip_missing:
             split = False
 
-        config = build_xray_config(params, dns_server, split_ru_direct=split)
+        config = build_xray_config(parsed[0], dns_server, split_ru_direct=split,
+                                   reserves=parsed[1:], all_down=all_down_mode(server))
+        relay_hosts = {_relay_tag(i): p["host"] for i, p in enumerate(parsed)}
 
         # Ничего не поменялось — не трогаем работающий процесс: перезапуск
         # рвёт все установленные соединения клиентов разом, а сохранение
         # настроек сервера случается по любому поводу.
         if is_running() and _last_config == config:
-            return None
+            return partial_error
 
         _stop_locked()
         CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -481,6 +612,7 @@ def sync(server) -> str | None:
         except OSError as exc:
             return f"Не удалось запустить xray: {exc}"
         _last_config = config
+        _running_relays = relay_hosts
         try:
             _proc.wait(timeout=0.4)
         except subprocess.TimeoutExpired:
@@ -492,7 +624,7 @@ def sync(server) -> str | None:
                 f"Разделение маршрутов включено, но базы geoip нет ({GEOIP_PATH}) — "
                 "весь трафик идёт через каскад. Обновите образ панели: база кладётся в него при сборке."
             )
-        return _tproxy_sockopt_error(log_offset)
+        return _tproxy_sockopt_error(log_offset) or partial_error
 
 
 def _tproxy_sockopt_error(log_offset: int) -> str | None:
@@ -566,7 +698,7 @@ def verify() -> tuple[bool, str | None]:
         out = subprocess.run(
             ["curl", "--silent", "--output", "/dev/null", "--write-out", "%{http_code}",
              "--max-time", str(PROBE_TIMEOUT_SECONDS),
-             "--proxy", f"socks5h://127.0.0.1:{PROBE_PORT}", PROBE_URL],
+             "--proxy", f"socks5h://127.0.0.1:{PROBE_PORT}", probe_url()],
             capture_output=True,
             text=True,
             timeout=PROBE_TIMEOUT_SECONDS + 5,
@@ -596,27 +728,107 @@ def health() -> dict:
 
 
 def _record(ok: bool, error: str | None) -> None:
-    from datetime import datetime, timezone
     with _lock:
         _health["verified_ok"] = ok
         _health["verified_at"] = datetime.now(timezone.utc).isoformat()
         _health["verify_error"] = error
 
 
+def restart_delay(attempt: int) -> int:
+    return RESTART_DELAYS_SECONDS[min(attempt, len(RESTART_DELAYS_SECONDS) - 1)]
+
+
+def _note_down() -> None:
+    """xray только что упал: снять перехват сразу, не дожидаясь перезапуска."""
+    from . import config_sync
+    from .database import SessionLocal
+
+    db = SessionLocal()
+    try:
+        server = config_sync.get_server(db)
+        if intercept_suspended(server):
+            config_sync.ensure_rules(server, config_sync.interface_names(db, server))
+    finally:
+        db.close()
+
+
+def _restart() -> bool:
+    """Поднять xray и вернуть правила. False: поднимать не понадобилось.
+
+    apply_lock берём здесь, а не в sync: при плановом перезапуске процесс тоже
+    умирает, и сторож видит это раньше, чем sync успевает запустить новый. Под
+    замком sync уже закончил, и остаётся проверить, что работа сделана."""
+    from . import config_sync
+    from .database import SessionLocal
+
+    with config_sync.apply_lock:
+        if is_running() or not _wanted:
+            return False
+        db = SessionLocal()
+        try:
+            server = config_sync.get_server(db)
+            error = sync(server)
+            with _lock:
+                _health["restarts"] += 1
+                _health["last_restart_at"] = datetime.now(timezone.utc).isoformat()
+            if error or not is_running():
+                _record(False, error or "не удалось поднять xray")
+            server.cascade_last_error = error
+            db.add(server)
+            db.commit()
+            config_sync.ensure_rules(server, config_sync.interface_names(db, server))
+        finally:
+            db.close()
+    _verify_soon.set()
+    return True
+
+
+def watch(stop_event) -> None:
+    """Сторож процесса xray.
+
+    Мёртвый xray при живом правиле перехвата = у всех клиентов молча пропадает
+    весь трафик. Раньше смерть замечалась раз в 30 секунд; здесь поток стоит на
+    proc.wait() и узнаёт о ней сразу."""
+    attempt = 0
+    started_at = time.monotonic()
+    while not stop_event.is_set():
+        try:
+            proc = _proc
+            if proc is None and not _wanted:
+                stop_event.wait(WATCH_POLL_SECONDS)
+                continue
+            if proc is not None:
+                try:
+                    proc.wait(timeout=WATCH_POLL_SECONDS)
+                except subprocess.TimeoutExpired:
+                    if time.monotonic() - started_at >= STABLE_SECONDS:
+                        attempt = 0
+                    continue
+            if not _wanted:
+                stop_event.wait(0.05)
+                continue
+
+            _note_down()
+            if stop_event.wait(restart_delay(attempt)):
+                return
+            if _restart():
+                attempt += 1
+            started_at = time.monotonic()
+        except Exception as exc:
+            # Сторож не имеет права падать: он последняя линия обороны.
+            print(f"[cascade] сторож xray: {exc}")
+            stop_event.wait(WATCH_POLL_SECONDS)
+
+
 def supervise(stop_event) -> None:
-    """Фоновый надзор за каскадом.
+    """Фоновый надзор за каскадом: ловит «running: true» при нулевом трафике,
+    когда процесс есть, а каскада нет. За самим процессом смотрит watch().
 
-    Решает две беды разом:
-      1. Мёртвый xray при живом правиле перехвата = у всех клиентов молча
-         пропадает весь TCP. Раньше это чинилось только руками через UI.
-      2. «running: true» при нулевом трафике: процесс есть, каскада нет.
-
-    Живость проверяется дёшево и часто, реальная проба — редко (она стоит
-    сетевого запроса)."""
+    Реальная проба стоит сетевого запроса, поэтому идёт редко."""
     from .database import SessionLocal
     from .models import ServerConfig
 
-    backoff = BACKOFF_START_SECONDS
+    global _wanted
     last_verify = 0.0
 
     while not stop_event.wait(SUPERVISE_INTERVAL_SECONDS):
@@ -625,28 +837,21 @@ def supervise(stop_event) -> None:
             server = db.query(ServerConfig).first()
             if server is None:
                 continue
-            wanted = bool(server.cascade_enabled) and bool((server.cascade_vless_url or "").strip())
+            wanted = bool(server.cascade_enabled) and bool(relay_urls(server))
             if not wanted:
                 continue
 
+            # Без автоприменения на старте sync ещё не вызывался: стороже нужно
+            # знать, что xray должен работать.
+            _wanted = True
             if not is_running():
-                from datetime import datetime, timezone
-                error = sync(server)
-                with _lock:
-                    _health["restarts"] += 1
-                    _health["last_restart_at"] = datetime.now(timezone.utc).isoformat()
-                if error or not is_running():
-                    _record(False, error or "не удалось поднять xray")
-                    stop_event.wait(backoff)
-                    backoff = min(backoff * 2, BACKOFF_MAX_SECONDS)
-                    continue
-                backoff = BACKOFF_START_SECONDS
-                last_verify = 0.0  # после перезапуска проверяем сразу
+                continue
 
             _rotate_log_if_needed()
 
             now = time.monotonic()
-            if now - last_verify >= VERIFY_EVERY_SECONDS:
+            if _verify_soon.is_set() or now - last_verify >= VERIFY_EVERY_SECONDS:
+                _verify_soon.clear()
                 ok, error = verify()
                 _record(ok, error)
                 last_verify = now
@@ -655,6 +860,31 @@ def supervise(stop_event) -> None:
             pass
         finally:
             db.close()
+
+
+def active_relay() -> str | None:
+    """Адрес релея, который xray выбрал сейчас. None: живых нет, выбирать не из
+    чего (один релей) или xray не ответил."""
+    if len(_running_relays) < 2 or not is_running():
+        return None
+    try:
+        out = subprocess.run(
+            [XRAY_BIN, "api", "bi", f"-server={STATS_API_ADDR}", BALANCER_TAG],
+            capture_output=True, text=True, timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return _running_relays.get(_selected_tag(out.stdout))
+
+
+def _selected_tag(output: str) -> str | None:
+    """Выбранный исходящий из вывода `xray api bi`. У команды нет JSON-режима,
+    вывод текстовый:
+      - Selects:
+        1   cascade-out
+    """
+    match = re.search(r"Selects:\s*\n\s*\d+\s+(\S+)", output)
+    return match.group(1) if match else None
 
 
 # Счётчики спрашивает и график истории (раз в HISTORY_INTERVAL секунд), и
