@@ -72,33 +72,36 @@ def create_peer(payload: PeerCreate, db: Session = Depends(get_db), _admin: str 
             )
         subnet = tunnel.address
 
-    # Занятые адреса — по всем клиентам и всем интерфейсам: подсети разные,
-    # но лишняя проверка дешевле пересечения, если их когда-то сдвинут.
-    used_ips = {a for (a,) in db.query(Peer.address).all()}
-    used_ips = {ip.split("/")[0] for ip in used_ips}
-    used_ips.add(server.address.split("/")[0])
-    used_ips.update(t.address.split("/")[0] for t in config_sync.get_tunnels(db))
-    try:
-        address = next_available_ip(subnet, used_ips)
-    except ValueError as exc:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
-
     priv, pub = crypto.generate_keypair()
-    peer = Peer(
-        name=payload.name,
-        private_key=priv,
-        public_key=pub,
-        preshared_key=crypto.generate_preshared_key(),
-        address=address,
-        allowed_ips_client=payload.allowed_ips_client,
-        dns_override=payload.dns_override,
-        persistent_keepalive=payload.persistent_keepalive,
-        enabled=True,
-        note=payload.note,
-        protocol=payload.protocol,
-    )
-    db.add(peer)
-    db.commit()
+    # Под замком от выбора адреса до коммита: иначе два одновременных запроса
+    # видят один и тот же свободный адрес и получают его оба.
+    with config_sync.apply_lock:
+        # Занятые адреса — по всем клиентам и всем интерфейсам: подсети разные,
+        # но лишняя проверка дешевле пересечения, если их когда-то сдвинут.
+        used_ips = {a for (a,) in db.query(Peer.address).all()}
+        used_ips = {ip.split("/")[0] for ip in used_ips}
+        used_ips.add(server.address.split("/")[0])
+        used_ips.update(t.address.split("/")[0] for t in config_sync.get_tunnels(db))
+        try:
+            address = next_available_ip(subnet, used_ips)
+        except ValueError as exc:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+
+        peer = Peer(
+            name=payload.name,
+            private_key=priv,
+            public_key=pub,
+            preshared_key=crypto.generate_preshared_key(),
+            address=address,
+            allowed_ips_client=payload.allowed_ips_client,
+            dns_override=payload.dns_override,
+            persistent_keepalive=payload.persistent_keepalive,
+            enabled=True,
+            note=payload.note,
+            protocol=payload.protocol,
+        )
+        db.add(peer)
+        db.commit()
     db.refresh(peer)
 
     config_sync.apply_current_config(db)  # best-effort, ошибки не блокируют создание

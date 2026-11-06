@@ -39,6 +39,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlparse
 
 from .config import DATA_DIR, settings
+from .fsutil import atomic_write
 
 XRAY_BIN = shutil.which("xray") or "/usr/local/bin/xray"
 CONFIG_PATH = DATA_DIR / "cascade-xray-config.json"
@@ -467,8 +468,7 @@ def sync(server) -> str | None:
 
         _stop_locked()
         CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
-        CONFIG_PATH.write_text(json.dumps(config, indent=2))
-        CONFIG_PATH.chmod(0o600)
+        atomic_write(CONFIG_PATH, json.dumps(config, indent=2), 0o600)
         # Запоминаем, где кончается лог, чтобы потом читать только то, что
         # написал именно этот запуск, а не жалобы прошлого.
         log_offset = LOG_PATH.stat().st_size if LOG_PATH.exists() else 0

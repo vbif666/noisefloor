@@ -494,6 +494,27 @@ STUB
     else
         fail "ошибка правил висит и после восстановления"
     fi
+
+    # Двадцать одновременных созданий: ни один клиент не должен потеряться,
+    # ни адрес совпасть.
+    local i
+    for i in $(seq 1 20); do
+        curl -kfsS -o /dev/null -X POST "https://127.0.0.1:$port/api/peers" \
+            -H "Authorization: Bearer $token" -H 'Content-Type: application/json' \
+            -d "{\"name\":\"p$i\"}" &
+    done
+    wait
+
+    local live unique
+    live="$(docker exec "$c" awg show awg-smoke0 peers | wc -l)"
+    unique="$(curl -kfsS -H "Authorization: Bearer $token" "https://127.0.0.1:$port/api/peers" \
+        | python3 -c 'import json,sys; print(len({p["address"] for p in json.load(sys.stdin)}))')"
+    [ "$live" = 20 ] \
+        && pass "20 параллельных созданий: все 20 пиров на интерфейсе" \
+        || fail "параллельное создание: на интерфейсе $live пиров из 20"
+    [ "$unique" = 20 ] \
+        && pass "у всех 20 клиентов разные адреса" \
+        || fail "параллельное создание: разных адресов $unique из 20"
 }
 
 # ------------------------------------------------------------------ main ----

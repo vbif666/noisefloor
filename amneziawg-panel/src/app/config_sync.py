@@ -11,6 +11,13 @@ from .models import Peer, ServerConfig, Tunnel
 # Код `noisefloor-rules check`: правила снесли снаружи (ufw reset, iptables -F).
 RULES_DRIFT_EXIT_CODE = 4
 
+# Применение конфига целиком, от чтения БД до правил фаервола. Запросы панели
+# идут в разных потоках, а ещё есть надзор и синхронизация с релеем. Без замка
+# поток с более старым снимком пиров мог записать конфиг последним и убрать с
+# интерфейса только что созданного клиента. RLock: под ним же выделяется адрес
+# клиента, а применение зовётся и изнутри.
+apply_lock = threading.RLock()
+
 _rules_lock = threading.Lock()
 _rules_status: dict = {
     "ok": None,            # None: ещё не проверяли или правил быть не должно
@@ -76,14 +83,15 @@ def ensure_rules(server: ServerConfig, interfaces: list[str]) -> awg_manager.Com
     if not server.egress_interface or not awg_manager.tools_available():
         return None
     up, _down = awg_config.rules_commands(server, interfaces)
-    state = awg_manager.run_rules([up[0], "check", *up[2:]])
-    if state.ok:
-        with _rules_lock:
-            _rules_status.update(ok=True, error=None)
-        return state
+    with apply_lock:
+        state = awg_manager.run_rules([up[0], "check", *up[2:]])
+        if state.ok:
+            with _rules_lock:
+                _rules_status.update(ok=True, error=None)
+            return state
 
-    drifted = state.code == RULES_DRIFT_EXIT_CODE
-    result = awg_manager.run_rules(up)
+        drifted = state.code == RULES_DRIFT_EXIT_CODE
+        result = awg_manager.run_rules(up)
     with _rules_lock:
         _rules_status.update(ok=result.ok, error=None if result.ok else result.output)
         if result.ok and drifted:
@@ -113,11 +121,22 @@ def apply_current_config(db: Session, *, restart: bool = False,
     server = get_server(db)
 
     # Если настроена синхронизация, сначала забираем у релея актуальные
-    # параметры — иначе применим заведомо устаревшую ссылку.
+    # параметры — иначе применим заведомо устаревшую ссылку. Это сетевой
+    # запрос, поэтому до замка: недоступный релей не должен держать всю панель.
     if server.cascade_enabled and (server.cascade_sync_url or "").strip():
         from . import cascade_sync
         cascade_sync.sync_once(db)
-        server = get_server(db)
+
+    with apply_lock:
+        # Сохранить то, что вызывающий ещё не закоммитил, и сбросить кэш сессии:
+        # читать надо то, что есть в БД к моменту получения замка.
+        db.commit()
+        return _apply_locked(db, restart=restart, restart_tunnels=restart_tunnels)
+
+
+def _apply_locked(db: Session, *, restart: bool,
+                  restart_tunnels: frozenset[str]) -> awg_manager.CommandResult:
+    server = get_server(db)
 
     # Каскад (xray -> VLESS) применяется ДО рендера awg-конфига: REDIRECT-
     # правило в PostUp имеет смысл только если процесс, на который оно

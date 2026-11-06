@@ -294,7 +294,9 @@ def sync_once(db) -> tuple[bool, str | None]:
     if changed:
         # Достаточно перезапустить каскадный xray: правила фаервола от
         # ссылки не зависят, поэтому туннель клиентов не трогаем.
-        error = cascade.sync(server)
+        from .config_sync import apply_lock
+        with apply_lock:
+            error = cascade.sync(server)
         if error:
             server.cascade_last_error = error
             db.add(server)

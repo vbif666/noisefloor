@@ -10,15 +10,18 @@
 """
 from __future__ import annotations
 
+import re
 import shutil
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
 from .config import settings
+from .fsutil import atomic_write
 
 AWG_QUICK_BIN = shutil.which("awg-quick")
 AWG_BIN = shutil.which("awg")
+_PUBLIC_KEY_RE = re.compile(r"^\s*PublicKey\s*=\s*(\S+)", re.MULTILINE)
 
 
 @dataclass
@@ -68,9 +71,60 @@ def write_config_file(interface_name: str, content: str) -> Path:
     path = _config_path(interface_name)
     path.parent.mkdir(parents=True, exist_ok=True)
     # 0600: файл содержит приватные ключи всех клиентов
-    path.write_text(content)
-    path.chmod(0o600)
+    atomic_write(path, content, 0o600)
     return path
+
+
+def expected_peers(config_text: str) -> set[str]:
+    """Публичные ключи пиров из конфига. В [Interface] ключ приватный, так
+    что PublicKey встречается только у пиров."""
+    return set(_PUBLIC_KEY_RE.findall(config_text))
+
+
+def live_peers(interface_name: str) -> set[str] | None:
+    """Пиры, которые реально стоят на интерфейсе. None: спросить не удалось."""
+    result = _run([AWG_BIN, "show", interface_name, "peers"])
+    return set(result.output.split()) if result.ok else None
+
+
+def _syncconf(interface_name: str, path: Path) -> CommandResult:
+    # Горячее применение: awg-quick strip убирает Address/MTU/PostUp/PostDown,
+    # оставляя только то, что понимает `awg setconf`/`syncconf`.
+    strip = subprocess.run([AWG_QUICK_BIN, "strip", str(path)], capture_output=True, text=True)
+    if strip.returncode != 0:
+        return CommandResult(False, strip.stderr.strip() or "awg-quick strip завершился с ошибкой")
+
+    stripped_path = path.with_suffix(".stripped.conf")
+    atomic_write(stripped_path, strip.stdout, 0o600)
+    try:
+        return _run([AWG_BIN, "syncconf", interface_name, str(stripped_path)])
+    finally:
+        stripped_path.unlink(missing_ok=True)
+
+
+def _reconcile(interface_name: str, path: Path, config_text: str, result: CommandResult) -> CommandResult:
+    """Сверить пиров на интерфейсе с конфигом и один раз повторить применение.
+
+    syncconf может вернуть успех, а клиента на интерфейсе не окажется. Снаружи
+    это выглядит как рабочая панель и клиент без связи, поэтому успехом
+    считается только совпадение с ядром."""
+    if not result.ok:
+        return result
+    expected = expected_peers(config_text)
+    if live_peers(interface_name) == expected:
+        return result
+
+    print(f"[awg] {interface_name}: пиры расходятся с конфигом, повторяю применение")
+    retry = _syncconf(interface_name, path)
+    if not retry.ok:
+        return retry
+    live = live_peers(interface_name)
+    if live == expected:
+        return retry
+    if live is None:
+        return CommandResult(False, f"{interface_name}: не удалось получить список пиров")
+    return CommandResult(False, f"{interface_name}: пиры не совпадают с конфигом: "
+                                f"не хватает {len(expected - live)}, лишних {len(live - expected)}")
 
 
 def apply(interface_name: str, config_text: str) -> CommandResult:
@@ -85,21 +139,10 @@ def apply(interface_name: str, config_text: str) -> CommandResult:
     path = write_config_file(interface_name, config_text)
 
     if not interface_is_up(interface_name):
-        return _run([AWG_QUICK_BIN, "up", str(path)])
-
-    # Горячее применение: awg-quick strip убирает Address/MTU/PostUp/PostDown,
-    # оставляя только то, что понимает `awg setconf`/`syncconf`.
-    strip = subprocess.run([AWG_QUICK_BIN, "strip", str(path)], capture_output=True, text=True)
-    if strip.returncode != 0:
-        return CommandResult(False, strip.stderr.strip() or "awg-quick strip завершился с ошибкой")
-
-    stripped_path = path.with_suffix(".stripped.conf")
-    stripped_path.write_text(strip.stdout)
-    stripped_path.chmod(0o600)
-    try:
-        return _run([AWG_BIN, "syncconf", interface_name, str(stripped_path)])
-    finally:
-        stripped_path.unlink(missing_ok=True)
+        result = _run([AWG_QUICK_BIN, "up", str(path)])
+    else:
+        result = _syncconf(interface_name, path)
+    return _reconcile(interface_name, path, config_text, result)
 
 
 def restart(interface_name: str, config_text: str) -> CommandResult:
@@ -117,7 +160,7 @@ def restart(interface_name: str, config_text: str) -> CommandResult:
         if not down.ok:
             return down
     new_path = write_config_file(interface_name, config_text)
-    return _run([AWG_QUICK_BIN, "up", str(new_path)])
+    return _reconcile(interface_name, new_path, config_text, _run([AWG_QUICK_BIN, "up", str(new_path)]))
 
 
 def down(interface_name: str) -> CommandResult:
