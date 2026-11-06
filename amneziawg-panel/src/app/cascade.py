@@ -392,7 +392,8 @@ def build_xray_config(params: dict, dns_server: str = "1.1.1.1", split_ru_direct
         # RoutingService нужен, чтобы менять набор правил на ходу
         # (`xray api adrules`): таблица исключений меняется часто, а
         # перезапуск движка рвёт все соединения клиентов разом.
-        "api": {"tag": "api", "services": ["StatsService", "RoutingService"]},
+        # HandlerService - замена исходящего при смене SNI, см. _swap_outbounds.
+        "api": {"tag": "api", "services": ["StatsService", "RoutingService", "HandlerService"]},
         "policy": {
             # Без этого блока действуют умолчания движка, а они для
             # прокси-режима вредны:
@@ -597,6 +598,14 @@ def sync(server) -> str | None:
         if is_running() and _last_config == config:
             return partial_error
 
+        # Сменились только параметры релея, чаще всего SNI: ротация.
+        changed = _changed_outbounds(_last_config, config) if is_running() else None
+        if changed and _swap_outbounds(changed):
+            atomic_write(CONFIG_PATH, json.dumps(config, indent=2), 0o600)
+            _last_config = config
+            _running_relays = relay_hosts
+            return partial_error
+
         _stop_locked()
         CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
         atomic_write(CONFIG_PATH, json.dumps(config, indent=2), 0o600)
@@ -625,6 +634,46 @@ def sync(server) -> str | None:
                 "весь трафик идёт через каскад. Обновите образ панели: база кладётся в него при сборке."
             )
         return _tproxy_sockopt_error(log_offset) or partial_error
+
+
+def _changed_outbounds(old: dict | None, new: dict) -> list[dict] | None:
+    """Исходящие, которыми отличается новый конфиг. None: отличается чем-то ещё,
+    на ходу это не применить."""
+    if old is None:
+        return None
+    before = {o["tag"]: o for o in old["outbounds"]}
+    after = {o["tag"]: o for o in new["outbounds"]}
+    rest = lambda config: {k: v for k, v in config.items() if k != "outbounds"}
+    if list(before) != list(after) or rest(old) != rest(new):
+        return None
+    return [o for tag, o in after.items() if before[tag] != o]
+
+
+def _swap_outbounds(outbounds: list[dict]) -> bool:
+    """Заменить исходящие в работающем xray. False: не вышло, нужен перезапуск.
+
+    В плане стояли отдельные исходящие на каждый SNI и смена правила, но правила
+    с балансировщиком выбирают не исходящий, а весь набор. Тег же остаётся
+    прежним, и балансировщику с пробами менять нечего. Соединения, начатые через
+    старый исходящий, живут до конца: rmo закрывает только сам обработчик.
+
+    Новые соединения, пришедшиеся на миг между rmo и ado, закрываются: мимо релея
+    они не уйдут, смок это проверяет. Если ado не прошёл, исходящего нет совсем, и
+    отказ здесь ведёт к перезапуску."""
+    swap_file = CONFIG_PATH.with_name("cascade-xray-swap.json")
+    try:
+        for outbound in outbounds:
+            atomic_write(swap_file, json.dumps({"outbounds": [outbound]}), 0o600)
+            for args in (["rmo", outbound["tag"]], ["ado", str(swap_file)]):
+                out = subprocess.run([XRAY_BIN, "api", args[0], f"-server={STATS_API_ADDR}", args[1]],
+                                     capture_output=True, text=True, timeout=5)
+                if out.returncode != 0:
+                    return False
+        return True
+    except (OSError, subprocess.SubprocessError):
+        return False
+    finally:
+        swap_file.unlink(missing_ok=True)
 
 
 def _tproxy_sockopt_error(log_offset: int) -> str | None:

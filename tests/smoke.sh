@@ -18,6 +18,7 @@
 #   tests/smoke.sh --install-only
 #   tests/smoke.sh --canary-only
 #   tests/smoke.sh --failover-only
+#   tests/smoke.sh --rotation-only [секунд загрузки, по умолчанию 60]
 #   tests/smoke.sh --selfcheck-only
 #   RELAY_IMAGE=... PANEL_IMAGE=... tests/smoke.sh
 #
@@ -454,7 +455,7 @@ canary_stand() {
     docker network create --subnet 100.64.78.0/24 smoke-canary-lan >/dev/null
 
     cat > "$dir/web.py" <<'PY'
-import os, socket, threading
+import os, socket, threading, time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 BODY = os.urandom(1048576)
@@ -476,6 +477,17 @@ class Handler(BaseHTTPRequestHandler):
             self.do_HEAD()
             return
         self.remember()
+        if self.path.startswith("/slow/"):
+            # Медленная загрузка: 10 КБ в секунду, длительность в адресе.
+            seconds = int(self.path.rsplit("/", 1)[1])
+            self.send_response(200)
+            self.send_header("Content-Length", str(seconds * 10240))
+            self.end_headers()
+            for _ in range(seconds):
+                self.wfile.write(b"x" * 10240)
+                self.wfile.flush()
+                time.sleep(1)
+            return
         body = BODY if self.path == "/1mb" else f"ip={self.client_address[0]}\n".encode()
         self.send_response(200)
         self.send_header("Content-Length", str(len(body)))
@@ -497,6 +509,7 @@ PY
 
     docker run -d --name smoke-canary-relay --network "$net" --ip 5.5.77.20 \
         -e LABEL=smoke-canary -e APP_CODENAME=SmokeCanary -e PUBLIC_HOST=5.5.77.20 \
+        -e ADMIN_PASSWORD=smoke-relay-pass \
         -v "$dir/relay:/data" "$RELAY_IMAGE" >/dev/null
     if ! wait_for 45 test -s "$dir/relay/creds.json"; then
         fail "релей стенда не поднялся"
@@ -821,6 +834,197 @@ assert [b["tag"] for b in config["routing"]["balancers"]] == ["relays", "relays-
 
 # ---------------------------------------- самопроверка релея и откат агента ----
 
+relay_api() {
+    # Вход формой, как у администратора: у стендового релея нет проброшенного порта.
+    docker exec smoke-canary-relay sh -c '
+        [ -s /tmp/jar ] || curl -kfsS -o /dev/null -c /tmp/jar --data-urlencode username=admin \
+            --data-urlencode password=smoke-relay-pass https://127.0.0.1:8001/login
+        curl -kfsS -b /tmp/jar "$@"' sh "$@"
+}
+
+relay_xray_pid() {
+    docker exec smoke-canary-relay python -c '
+import os
+for pid in filter(str.isdigit, os.listdir("/proc")):
+    try:
+        cmd = open(f"/proc/{pid}/cmdline", "rb").read()
+    except OSError:
+        continue
+    if cmd.startswith(b"/usr/local/bin/xray\0run") and b"xray-config.json" in cmd:
+        print(pid)
+        break
+' 2>/dev/null
+}
+
+relay_router_reaches() {
+    # Сертификат отдаёт сам хост: значит, nginx выбрал его по SNI.
+    docker exec smoke-canary-relay sh -c "openssl s_client -connect 127.0.0.1:18443 -servername $1 \
+        </dev/null 2>/dev/null | openssl x509 -noout -ext subjectAltName 2>/dev/null" | grep -qF "$1"
+}
+
+relay_xray_replaced() {
+    local now
+    now="$(relay_xray_pid)"
+    [ -n "$now" ] && [ "$now" != "$1" ]
+}
+
+panel_reaches_web() {
+    [ "$(docker exec smoke-canary-panel curl -sS --max-time 5 \
+        --socks5-hostname 127.0.0.1:10087 http://5.5.77.10/ip 2>/dev/null)" = "ip=5.5.77.20" ]
+}
+
+relay_uses_router() {
+    docker exec smoke-canary-relay grep -q '"dest": "127.0.0.1:18443"' /data/xray-config.json
+}
+
+panel_sni() {
+    docker exec smoke-canary-panel python -c '
+import json
+config = json.load(open("/opt/panel/data/cascade-xray-config.json"))
+print(config["outbounds"][0]["streamSettings"]["realitySettings"]["serverName"])'
+}
+
+relay_sni() {
+    docker exec smoke-canary-relay python -c 'import json; print(json.load(open("/data/creds.json"))["sni"])'
+}
+
+panel_follows_relay() {
+    [ "$(panel_sni)" = "$(relay_sni)" ]
+}
+
+panel_sync() {
+    curl -kfsS -o /dev/null -X POST "https://127.0.0.1:$CANARY_PANEL_PORT/api/server/cascade/sync" \
+        -H "Authorization: Bearer $CANARY_TOKEN"
+}
+
+cascade_downlink() {
+    docker exec smoke-canary-panel xray api stats -server=127.0.0.1:10086 \
+        -name 'outbound>>>cascade-out>>>traffic>>>downlink' 2>/dev/null \
+        | python3 -c 'import json,sys; print(json.load(sys.stdin)["stat"].get("value", 0))' 2>/dev/null \
+        || echo 0
+}
+
+# Смена SNI не рвёт идущую загрузку: принудительная ротация посреди неё.
+test_rotation() {
+    local seconds="${1:-60}" dir="$WORKDIR/rotation" c=smoke-canary-panel
+    echo
+    echo "Ротация SNI без обрывов, загрузка $seconds с  ($PANEL_IMAGE)"
+    canary_stand rotation 30 || return
+
+    # Включение ротации меняет конфиг: это единственный разрешённый перезапуск.
+    local started
+    started="$(relay_xray_pid)"
+    relay_api -o /dev/null --data-urlencode enabled=on --data-urlencode interval_hours=24 \
+        --data-urlencode 'pool=dl.google.com
+www.amd.com
+www.dell.com
+www.asus.com' https://127.0.0.1:8001/api/rotation \
+        || { fail "релей не принял пул"; return; }
+    wait_for 15 relay_uses_router && wait_for 30 relay_xray_replaced "$started" \
+        && pass "релей ведёт REALITY через маршрутизатор" \
+        || { fail "маршрутизатор не включился"; docker logs smoke-canary-relay 2>&1 | tail -8; return; }
+    relay_router_reaches www.amd.com \
+        && pass "маршрутизатор довёл до хоста из пула" || fail "маршрутизатор не довёл до хоста из пула"
+
+    local body
+    body="$(python3 - "$dir/relay/creds.json" <<'PY'
+import json, sys
+c = json.load(open(sys.argv[1]))
+print(json.dumps({"cascade_sync_url": "https://5.5.77.20:8001", "cascade_sync_token": c["sync_token"]}))
+PY
+)"
+    api_put_server "$body" || { fail "панель не приняла синхронизацию"; return; }
+    panel_sync || fail "синхронизация с релеем не прошла"
+    wait_for 40 panel_reaches_web || fail "стенд: каскад не вернулся после включения"
+
+    local panel_pid relay_pid first second bytes got
+    panel_pid="$(panel_xray_pid)"
+    relay_pid="$(relay_xray_pid)"
+    [ -n "$panel_pid" ] && [ -n "$relay_pid" ] || { fail "стенд: нет PID xray"; return; }
+
+    docker exec -d "$c" sh -c "curl -sS -o /tmp/slow --stderr /tmp/slow.err --max-time $(( seconds + 30 )) \
+        --socks5-hostname 127.0.0.1:10087 http://5.5.77.10/slow/$seconds; echo \$? > /tmp/slow.exit"
+    sleep_seconds 5
+
+    # Запросы всё время смены: ни один не должен выйти мимо релея.
+    web_forget
+    docker exec -d "$c" sh -c 'for i in $(seq 1 150); do
+        curl -s -o /dev/null --max-time 2 --socks5-hostname 127.0.0.1:10087 http://5.5.77.10/hammer & sleep 0.1
+    done'
+
+    first="$(relay_sni)"
+    relay_api -o /dev/null -X POST https://127.0.0.1:8001/api/rotation/now || fail "ротация не запустилась"
+    second="$(relay_sni)"
+    [ "$first" != "$second" ] && pass "релей сменил SNI: $first -> $second" || fail "SNI не сменился"
+    panel_sync || fail "синхронизация после ротации не прошла"
+    wait_for 15 panel_follows_relay && pass "панель перешла на новый SNI" \
+        || fail "панель осталась на $(panel_sni), релей на $(relay_sni)"
+
+    if [ "$(relay_xray_pid)" = "$relay_pid" ]; then
+        pass "xray релея не перезапускался"
+    else
+        fail "xray релея перезапущен: $relay_pid -> $(relay_xray_pid)"
+        relay_api https://127.0.0.1:8001/api/status | head -c 600; echo
+        docker logs smoke-canary-relay 2>&1 | tail -25
+    fi
+    [ "$(panel_xray_pid)" = "$panel_pid" ] && pass "xray панели не перезапускался" || fail "xray панели перезапущен"
+
+    local before after
+    before="$(cascade_downlink)"
+    got="$(docker exec "$c" curl -sS --max-time 10 --socks5-hostname 127.0.0.1:10087 http://5.5.77.10/ip)"
+    [ "$got" = "ip=5.5.77.20" ] && pass "новое соединение идёт через релей с новым SNI" \
+        || fail "новое соединение после смены: $got"
+    docker exec "$c" curl -sS -o /dev/null --max-time 10 --socks5-hostname 127.0.0.1:10087 http://5.5.77.10/1mb
+    after="$(cascade_downlink)"
+    [ "$after" -gt "$before" ] && pass "счётчики исходящего считают после замены: $before -> $after" \
+        || fail "счётчики исходящего встали после замены: $before -> $after"
+
+    sleep_seconds 18
+    web_saw 5.5.77.30 && fail "во время смены запрос вышел мимо релея" \
+        || pass "во время смены ни один запрос не вышел мимо релея"
+    web_saw 5.5.77.20 && pass "запросы шли через релей" || fail "контроль: журнал web пуст"
+
+    wait_for $(( seconds + 30 )) docker exec "$c" test -s /tmp/slow.exit || fail "загрузка не закончилась"
+    got="$(docker exec "$c" cat /tmp/slow.exit)"
+    bytes="$(docker exec "$c" stat -c %s /tmp/slow)"
+    if [ "$got" = 0 ] && [ "$bytes" = "$(( seconds * 10240 ))" ]; then
+        pass "загрузка на $seconds с пережила ротацию: $bytes байт"
+    else
+        fail "загрузка оборвалась: код $got, байт $bytes из $(( seconds * 10240 ))"
+        docker exec "$c" cat /tmp/slow.err
+        docker exec "$c" tail -15 /opt/panel/data/cascade-xray.log
+    fi
+
+    started="$(relay_xray_pid)"
+    relay_api -o /dev/null --data-urlencode enabled=on --data-urlencode extra=geohide.example \
+        https://127.0.0.1:8001/api/geohide || fail "релей не принял GeoHide"
+    wait_for 30 relay_xray_replaced "$started" || fail "стенд: включение GeoHide не применилось"
+    relay_pid="$(relay_xray_pid)"
+    relay_api -o /dev/null -X POST https://127.0.0.1:8001/api/geohide/refresh || fail "обновление GeoHide не прошло"
+    relay_api -o /dev/null -X POST https://127.0.0.1:8001/api/geohide/refresh || fail "обновление GeoHide не прошло"
+    # Дольше отложенного перезапуска.
+    sleep_seconds 20
+    [ "$(relay_xray_pid)" = "$relay_pid" ] \
+        && pass "повторный geohide_apply не перезапускает xray" || fail "geohide_apply перезапустил xray"
+
+    # Упавший маршрутизатор поднимает сторож, иначе не пройдёт ни одно рукопожатие.
+    docker exec smoke-canary-relay python -c '
+import os, signal
+for pid in filter(str.isdigit, os.listdir("/proc")):
+    try:
+        cmd = open(f"/proc/{pid}/cmdline", "rb").read()
+    except OSError:
+        continue
+    if cmd.startswith(b"nginx: master"):
+        os.kill(int(pid), signal.SIGKILL)
+'
+    sleep_seconds 1
+    wait_for 15 relay_router_reaches www.amd.com && pass "упавший маршрутизатор поднят" \
+        || fail "маршрутизатор не поднялся"
+
+    canary_cleanup
+}
+
 selfcheck_cleanup() {
     docker rm -f smoke-selfcheck smoke-agent-relay-1 >/dev/null 2>&1 || true
     docker image rm -f nf-smoke-agent-relay:broken nf-smoke-agent-relay:current \
@@ -1132,8 +1336,9 @@ case "${1:-}" in
     --install-only) test_install ;;
     --canary-only) test_canary ;;
     --failover-only) test_failover ;;
+    --rotation-only) test_rotation "${2:-}" ;;
     --selfcheck-only) test_selfcheck ;;
-    "")           test_relay; test_panel; test_rules; test_rules_supervision; test_install; test_canary; test_failover; test_selfcheck ;;
+    "")           test_relay; test_panel; test_rules; test_rules_supervision; test_install; test_canary; test_failover; test_rotation; test_selfcheck ;;
     *) echo "неизвестный аргумент: $1" >&2; exit 2 ;;
 esac
 

@@ -29,7 +29,7 @@ FROM python:3.12-slim
 ARG BUILD_VERSION=dev
 ARG BUILD_SHA=unknown
 ARG BUILD_DATE=unknown
-RUN apt-get update && apt-get install -y --no-install-recommends curl ca-certificates dumb-init openssl && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y --no-install-recommends curl ca-certificates dumb-init openssl nginx libnginx-mod-stream && rm -rf /var/lib/apt/lists/*
 COPY --from=xray-fetch /tmp/xray-out/xray /usr/local/bin/xray
 COPY --from=xray-fetch /tmp/xray-out/VERSION /opt/XRAY_VERSION
 RUN chmod +x /usr/local/bin/xray

@@ -5,7 +5,9 @@
 откат на прошлую версию панели не теряет основной релей: она читает столбцы
 server_config и про таблицу cascade_relays не знает.
 """
+import tempfile
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
@@ -163,6 +165,52 @@ class ConfigTests(unittest.TestCase):
         fixed = [r for r in config["routing"]["rules"] if r.get("outboundTag") == "cascade-out"]
         # Правило мимо балансировщика не заметило бы смерти основного релея.
         self.assertEqual(fixed, [])
+
+
+class HotSwapTests(unittest.TestCase):
+    OLD = {"log": {}, "outbounds": [{"tag": "cascade-out", "sni": "a"}, {"tag": "direct"}]}
+
+    def new(self, **changes):
+        config = {"log": {}, "outbounds": [{"tag": "cascade-out", "sni": "b"}, {"tag": "direct"}]}
+        config.update(changes)
+        return config
+
+    def test_changed_relay_is_swappable(self):
+        self.assertEqual(cascade._changed_outbounds(self.OLD, self.new()), [{"tag": "cascade-out", "sni": "b"}])
+
+    def test_anything_else_needs_restart(self):
+        self.assertIsNone(cascade._changed_outbounds(self.OLD, self.new(log={"loglevel": "info"})))
+
+    def test_new_relay_needs_restart(self):
+        new = self.new(outbounds=self.OLD["outbounds"] + [{"tag": "cascade-2"}])
+        self.assertIsNone(cascade._changed_outbounds(self.OLD, new))
+
+    def test_first_start_needs_restart(self):
+        self.assertIsNone(cascade._changed_outbounds(None, self.new()))
+
+    def swap(self, returncodes):
+        calls = []
+
+        def run(args, **kwargs):
+            calls.append(args[2])
+            return SimpleNamespace(returncode=returncodes.pop(0), stdout="", stderr="")
+
+        with tempfile.TemporaryDirectory() as tmp, \
+                mock.patch.object(cascade, "CONFIG_PATH", Path(tmp) / "config.json"), \
+                mock.patch.object(cascade.subprocess, "run", side_effect=run):
+            done = cascade._swap_outbounds([{"tag": "cascade-out"}])
+            self.assertEqual(list(Path(tmp).iterdir()), [], "ключи релея остались в файле")
+        return done, calls
+
+    def test_remove_then_add(self):
+        self.assertEqual(self.swap([0, 0]), (True, ["rmo", "ado"]))
+
+    def test_failure_asks_for_restart(self):
+        self.assertEqual(self.swap([1]), (False, ["rmo"]))
+        self.assertEqual(self.swap([0, 1]), (False, ["rmo", "ado"]))
+
+    def test_api_can_swap(self):
+        self.assertIn('"HandlerService"', Path(cascade.__file__).read_text(encoding="utf-8"))
 
 
 class ActiveRelayTests(unittest.TestCase):

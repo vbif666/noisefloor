@@ -58,7 +58,7 @@ class RotationTests(unittest.TestCase):
         self.creds["rotation"]["pool"] = ["dl.google.com", "www.samsung.com", "www.amd.com"]
         app.save_creds(self.creds)
         self.restart = mock.patch.object(app, "restart_xray").start()
-        mock.patch.object(app, "render_config").start()
+        mock.patch.object(app, "_xray_test", return_value=None).start()
         self.addCleanup(mock.patch.stopall)
 
     def stored(self):
@@ -180,6 +180,7 @@ class SniGraceTests(unittest.TestCase):
         }
         app.save_creds(self.creds)
         mock.patch.object(app, "restart_xray").start()
+        mock.patch.object(app, "_xray_test", return_value=None).start()
         self.addCleanup(mock.patch.stopall)
 
     def rendered_names(self):

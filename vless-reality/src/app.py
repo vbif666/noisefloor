@@ -32,6 +32,7 @@ import os
 import random
 import re
 import secrets
+import signal
 import socket
 import ssl
 import subprocess
@@ -75,6 +76,11 @@ def build_info() -> dict:
 ACCESS_LOG_MAX_BYTES = 20 * 1024 * 1024
 ACCESS_LOG_CHECK_SECONDS = 60
 XRAY_BIN = os.environ.get("XRAY_BIN", "/usr/local/bin/xray")
+# Локальный SNI-маршрутизатор, см. раздел sni router.
+NGINX_BIN = os.environ.get("NGINX_BIN", "/usr/sbin/nginx")
+NGINX_STREAM_MODULE = "/usr/lib/nginx/modules/ngx_stream_module.so"
+SNI_ROUTER_PORT = int(os.environ.get("SNI_ROUTER_PORT", "18443"))
+SNI_ROUTER_CONF = DATA_DIR / "sni-router.conf"
 STATS_API_ADDR = "127.0.0.1:10085"
 
 # Только 443. Замерено на живом плече RU -> NL (2026-09-14): REALITY на
@@ -185,6 +191,8 @@ state = {
     "last_client_ip": None,
     "connect_count": 0,
     "xray_running": False,
+    "config_error": None,
+    "router_error": None,
     "traffic_uplink": 0,
     "traffic_downlink": 0,
     "traffic_active": False,
@@ -425,7 +433,23 @@ def active_server_names(creds: dict, now: datetime | None = None) -> list[str]:
     return names
 
 
-def render_config(creds: dict, now: datetime | None = None) -> None:
+def router_routes(creds: dict, now: datetime | None = None) -> dict[str, str]:
+    """SNI -> куда вести. Пусто при выключенной ротации: с одним хостом
+    маршрутизатор не нужен, и конфиг xray остаётся прежним."""
+    rot = get_rotation(creds)
+    if not rot["enabled"]:
+        return {}
+    routes = {host: f"{host}:443" for host in rot["pool"]}
+    for name in active_server_names(creds, now):
+        routes.setdefault(name, f"{name}:443")
+    routes[creds["sni"]] = creds["dest"]
+    return routes
+
+
+def build_config(creds: dict, now: datetime | None = None) -> dict:
+    # С маршрутизатором ротация не меняет ни dest, ни serverNames, а значит и
+    # конфиг: смена SNI обходится без перезапуска xray.
+    routes = router_routes(creds, now) if router_up else {}
     config = {
         "log": {"loglevel": "warning", "access": str(ACCESS_LOG)},
         "stats": {},
@@ -471,9 +495,9 @@ def render_config(creds: dict, now: datetime | None = None) -> None:
                     "security": "reality",
                     "realitySettings": {
                         "show": False,
-                        "dest": creds["dest"],
+                        "dest": f"127.0.0.1:{SNI_ROUTER_PORT}" if routes else creds["dest"],
                         "xver": 0,
-                        "serverNames": active_server_names(creds, now),
+                        "serverNames": sorted(routes) if routes else active_server_names(creds, now),
                         "privateKey": creds["private_key"],
                         "shortIds": [creds["short_id"]],
                     },
@@ -503,7 +527,74 @@ def render_config(creds: dict, now: datetime | None = None) -> None:
         config["dns"] = gh_dns
         config["outbounds"].extend(gh_outbounds)
         config["routing"]["rules"].extend(gh_rules)
-    CONFIG_FILE.write_text(json.dumps(config, indent=2))
+    return config
+
+
+def render_config(creds: dict, now: datetime | None = None) -> None:
+    CONFIG_FILE.write_text(json.dumps(build_config(creds, now), indent=2))
+
+
+class ConfigError(Exception):
+    """xray не принял новый конфиг. Работающий процесс не тронут."""
+
+
+def _xray_test(path: Path) -> str | None:
+    """Текст ошибки, если xray не принимает конфиг."""
+    try:
+        out = subprocess.run([XRAY_BIN, "run", "-test", "-c", str(path)],
+                             capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.SubprocessError) as exc:
+        return str(exc)
+    if out.returncode == 0:
+        return None
+    return (out.stdout + out.stderr).strip()[-300:] or f"код {out.returncode}"
+
+
+def _config_hash(text: str) -> str:
+    return hashlib.sha256(text.encode()).hexdigest()
+
+
+def prepare_config(creds: dict, now: datetime | None = None) -> str | None:
+    """Новый конфиг, уже проверенный xray, или None, если он совпал с тем, на
+    котором работает процесс: перезапуск рвёт все соединения разом, делать его
+    без причины нельзя. ConfigError: конфиг негодный."""
+    text = json.dumps(build_config(creds, now), indent=2)
+    running = xray_proc is not None and xray_proc.poll() is None
+    if running and _config_hash(text) == _running_config_hash:
+        with state_lock:
+            state["config_error"] = None
+        return None
+    candidate = CONFIG_FILE.with_name(CONFIG_FILE.stem + ".new.json")
+    candidate.write_text(text)
+    try:
+        error = _xray_test(candidate)
+    finally:
+        candidate.unlink(missing_ok=True)
+    with state_lock:
+        state["config_error"] = error
+    if error:
+        raise ConfigError(error)
+    return text
+
+
+def install_config(text: str) -> None:
+    global _running_config_hash
+    # Перезапуск может быть отложен: до него процесс уже не считается актуальным.
+    _running_config_hash = None
+    tmp = CONFIG_FILE.with_suffix(".tmp")
+    tmp.write_text(text)
+    tmp.replace(CONFIG_FILE)
+    restart_xray()
+
+
+def apply_config(creds: dict, now: datetime | None = None) -> bool:
+    """Привести xray к настройкам. True, если понадобился перезапуск."""
+    sync_router(creds, now)
+    text = prepare_config(creds, now)
+    if text is None:
+        return False
+    install_config(text)
+    return True
 
 
 def build_vless_url(creds: dict, host: str) -> str:
@@ -659,8 +750,10 @@ def geohide_xray_parts(creds: dict) -> tuple[dict | None, list[dict], list[dict]
 
 
 def geohide_apply(update_list: bool) -> dict:
-    """Пересобрать конфиг под текущие настройки GeoHide (опционально
-    обновив список) и перезапустить xray. Вызывать под rotation_lock."""
+    """Пересобрать конфиг под текущие настройки GeoHide (опционально обновив
+    список) и перезапустить xray, если конфиг изменился: раз в сутки приходит
+    обычно тот же список, а при неудачной загрузке старый файл остаётся на
+    месте. Вызывать под rotation_lock."""
     creds = load_creds()
     gh = get_geohide(creds)
     if update_list:
@@ -671,8 +764,12 @@ def geohide_apply(update_list: bool) -> dict:
             gh["updated_at"] = datetime.now(timezone.utc).isoformat()
     creds["geohide"] = gh
     save_creds(creds)
-    render_config(creds)
-    restart_xray()
+    try:
+        apply_config(creds)
+    except ConfigError as exc:
+        gh["last_error"] = f"xray не принял конфиг: {exc}"
+        creds["geohide"] = gh
+        save_creds(creds)
     return gh
 
 
@@ -868,12 +965,14 @@ def apply_camouflage(creds: dict, dest: str, sni: str, now: datetime | None = No
     if previous and previous != sni:
         grace = [g for g in grace if g["sni"] != previous]
         grace.append({"sni": previous, "until": (now + timedelta(seconds=SNI_GRACE_SECONDS)).isoformat()})
-    creds["sni_grace"] = grace
-    creds["dest"] = dest
-    creds["sni"] = sni
+    # Сначала проверка: нельзя объявить панели SNI, которого xray не примет.
+    candidate = dict(creds, sni_grace=grace, dest=dest, sni=sni)
+    sync_router(candidate, now)
+    text = prepare_config(candidate, now)
+    creds.update(sni_grace=grace, dest=dest, sni=sni)
     save_creds(creds)
-    render_config(creds, now)
-    restart_xray()
+    if text is not None:
+        install_config(text)
 
 
 def rotate_now(creds: dict, reason: str = "по расписанию", now: datetime | None = None) -> dict:
@@ -894,7 +993,13 @@ def rotate_now(creds: dict, reason: str = "по расписанию", now: date
             creds["rotation"] = rot
             return plan_next(creds, now)
     previous = creds.get("sni")
-    apply_camouflage(creds, f"{host}:443", host, now=now)
+    try:
+        apply_camouflage(creds, f"{host}:443", host, now=now)
+    except ConfigError as exc:
+        rot["last_error"] = f"xray не принял конфиг: {exc}"
+        _record(rot, {"at": now.isoformat(), "ok": False, "reason": reason, "note": rot["last_error"]})
+        creds["rotation"] = rot
+        return plan_next(creds, now)
     _record(rot, {"at": now.isoformat(), "ok": True, "reason": reason,
                   "from": previous, "sni": host, "note": note})
     creds["rotation"] = rot
@@ -937,10 +1042,15 @@ def rotation_loop(stop_event: threading.Event):
 
 xray_proc: subprocess.Popen | None = None
 xray_lock = threading.Lock()
+_running_config_hash: str | None = None
 
 
 def _start_xray_locked():
-    global xray_proc
+    global xray_proc, _running_config_hash
+    try:
+        _running_config_hash = _config_hash(CONFIG_FILE.read_text())
+    except OSError:
+        _running_config_hash = None
     xray_proc = subprocess.Popen([XRAY_BIN, "run", "-config", str(CONFIG_FILE)])
     with state_lock:
         state["xray_running"] = True
@@ -1117,10 +1227,134 @@ def rotate_access_log(stop_event: threading.Event):
             continue
 
 
+# ---------------------------------------------------------- sni router ----
+#
+# REALITY ведёт чужих не на один хост, а в локальный nginx: тот по SNI
+# выбирает настоящий сайт, но только из пула. Поэтому xray может принимать весь
+# пул сразу и смена SNI его не касается.
+#
+# Новая точка отказа: без nginx не проходит ни одно рукопожатие REALITY. Поэтому
+# его держит сторож, а если поднять не вышло, конфиг возвращается к прямому dest.
+
+router_proc: subprocess.Popen | None = None
+router_lock = threading.Lock()
+router_up = False
+_router_text: str | None = None
+
+
+def _resolvers() -> list[str]:
+    """nginx не умеет системный резолвер, ему нужен адрес."""
+    found = []
+    try:
+        for line in Path("/etc/resolv.conf").read_text().splitlines():
+            parts = line.split()
+            if len(parts) >= 2 and parts[0] == "nameserver":
+                found.append(f"[{parts[1]}]" if ":" in parts[1] else parts[1])
+    except OSError:
+        pass
+    return found or ["1.1.1.1", "8.8.8.8"]
+
+
+def router_conf(routes: dict[str, str], default: str) -> str:
+    """Неизвестное имя идёт на текущий хост: так же, как было бы без
+    маршрутизатора. Посторонний адрес через него не достать."""
+    lines = "\n".join(f"        {name} {target};" for name, target in sorted(routes.items()))
+    return f"""load_module {NGINX_STREAM_MODULE};
+worker_processes 1;
+pid /tmp/sni-router.pid;
+error_log stderr warn;
+events {{ worker_connections 4096; }}
+stream {{
+    resolver {' '.join(_resolvers())} ipv6=off valid=300s;
+    map $ssl_preread_server_name $sni_target {{
+{lines}
+        default {default};
+    }}
+    server {{
+        listen 127.0.0.1:{SNI_ROUTER_PORT};
+        ssl_preread on;
+        proxy_connect_timeout 5s;
+        proxy_pass $sni_target;
+    }}
+}}
+"""
+
+
+def _stop_router_locked() -> None:
+    global router_proc, router_up, _router_text
+    if router_proc is not None and router_proc.poll() is None:
+        router_proc.terminate()
+        try:
+            router_proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            router_proc.kill()
+    router_proc = None
+    router_up = False
+    _router_text = None
+
+
+def stop_router() -> None:
+    with router_lock:
+        _stop_router_locked()
+
+
+def sync_router(creds: dict, now: datetime | None = None) -> bool:
+    """Привести nginx к настройкам. True, если маршрутизатор работает."""
+    global router_proc, router_up, _router_text
+    routes = router_routes(creds, now)
+    with router_lock:
+        if not routes or not Path(NGINX_BIN).exists():
+            _stop_router_locked()
+            return False
+        text = router_conf(routes, creds["dest"])
+        alive = router_proc is not None and router_proc.poll() is None
+        if alive and text == _router_text:
+            return True
+        candidate = SNI_ROUTER_CONF.with_suffix(".new")
+        candidate.write_text(text)
+        try:
+            out = subprocess.run([NGINX_BIN, "-e", "stderr", "-t", "-c", str(candidate)],
+                                 capture_output=True, text=True, timeout=15)
+            error = out.stderr.strip()[-300:] if out.returncode != 0 else None
+        except (OSError, subprocess.SubprocessError) as exc:
+            error = str(exc)
+        with state_lock:
+            state["router_error"] = error
+        if error:
+            router_up = alive
+            return alive
+        candidate.replace(SNI_ROUTER_CONF)
+        if alive:
+            # Перезагрузка мягкая: прежний воркер доводит свои соединения.
+            router_proc.send_signal(signal.SIGHUP)
+        else:
+            router_proc = subprocess.Popen(
+                [NGINX_BIN, "-e", "stderr", "-c", str(SNI_ROUTER_CONF), "-g", "daemon off;"])
+            try:
+                router_proc.wait(timeout=0.3)
+            except subprocess.TimeoutExpired:
+                pass
+        _router_text = text
+        router_up = router_proc.poll() is None
+        return router_up
+
+
+def router_tick() -> None:
+    """Такт сторожа: поднять упавший nginx, а не вышло - вернуть прямой dest."""
+    if router_proc is None or router_proc.poll() is None:
+        return
+    with rotation_lock:
+        try:
+            apply_config(load_creds())
+        except ConfigError:
+            pass  # ошибка уже в статусе
+
+
 def watchdog(stop_event: threading.Event):
     while not stop_event.is_set():
         time.sleep(5)
         watchdog_tick(stop_event)
+        router_tick()
 
 
 _stop_event = threading.Event()
@@ -1129,6 +1363,7 @@ _stop_event = threading.Event()
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     creds = provision()
+    sync_router(creds)
     render_config(creds)
     start_xray()
     threads = [
@@ -1148,6 +1383,7 @@ async def lifespan(app: FastAPI):
     finally:
         _stop_event.set()
         stop_xray()
+        stop_router()
 
 
 app = FastAPI(lifespan=lifespan, dependencies=[Depends(check_auth)])
@@ -1320,7 +1556,10 @@ def api_settings(dest: str = Form(...), sni: str = Form(...)):
     if ":" not in dest:
         dest = f"{dest}:443"
     with rotation_lock, xray_restart_after_response():
-        apply_camouflage(load_creds(), dest, sni)
+        try:
+            apply_camouflage(load_creds(), dest, sni)
+        except ConfigError as exc:
+            raise HTTPException(status_code=400, detail=f"xray не принял конфиг: {exc}") from exc
     return RedirectResponse(url="/", status_code=303)
 
 
@@ -1337,7 +1576,7 @@ def api_rotation_save(enabled: str = Form(""), interval_hours: int = Form(ROTATI
                       pool: str = Form("")):
     hosts = parse_pool(pool)
     interval_hours = max(1, min(168, interval_hours))
-    with rotation_lock:
+    with rotation_lock, xray_restart_after_response():
         creds = load_creds()
         rot = get_rotation(creds)
         was = (rot["enabled"], rot["interval_hours"])
@@ -1360,6 +1599,11 @@ def api_rotation_save(enabled: str = Form(""), interval_hours: int = Form(ROTATI
             if not rot["enabled"]:
                 rot["next_at"] = rot["next_dest"] = rot["next_sni"] = None
             save_creds(creds)
+        # Пул входит в конфиг xray и маршрутизатора.
+        try:
+            apply_config(load_creds())
+        except ConfigError:
+            pass  # работающий xray не тронут, ошибка в статусе
     return RedirectResponse(url="/", status_code=303)
 
 
@@ -1442,6 +1686,7 @@ def api_restart():
     def _do_restart():
         time.sleep(0.5)
         stop_xray()
+        stop_router()
         os._exit(0)
 
     threading.Thread(target=_do_restart, daemon=True).start()
