@@ -15,9 +15,12 @@ import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest import mock
+from zoneinfo import ZoneInfo
 
 os.environ.setdefault("DATA_DIR", tempfile.mkdtemp(prefix="relay-test-"))
 os.environ.setdefault("ADMIN_PASSWORD", "test")
+
+from fastapi import HTTPException  # noqa: E402
 
 import app  # noqa: E402  (после DATA_DIR — модуль создаёт каталоги при импорте)
 
@@ -165,6 +168,181 @@ class RotationTests(unittest.TestCase):
         self.creds["rotation"]["enabled"] = False
         app.save_creds(self.creds)
         self.assertEqual(app.rotation_tick(NOW), "off")
+
+
+def utc(*parts):
+    return datetime(*parts, tzinfo=timezone.utc)
+
+
+def daily(**extra):
+    rot = app.rotation_defaults()
+    rot.update(mode="daily", at_time="04:00", tz="Europe/Moscow", period_hours=24)
+    rot.update(extra)
+    return rot
+
+
+class DailyPlanTests(unittest.TestCase):
+    def test_time_ahead_today_in_local_zone(self):
+        self.assertEqual(app.compute_next_at(daily(), utc(2026, 11, 6, 0, 0)), utc(2026, 11, 6, 1, 0))
+
+    def test_time_passed_moves_to_next_day(self):
+        self.assertEqual(app.compute_next_at(daily(), utc(2026, 11, 6, 1, 1)), utc(2026, 11, 7, 1, 0))
+
+    def test_exact_moment_is_not_planned_again(self):
+        self.assertEqual(app.compute_next_at(daily(), utc(2026, 11, 6, 1, 0)), utc(2026, 11, 7, 1, 0))
+
+    def test_local_date_differs_from_utc_date(self):
+        rot = daily(at_time="00:30")
+        self.assertEqual(app.compute_next_at(rot, utc(2026, 11, 6, 20, 0)), utc(2026, 11, 6, 21, 30))
+
+    def test_other_zone(self):
+        rot = daily(tz="America/New_York", at_time="23:00")
+        self.assertEqual(app.compute_next_at(rot, utc(2026, 7, 1, 12, 0)), utc(2026, 7, 2, 3, 0))
+
+    def test_48h_three_cycles_keep_anchor_parity(self):
+        rot = daily(period_hours=48, anchor_date="2026-11-07")
+        now = utc(2026, 11, 6, 12, 0)
+        seen = []
+        for _ in range(3):
+            now = app.compute_next_at(rot, now)
+            seen.append(now)
+        self.assertEqual(seen, [utc(2026, 11, 7, 1, 0), utc(2026, 11, 9, 1, 0), utc(2026, 11, 11, 1, 0)])
+
+    def test_48h_outage_does_not_shift_parity(self):
+        rot = daily(period_hours=48, anchor_date="2026-11-07")
+        self.assertEqual(app.compute_next_at(rot, utc(2026, 11, 10, 12, 0)), utc(2026, 11, 11, 1, 0))
+
+    def test_dst_keeps_local_time(self):
+        rot = daily(tz="Europe/Berlin", at_time="04:00")
+        before = app.compute_next_at(rot, utc(2026, 3, 28, 12, 0))
+        after = app.compute_next_at(rot, before)
+        zone = ZoneInfo("Europe/Berlin")
+        self.assertEqual(before.astimezone(zone).hour, 4)
+        self.assertEqual(after.astimezone(zone).hour, 4)
+        self.assertEqual(after - before, timedelta(hours=24))
+
+    def test_day_of_clock_change_is_23_hours(self):
+        rot = daily(tz="Europe/Berlin", at_time="01:00")
+        before = app.compute_next_at(rot, utc(2026, 3, 28, 12, 0))
+        after = app.compute_next_at(rot, before)
+        self.assertEqual(after - before, timedelta(hours=23))
+
+    def test_missing_local_time_moves_to_first_existing_minute(self):
+        rot = daily(tz="Europe/Berlin", at_time="02:30")
+        moment = app.compute_next_at(rot, utc(2026, 3, 28, 12, 0))
+        self.assertEqual(moment, utc(2026, 3, 29, 1, 0))
+        self.assertEqual(moment.astimezone(ZoneInfo("Europe/Berlin")).strftime("%H:%M"), "03:00")
+
+    def test_repeated_local_time_takes_first(self):
+        rot = daily(tz="Europe/Berlin", at_time="02:30")
+        self.assertEqual(app.compute_next_at(rot, utc(2026, 10, 24, 12, 0)), utc(2026, 10, 25, 0, 30))
+
+
+class DailyRotationTests(unittest.TestCase):
+    NOW = utc(2026, 11, 6, 1, 0)  # 04:00 по Москве
+
+    def setUp(self):
+        self.creds = {
+            "uuid": "u", "short_id": "s", "private_key": "p", "public_key": "P",
+            "dest": "dl.google.com:443", "sni": "dl.google.com", "vless_port": 8443,
+            "sync_token": "t", "rotation": daily(enabled=True, anchor_date="2026-11-06"),
+        }
+        self.creds["rotation"]["pool"] = ["dl.google.com", "www.samsung.com", "www.amd.com"]
+        app.save_creds(self.creds)
+        mock.patch.object(app, "restart_xray").start()
+        mock.patch.object(app, "_xray_test", return_value=None).start()
+        self.addCleanup(mock.patch.stopall)
+
+    def stored(self):
+        return json.loads(app.CREDS_FILE.read_text())["rotation"]
+
+    def test_old_creds_stay_in_interval_mode(self):
+        old = {k: v for k, v in app.rotation_defaults().items()
+               if k in ("enabled", "interval_hours", "pool", "next_at", "next_dest", "next_sni",
+                        "last_error", "history")}
+        old.update(enabled=True, next_at="2026-11-06T10:00:00+00:00")
+        rot = app.get_rotation({"rotation": old})
+        self.assertEqual(rot["mode"], "interval")
+        self.assertEqual(rot["next_at"], "2026-11-06T10:00:00+00:00")
+        self.assertEqual(app.compute_next_at(rot, NOW), NOW + timedelta(hours=4))
+
+    def test_plan_after_switch_is_next_local_time(self):
+        with mock.patch.object(app, "check_dest", side_effect=good):
+            rot = app.rotate_now(self.creds, now=self.NOW)
+        self.assertEqual(datetime.fromisoformat(rot["next_at"]), utc(2026, 11, 7, 1, 0))
+        self.assertTrue(rot["next_sni"])
+
+    def test_pool_failure_at_planning_keeps_regular_time(self):
+        # Смена прошла, проверка следующего хоста нет: лишней смены через 10 минут быть не должно.
+        with mock.patch.object(app, "check_dest", return_value={"ok": False, "error": "нет сети"}):
+            rot = app.plan_next(self.creds, self.NOW)
+        self.assertEqual(datetime.fromisoformat(rot["next_at"]), utc(2026, 11, 7, 1, 0))
+        self.assertIsNone(rot["next_sni"])
+        self.assertIn("в момент смены", rot["last_error"])
+
+    def test_failed_switch_retries_soon_and_keeps_anchor(self):
+        self.creds["rotation"]["period_hours"] = 48
+        with mock.patch.object(app, "check_dest", return_value={"ok": False, "error": "нет сети"}):
+            rot = app.rotate_now(self.creds, now=self.NOW)
+        self.assertEqual(datetime.fromisoformat(rot["next_at"]), self.NOW + timedelta(minutes=10))
+        self.assertEqual(rot["anchor_date"], "2026-11-06")
+        with mock.patch.object(app, "check_dest", side_effect=good):
+            rot = app.rotate_now(self.creds, now=self.NOW + timedelta(minutes=10))
+        self.assertEqual(datetime.fromisoformat(rot["next_at"]), utc(2026, 11, 8, 1, 0))
+
+    def test_retry_never_passes_next_regular_time(self):
+        now = utc(2026, 11, 7, 0, 55)
+        with mock.patch.object(app, "check_dest", return_value={"ok": False, "error": "нет сети"}):
+            rot = app.plan_next(self.creds, now, retry=True)
+        self.assertEqual(datetime.fromisoformat(rot["next_at"]), utc(2026, 11, 7, 1, 0))
+
+    def test_outage_replans_to_next_local_time(self):
+        self.creds["rotation"]["next_at"] = self.NOW.isoformat()
+        app.save_creds(self.creds)
+        with mock.patch.object(app, "check_dest", side_effect=good):
+            self.assertEqual(app.rotation_tick(self.NOW + timedelta(hours=1)), "missed")
+        self.assertEqual(datetime.fromisoformat(self.stored()["next_at"]), utc(2026, 11, 7, 1, 0))
+
+    def save(self, **form):
+        args = dict(enabled="on", interval_hours=4, pool="\n".join(self.creds["rotation"]["pool"]),
+                    mode="", period_hours="", at_time="", tz="")
+        args.update(form)
+        with mock.patch.object(app, "check_dest", side_effect=good), \
+                mock.patch.object(app, "apply_config"):
+            app.api_rotation_save(**args)
+        return self.stored()
+
+    def test_old_form_keeps_schedule_and_announced_time(self):
+        self.creds["rotation"].update(next_at="2026-11-07T01:00:00+00:00", next_sni="www.amd.com",
+                                      next_dest="www.amd.com:443")
+        app.save_creds(self.creds)
+        rot = self.save()
+        self.assertEqual(rot["mode"], "daily")
+        self.assertEqual(rot["at_time"], "04:00")
+        self.assertEqual(rot["next_at"], "2026-11-07T01:00:00+00:00")
+
+    def test_changing_time_replans_and_sets_anchor(self):
+        self.creds["rotation"].update(next_at="2026-11-07T01:00:00+00:00", next_sni="www.amd.com",
+                                      next_dest="www.amd.com:443")
+        app.save_creds(self.creds)
+        rot = self.save(mode="daily", period_hours="48", at_time="05:15", tz="Europe/Moscow")
+        moment = datetime.fromisoformat(rot["next_at"]).astimezone(ZoneInfo("Europe/Moscow"))
+        self.assertEqual(moment.strftime("%H:%M"), "05:15")
+        self.assertEqual(rot["anchor_date"], moment.date().isoformat())
+
+    def test_bad_form_values_are_rejected(self):
+        for form in ({"mode": "smart"}, {"period_hours": "12"}, {"at_time": "24:00"},
+                     {"at_time": "4:00"}, {"at_time": "04:60"}, {"tz": "Mars/Base"}, {"tz": "../etc/passwd"}):
+            with self.subTest(form):
+                with self.assertRaises(HTTPException) as caught:
+                    self.save(**form)
+                self.assertEqual(caught.exception.status_code, 400)
+        self.assertEqual(self.stored()["at_time"], "04:00")
+
+    def test_headline_and_api_show_selected_zone(self):
+        rot = daily(enabled=True, next_at="2026-11-07T01:00:00+00:00", next_sni="www.amd.com")
+        self.assertIn("07.11 04:00 (Europe/Moscow)", app.rotation_headline(rot))
+        self.assertEqual(app.rotation_local(rot), "07.11 04:00")
 
 
 class SniGraceTests(unittest.TestCase):

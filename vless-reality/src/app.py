@@ -17,7 +17,7 @@ Web UI (PANEL_PORT, default 8001), HTTPS only, login form + session cookie:
   GET  /api/qr.png     - QR code of the current vless:// link
   POST /api/settings   - update SNI / camouflage dest (restarts xray, not the container)
   GET  /api/rotation   - rotation state: pool, next switch, history
-  POST /api/rotation   - save rotation settings (enabled / interval / pool)
+  POST /api/rotation   - save rotation settings (enabled / schedule / pool)
   POST /api/rotation/now   - switch to a random pool host right now
   POST /api/rotation/check - probe every pool host, report which are usable
   POST /api/restart    - restart the whole container (relies on `restart: unless-stopped`)
@@ -40,9 +40,10 @@ import threading
 import time
 import uuid
 from contextlib import asynccontextmanager, contextmanager
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import quote
+from zoneinfo import ZoneInfo
 
 from fastapi import Depends, FastAPI, Form, HTTPException, Request, status
 
@@ -129,6 +130,11 @@ ROTATION_DEFAULT_POOL = [
     "www.kpn.com",
 ]
 ROTATION_DEFAULT_HOURS = 4
+ROTATION_MODES = ("interval", "daily")
+ROTATION_DAILY_PERIODS = ("24", "48")
+ROTATION_DEFAULT_TZ = "Europe/Moscow"
+ROTATION_SCHEDULE_FIELDS = ("mode", "interval_hours", "period_hours", "at_time", "tz")
+_HHMM_RE = re.compile(r"([01]\d|2[0-3]):[0-5]\d")
 ROTATION_CHECK_SECONDS = 15
 # Через сколько секунд после ответа перезапускать xray, если смену конфига
 # попросили из веб-интерфейса. Браузер администратора часто сам ходит
@@ -619,10 +625,29 @@ def build_vless_url(creds: dict, host: str) -> str:
 rotation_lock = threading.Lock()
 
 
+def load_zone(name: str) -> ZoneInfo | None:
+    try:
+        return ZoneInfo(name)
+    except Exception:  # ZoneInfoNotFoundError, ValueError, OSError - смотря что за имя
+        return None
+
+
+def default_rotation_tz() -> str:
+    env = os.environ.get("TZ", "")
+    return env if env and load_zone(env) else ROTATION_DEFAULT_TZ
+
+
 def rotation_defaults() -> dict:
     return {
         "enabled": False,
+        "mode": "interval",
         "interval_hours": ROTATION_DEFAULT_HOURS,
+        # Режим daily: местное ЧЧ:ММ раз в 24 или 48 часов. Дата первой смены
+        # нужна для 48 часов: без неё чётность дней поплывёт после пропуска.
+        "period_hours": 24,
+        "at_time": "04:00",
+        "anchor_date": None,
+        "tz": default_rotation_tz(),
         "pool": list(ROTATION_DEFAULT_POOL),
         "next_at": None,
         "next_dest": None,
@@ -933,7 +958,43 @@ def _record(rot: dict, entry: dict) -> None:
     del rot["history"][ROTATION_HISTORY_MAX:]
 
 
-def plan_next(creds: dict, now: datetime | None = None) -> dict:
+def local_moment(day: date, at_time: str, tz: ZoneInfo) -> datetime:
+    """Момент ЧЧ:ММ местного дня в UTC. Несуществующее время (переход на
+    летнее) сдвигается на первую существующую минуту после него, из двух
+    одинаковых (переход на зимнее) берётся первое."""
+    hour, minute = map(int, at_time.split(":"))
+    wall = datetime(day.year, day.month, day.day, hour, minute)
+    for _ in range(24 * 60):
+        moment = wall.replace(tzinfo=tz, fold=0).astimezone(timezone.utc)
+        if moment.astimezone(tz).replace(tzinfo=None) == wall:
+            break
+        wall += timedelta(minutes=1)
+    return moment
+
+
+def daily_next_at(rot: dict, now: datetime) -> datetime:
+    """Ближайшее at_time строго позже now. Считается в местном времени, а не
+    прибавлением часов к UTC: смена остаётся в то же ЧЧ:ММ при переводе часов."""
+    tz = load_zone(rot["tz"]) or ZoneInfo("UTC")
+    today = now.astimezone(tz).date()
+    anchor = date.fromisoformat(rot["anchor_date"]) if rot["anchor_date"] else None
+    for offset in range(-1, 4):
+        day = today + timedelta(days=offset)
+        if rot["period_hours"] == 48 and anchor and (day - anchor).days % 2:
+            continue
+        moment = local_moment(day, rot["at_time"], tz)
+        if moment > now:
+            return moment
+    return now + timedelta(hours=rot["period_hours"])
+
+
+def compute_next_at(rot: dict, now: datetime) -> datetime:
+    if rot["mode"] == "daily":
+        return daily_next_at(rot, now)
+    return now + timedelta(hours=rot["interval_hours"])
+
+
+def plan_next(creds: dict, now: datetime | None = None, retry: bool = False) -> dict:
     """Выбирает и объявляет следующую пару dest/SNI и момент смены.
 
     Объявляем заранее, а не в момент смены, ради каскада: панель на первом
@@ -942,13 +1003,21 @@ def plan_next(creds: dict, now: datetime | None = None) -> dict:
     поломку на очередном пятиминутном опросе."""
     rot = get_rotation(creds)
     now = now or datetime.now(timezone.utc)
+    due = compute_next_at(rot, now)
     host, failures = pick_candidate(rot["pool"], exclude=creds.get("sni"))
     if host:
-        rot["next_at"] = (now + timedelta(hours=rot["interval_hours"])).isoformat()
+        rot["next_at"] = due.isoformat()
         rot["next_dest"], rot["next_sni"], rot["last_error"] = f"{host}:443", host, None
+    elif rot["mode"] == "daily" and not retry:
+        # Смена уже прошла, повторять нечего: хост выберется в момент
+        # следующей, в её обычное время. retry - смена только что не удалась.
+        rot["next_at"] = due.isoformat()
+        rot["next_dest"] = rot["next_sni"] = None
+        rot["last_error"] = ("ни один хост пула не прошёл проверку, хост выберем "
+                             "в момент смены - " + "; ".join(failures))
     else:
         # Не через полный интервал, а скоро — см. ROTATION_RETRY_SECONDS.
-        rot["next_at"] = (now + timedelta(seconds=ROTATION_RETRY_SECONDS)).isoformat()
+        rot["next_at"] = min(now + timedelta(seconds=ROTATION_RETRY_SECONDS), due).isoformat()
         rot["next_dest"] = rot["next_sni"] = None
         rot["last_error"] = ("ни один хост пула не прошёл проверку, повторю через "
                              f"{ROTATION_RETRY_SECONDS // 60} мин — " + "; ".join(failures))
@@ -992,7 +1061,7 @@ def rotate_now(creds: dict, reason: str = "по расписанию", now: date
             rot["last_error"] = "смена не удалась: " + "; ".join(failures)
             _record(rot, {"at": now.isoformat(), "ok": False, "reason": reason, "note": rot["last_error"]})
             creds["rotation"] = rot
-            return plan_next(creds, now)
+            return plan_next(creds, now, retry=True)
     previous = creds.get("sni")
     try:
         apply_camouflage(creds, f"{host}:443", host, now=now)
@@ -1000,7 +1069,7 @@ def rotate_now(creds: dict, reason: str = "по расписанию", now: date
         rot["last_error"] = f"xray не принял конфиг: {exc}"
         _record(rot, {"at": now.isoformat(), "ok": False, "reason": reason, "note": rot["last_error"]})
         creds["rotation"] = rot
-        return plan_next(creds, now)
+        return plan_next(creds, now, retry=True)
     _record(rot, {"at": now.isoformat(), "ok": True, "reason": reason,
                   "from": previous, "sni": host, "note": note})
     creds["rotation"] = rot
@@ -1571,21 +1640,47 @@ def api_rotation():
     creds = load_creds()
     rot = get_rotation(creds)
     rot["current_sni"] = creds.get("sni")
+    rot["next_at_local"] = rotation_local(rot)
     return JSONResponse(rot)
+
+
+def apply_schedule_form(rot: dict, mode: str, period_hours: str, at_time: str, tz: str) -> None:
+    """Пустое поле - значение остаётся: старая форма этих полей не присылает."""
+    mode = mode or rot["mode"]
+    period = period_hours.strip() or str(rot["period_hours"])
+    at_time = at_time.strip() or rot["at_time"]
+    tz = tz.strip() or rot["tz"]
+    if mode not in ROTATION_MODES:
+        raise HTTPException(status_code=400, detail=f"неизвестный режим ротации: {mode}")
+    if period not in ROTATION_DAILY_PERIODS:
+        raise HTTPException(status_code=400, detail="период может быть только 24 или 48 часов")
+    if not _HHMM_RE.fullmatch(at_time):
+        raise HTTPException(status_code=400, detail="время смены нужно указать как ЧЧ:ММ")
+    if not load_zone(tz):
+        raise HTTPException(status_code=400, detail=f"неизвестный часовой пояс: {tz}")
+    rot.update(mode=mode, period_hours=int(period), at_time=at_time, tz=tz)
 
 
 @app.post("/api/rotation")
 def api_rotation_save(enabled: str = Form(""), interval_hours: int = Form(ROTATION_DEFAULT_HOURS),
-                      pool: str = Form("")):
+                      pool: str = Form(""), mode: str = Form(""), period_hours: str = Form(""),
+                      at_time: str = Form(""), tz: str = Form("")):
     hosts = parse_pool(pool)
     interval_hours = max(1, min(168, interval_hours))
     with rotation_lock, xray_restart_after_response():
         creds = load_creds()
         rot = get_rotation(creds)
-        was = (rot["enabled"], rot["interval_hours"])
+        was_enabled = rot["enabled"]
+        schedule_was = tuple(rot[k] for k in ROTATION_SCHEDULE_FIELDS)
         rot["enabled"] = bool(enabled) and len(hosts) >= 2
         rot["interval_hours"] = interval_hours
         rot["pool"] = hosts
+        apply_schedule_form(rot, mode, period_hours, at_time, tz)
+        schedule_changed = schedule_was != tuple(rot[k] for k in ROTATION_SCHEDULE_FIELDS)
+        if rot["mode"] == "daily" and (schedule_changed or not was_enabled or not rot["anchor_date"]):
+            rot["anchor_date"] = None
+            first = daily_next_at(rot, datetime.now(timezone.utc))
+            rot["anchor_date"] = first.astimezone(load_zone(rot["tz"])).date().isoformat()
         if bool(enabled) and len(hosts) < 2:
             rot["last_error"] = "для ротации нужно хотя бы два хоста в пуле"
         creds["rotation"] = rot
@@ -1593,7 +1688,7 @@ def api_rotation_save(enabled: str = Form(""), interval_hours: int = Form(ROTATI
         # интервал или объявленный хост выпал из пула. Иначе объявленное
         # время остаётся в силе — панель первого сервера уже его знает.
         replan = rot["enabled"] and (
-            not was[0] or not rot["next_at"] or was[1] != interval_hours
+            not was_enabled or not rot["next_at"] or schedule_changed
             or rot["next_sni"] not in hosts
         )
         if replan:
@@ -1993,8 +2088,33 @@ canvas.chart-canvas { width: 100%; height: 140px; display: block; }
             </p>
           </div>
           <div class="field">
-            <label for="f-hours">Интервал, часов</label>
-            <input id="f-hours" type="number" name="interval_hours" min="1" max="168" value="@@ROT_HOURS@@" required>
+            <label for="f-rot-mode">Расписание</label>
+            <select id="f-rot-mode" name="mode" onchange="rotModeChanged()">@@ROT_MODE_OPTIONS@@</select>
+          </div>
+        </div>
+        <div class="field" id="rot-interval-fields">
+          <label for="f-hours">Интервал, часов</label>
+          <input id="f-hours" type="number" name="interval_hours" min="1" max="168" value="@@ROT_HOURS@@" required>
+        </div>
+        <div id="rot-daily-fields">
+          <div class="field-row">
+            <div class="field">
+              <label for="f-rot-period">Период</label>
+              <select id="f-rot-period" name="period_hours">@@ROT_PERIOD_OPTIONS@@</select>
+            </div>
+            <div class="field">
+              <label for="f-rot-at">Время смены</label>
+              <input id="f-rot-at" type="time" name="at_time" value="@@ROT_AT_TIME@@" required>
+            </div>
+          </div>
+          <div class="field">
+            <label for="f-rot-tz">Часовой пояс</label>
+            <input id="f-rot-tz" name="tz" value="@@ROT_TZ@@" list="rot-tz-list" required>
+            <datalist id="rot-tz-list">
+              <option value="Europe/Moscow"><option value="Europe/Berlin"><option value="Europe/London">
+              <option value="Asia/Yekaterinburg"><option value="Asia/Novosibirsk"><option value="UTC">
+            </datalist>
+            <p class="field-hint">IANA-имя. При переводе часов смена остаётся в то же местное время.</p>
           </div>
         </div>
         <div class="field">
@@ -2432,6 +2552,13 @@ function pollUntilBack() {
   setTimeout(tick, 8000);
 }
 
+function rotModeChanged() {
+  const daily = document.getElementById("f-rot-mode").value === "daily";
+  document.getElementById("rot-daily-fields").style.display = daily ? "" : "none";
+  document.getElementById("rot-interval-fields").style.display = daily ? "none" : "";
+}
+
+rotModeChanged();
 pollStatus(); pollHistory(); loadUpdate(false);
 setInterval(pollStatus, 4000);
 setInterval(pollHistory, 5000);
@@ -2456,13 +2583,23 @@ def sni_grace_html(creds: dict) -> str:
     return f'<div class="field-hint">ещё принимается: {"; ".join(parts)}</div>'
 
 
+def rotation_local(rot: dict) -> str | None:
+    """Следующая смена в выбранном поясе: в режиме daily время задано в нём."""
+    zone = load_zone(rot["tz"])
+    if not rot["next_at"] or not zone:
+        return None
+    return datetime.fromisoformat(rot["next_at"]).astimezone(zone).strftime("%d.%m %H:%M")
+
+
 def rotation_headline(rot: dict) -> str:
     if not rot["enabled"]:
         return "выключена"
+    local = rotation_local(rot) if rot["mode"] == "daily" else None
+    when = f'{local} ({html.escape(rot["tz"])})' if local else _when(rot["next_at"])
     if rot["next_sni"] and rot["next_at"]:
-        return f'следующая: {_when(rot["next_at"])} → {html.escape(rot["next_sni"])}'
+        return f'следующая: {when} → {html.escape(rot["next_sni"])}'
     if rot["next_at"]:
-        return f'следующая попытка: {_when(rot["next_at"])}'
+        return f'следующая попытка: {when}'
     return "план ещё не составлен"
 
 
@@ -2596,6 +2733,14 @@ def index(response: Response):
         "@@ROT_NEXT@@": rotation_headline(rot),
         "@@ROT_ENABLED@@": "checked" if rot["enabled"] else "",
         "@@ROT_HOURS@@": str(rot["interval_hours"]),
+        "@@ROT_MODE_OPTIONS@@": "".join(
+            f'<option value="{m}"{" selected" if m == rot["mode"] else ""}>{label}</option>'
+            for m, label in (("interval", "По интервалу"), ("daily", "По времени"))),
+        "@@ROT_PERIOD_OPTIONS@@": "".join(
+            f'<option value="{p}"{" selected" if p == str(rot["period_hours"]) else ""}>Раз в {p} ч</option>'
+            for p in ROTATION_DAILY_PERIODS),
+        "@@ROT_AT_TIME@@": html.escape(rot["at_time"], quote=True),
+        "@@ROT_TZ@@": html.escape(rot["tz"], quote=True),
         "@@ROT_POOL@@": html.escape("\n".join(rot["pool"])),
         "@@DEST_MAX_MS@@": str(DEST_MAX_HANDSHAKE_MS),
         "@@ROT_ERROR@@": html.escape(rot["last_error"] or ""),
