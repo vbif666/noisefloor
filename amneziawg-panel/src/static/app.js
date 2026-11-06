@@ -1402,6 +1402,15 @@ function renderCascadeChecklist(c) {
       : `ядро ${c.kernel} не тянет TPROXY — обновите до 6.x: apt install linux-generic-hwe-22.04 && reboot`;
     row("warn", "UDP идёт мимо каскада: звонки Telegram/WhatsApp, QUIC и DNS выходят с адреса этого сервера", escapeHtml(fix));
   }
+  // Канарейка отдельной строкой: xray может быть жив, а клиентский путь сломан.
+  if (c.canary_ok === true) {
+    const details = [c.canary_exit_ip ? `выход ${escapeHtml(c.canary_exit_ip)}` : ""];
+    if (c.canary_speed_bps) details.push(`${formatBytes(c.canary_speed_bps)}/с`);
+    if (c.canary_checked_at) details.push(`проверено ${timeAgo(new Date(c.canary_checked_at))}`);
+    row("ok", "Канарейка: путь клиента работает", details.filter(Boolean).join(" · "));
+  } else if (c.canary_ok === false) {
+    row("bad", "Канарейка: путь клиента сломан", escapeHtml(c.canary_error || ""));
+  }
 
   box.innerHTML = rows.join("");
 }
@@ -1420,6 +1429,11 @@ function renderCascadeStatus(c) {
   }
   if (c.checking) {
     el.textContent = "проверяю…";
+    return;
+  }
+  if (c.running && c.canary_ok === false) {
+    el.textContent = "xray запущен, клиенты не проходят";
+    el.classList.add("is-error");
     return;
   }
   if (c.sync_enabled && c.sync_error && c.running && c.verified_ok) {

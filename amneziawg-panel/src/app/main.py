@@ -6,7 +6,7 @@ from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 
-from . import awg_supervisor, backup, bootstrap, cascade, cascade_sync, config_sync, self_update, traffic_history
+from . import awg_supervisor, backup, bootstrap, canary, cascade, cascade_sync, config_sync, self_update, traffic_history
 from .config import settings
 from .database import Base, SessionLocal, engine, run_migrations
 from .models import ServerConfig, Tunnel
@@ -35,6 +35,7 @@ class RevalidatingStaticFiles(StaticFiles):
 _traffic_history_stop = threading.Event()
 _cascade_supervisor_stop = threading.Event()
 _awg_supervisor_stop = threading.Event()
+_canary_stop = threading.Event()
 _backup_stop = threading.Event()
 _cascade_sync_stop = threading.Event()
 _self_update_stop = threading.Event()
@@ -67,6 +68,8 @@ async def lifespan(app: FastAPI):
     # awg0 исчез — поднимает его заново. Без этого панель жива, VPN мёртв,
     # и HEALTHCHECK этого не видит.
     threading.Thread(target=awg_supervisor.supervise, args=(_awg_supervisor_stop,), daemon=True).start()
+    # Канарейка: служебный пир и настройки для контейнера с пробой через туннель.
+    threading.Thread(target=canary.run, args=(_canary_stop,), daemon=True).start()
     # Резервные копии: одна сразу при старте, дальше раз в сутки. В data
     # лежат ключи всех клиентов — без копий их потеря невосстановима.
     threading.Thread(target=backup.run, args=(_backup_stop,), daemon=True).start()
@@ -83,6 +86,7 @@ async def lifespan(app: FastAPI):
         _traffic_history_stop.set()
         _cascade_supervisor_stop.set()
         _awg_supervisor_stop.set()
+        _canary_stop.set()
         _backup_stop.set()
         _cascade_sync_stop.set()
         _self_update_stop.set()

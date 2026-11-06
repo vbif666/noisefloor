@@ -6,7 +6,7 @@ from fastapi import APIRouter, Depends
 from fastapi.responses import PlainTextResponse
 from sqlalchemy.orm import Session
 
-from .. import awg_manager, awg_supervisor, cascade, config_sync, traffic_history
+from .. import awg_manager, awg_supervisor, canary, cascade, config_sync, traffic_history
 from ..database import get_db
 from ..models import Peer
 from ..schemas import LivePeerStatus, StatusResponse, TrafficHistoryPoint, TunnelLiveStatus
@@ -20,7 +20,7 @@ router = APIRouter()
 def get_status(db: Session = Depends(get_db), _admin: str = Depends(get_current_admin)):
     server = config_sync.get_server(db)
     live_status = config_sync.live_status_by_pubkey(server)
-    peers = db.query(Peer).all()
+    peers = db.query(Peer).filter(Peer.is_service.is_(False)).all()
     rules = config_sync.rules_status()
 
     peer_statuses = []
@@ -86,7 +86,7 @@ def metrics(db: Session = Depends(get_db), _admin: str = Depends(get_current_adm
     """
     server = config_sync.get_server(db)
     live = config_sync.live_status_by_pubkey(server) or {}
-    peers = db.query(Peer).all()
+    peers = db.query(Peer).filter(Peer.is_service.is_(False)).all()
 
     now = datetime.now(timezone.utc).timestamp()
     online = sum(
@@ -101,6 +101,8 @@ def metrics(db: Session = Depends(get_db), _admin: str = Depends(get_current_adm
     stats = cascade.traffic_stats() or {}
     health = cascade.health()
     verified = health.get("verified_ok")
+    bird = canary.status()
+    bird_ok = bird["ok"]
 
     lines = [
         "# HELP noisefloor_interface_up Поднят ли интерфейс туннеля",
@@ -136,6 +138,15 @@ def metrics(db: Session = Depends(get_db), _admin: str = Depends(get_current_adm
         "# HELP noisefloor_cascade_verified Прошла ли последняя проба трафика через каскад (-1 если проверки ещё не было)",
         "# TYPE noisefloor_cascade_verified gauge",
         f"noisefloor_cascade_verified {-1 if verified is None else int(verified)}",
+        "# HELP noisefloor_canary_ok Проходит ли проба через настоящий туннель (-1 если канарейка не работает)",
+        "# TYPE noisefloor_canary_ok gauge",
+        f"noisefloor_canary_ok {-1 if bird_ok is None else int(bird_ok)}",
+        "# HELP noisefloor_canary_duration_seconds Длительность последней пробы канарейки",
+        "# TYPE noisefloor_canary_duration_seconds gauge",
+        f"noisefloor_canary_duration_seconds {(bird['duration_ms'] or 0) / 1000}",
+        "# HELP noisefloor_canary_speed_bytes_per_second Скорость скачивания в последней пробе",
+        "# TYPE noisefloor_canary_speed_bytes_per_second gauge",
+        f"noisefloor_canary_speed_bytes_per_second {bird['speed_bps'] or 0}",
         "# HELP noisefloor_cascade_restarts_total Сколько раз супервизор поднимал упавший xray",
         "# TYPE noisefloor_cascade_restarts_total counter",
         f"noisefloor_cascade_restarts_total {health.get('restarts', 0)}",

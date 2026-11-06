@@ -3,7 +3,7 @@ import platform
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 
-from .. import cascade, cascade_sync, config_sync
+from .. import canary, cascade, cascade_sync, config_sync
 from ..config import settings
 from ..database import get_db
 from ..obfuscation import random_obfuscation_profile
@@ -156,6 +156,7 @@ def cascade_status(db: Session = Depends(get_db), _admin: str = Depends(get_curr
     server = config_sync.get_server(db)
     stats = cascade.traffic_stats() or {}
     health = cascade.health()
+    bird = canary.status()
 
     # Разбираем сохранённую ссылку, чтобы показать администратору адрес и
     # маскировку, но не uuid и не ключи.
@@ -182,6 +183,13 @@ def cascade_status(db: Session = Depends(get_db), _admin: str = Depends(get_curr
         verified_at=health.get("verified_at"),
         verify_error=health.get("verify_error"),
         restarts=health.get("restarts", 0),
+        canary_ok=bird["ok"],
+        canary_checked_at=bird["checked_at"],
+        canary_error=bird["error"],
+        canary_stage=bird["stage"],
+        canary_exit_ip=bird["exit_ip"],
+        canary_duration_ms=bird["duration_ms"],
+        canary_speed_bps=bird["speed_bps"],
         uplink=stats.get("uplink", 0),
         downlink=stats.get("downlink", 0),
         intercept_mode=cascade.intercept_mode(),

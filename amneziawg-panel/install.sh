@@ -411,6 +411,32 @@ services:
     volumes:
       - ./data:/opt/panel/data
       - ./awg_config:/etc/amnezia/amneziawg
+
+  # Проба через настоящий туннель, см. docs/OPERATIONS.md. Без него панель
+  # работает как раньше. Свой netns, из привилегий только NET_ADMIN.
+  canary:
+    image: $IMAGE
+    container_name: NOISEFLOOR-canary
+    restart: unless-stopped
+    init: true
+    entrypoint: ["python", "-m", "app.canary_probe"]
+    command: []
+    healthcheck:
+      disable: true
+    mem_limit: 128m
+    logging:
+      driver: json-file
+      options:
+        max-size: "1m"
+        max-file: "2"
+    cap_drop:
+      - ALL
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun
+    volumes:
+      - ./data/canary:/canary
 EOF
 
 if [ -f .env ] && [ "$FORCE" -eq 0 ]; then

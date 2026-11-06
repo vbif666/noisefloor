@@ -41,7 +41,7 @@ def _to_read(db: Session, tunnel: Tunnel) -> TunnelRead:
     data = TunnelRead.model_validate(tunnel)
     if awg_manager.tools_available():
         data.interface_up = awg_manager.interface_is_up(tunnel.interface_name)
-    data.peers_total = db.query(Peer).filter(Peer.protocol == tunnel.protocol).count()
+    data.peers_total = db.query(Peer).filter(Peer.protocol == tunnel.protocol, Peer.is_service.is_(False)).count()
     return data
 
 
@@ -88,7 +88,7 @@ def validate_address(db: Session, tunnel: Tunnel, address: str) -> str:
             raise _bad(f"Подсеть {iface.network} пересекается с подсетью {label} ({other_net})")
 
     if iface.network != ipaddress.ip_interface(tunnel.address).network:
-        clients = db.query(Peer).filter(Peer.protocol == tunnel.protocol).count()
+        clients = db.query(Peer).filter(Peer.protocol == tunnel.protocol, Peer.is_service.is_(False)).count()
         if clients:
             raise _bad(
                 f"У протокола уже {clients} клиент(ов) с адресами из старой подсети — "

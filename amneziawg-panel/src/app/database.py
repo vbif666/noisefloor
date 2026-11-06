@@ -41,6 +41,7 @@ _SERVER_CONFIG_MIGRATIONS = [
 # основному интерфейсу AmneziaWG 2.0.
 _PEER_MIGRATIONS = [
     ("protocol", "ALTER TABLE peers ADD COLUMN protocol VARCHAR(8) NOT NULL DEFAULT 'awg2'"),
+    ("is_service", "ALTER TABLE peers ADD COLUMN is_service BOOLEAN NOT NULL DEFAULT 0"),
 ]
 
 

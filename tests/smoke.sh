@@ -16,6 +16,7 @@
 #   tests/smoke.sh --panel-only
 #   tests/smoke.sh --rules-only
 #   tests/smoke.sh --install-only
+#   tests/smoke.sh --canary-only
 #   RELAY_IMAGE=... PANEL_IMAGE=... tests/smoke.sh
 #
 # Работает на bridge-сети с портами из диапазона 291xx, поэтому безопасен
@@ -400,6 +401,212 @@ STUB
         || fail "перехват не встал, а клиенты всё равно выходят напрямую"
 }
 
+# ------------------------------------------------------ канарейка, вживую ----
+
+# Стенд из четырёх контейнеров: релей, панель с настоящим каскадом, канарейка и
+# поддельный интернет. Адреса публичные: перехват пропускает приватные сети, а
+# xray на релее не ходит и в служебные диапазоны вроде 100.64.0.0/10.
+canary_status_has() {
+    local body
+    body="$(curl -kfsS -H "Authorization: Bearer $CANARY_TOKEN" \
+        "https://127.0.0.1:$CANARY_PANEL_PORT/api/server/cascade/status")" || return 1
+    [[ "$body" == *$1* ]]
+}
+
+canary_cleanup() {
+    docker rm -f smoke-canary smoke-canary-panel smoke-canary-relay smoke-canary-web >/dev/null 2>&1 || true
+    docker network rm smoke-canary-net smoke-canary-lan >/dev/null 2>&1 || true
+}
+
+test_canary() {
+    echo
+    echo "Канарейка  ($PANEL_IMAGE)"
+    local dir="$WORKDIR/canary" c=smoke-canary-panel net=smoke-canary-net
+    CANARY_PANEL_PORT=29103
+    mkdir -p "$dir/data/canary" "$dir/awg_config" "$dir/relay" "$dir/bin"
+    canary_cleanup
+    trap 'canary_cleanup; docker rm -f smoke-rules-panel >/dev/null 2>&1 || true; cleanup' EXIT
+    docker network create --subnet 5.5.77.0/24 "$net" >/dev/null
+    # Канарейка в своей сети: иначе «интернет» был бы ей виден напрямую, мимо туннеля.
+    docker network create --subnet 100.64.78.0/24 smoke-canary-lan >/dev/null
+
+    cat > "$dir/web.py" <<'PY'
+import os, socket, threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+BODY = os.urandom(1048576)
+
+class Handler(BaseHTTPRequestHandler):
+    def log_message(self, *args):
+        pass
+    def do_GET(self):
+        body = BODY if self.path == "/1mb" else f"ip={self.client_address[0]}\n".encode()
+        self.send_response(200)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+def dns():
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.bind(("0.0.0.0", 53))
+    while True:
+        data, addr = sock.recvfrom(1500)
+        sock.sendto(data[:2] + b"\x81\x80" + data[4:6] + b"\x00\x01" + data[8:], addr)
+
+threading.Thread(target=dns, daemon=True).start()
+ThreadingHTTPServer(("0.0.0.0", 80), Handler).serve_forever()
+PY
+    docker run -d --name smoke-canary-web --network "$net" --ip 5.5.77.10 \
+        -v "$dir/web.py:/web.py:ro" --entrypoint python "$PANEL_IMAGE" /web.py >/dev/null
+
+    docker run -d --name smoke-canary-relay --network "$net" --ip 5.5.77.20 \
+        -e LABEL=smoke-canary -e APP_CODENAME=SmokeCanary -e PUBLIC_HOST=5.5.77.20 \
+        -v "$dir/relay:/data" "$RELAY_IMAGE" >/dev/null
+    if ! wait_for 45 test -s "$dir/relay/creds.json"; then
+        fail "релей стенда не поднялся"
+        docker logs smoke-canary-relay 2>&1 | tail -10
+        return
+    fi
+
+    local url
+    url="$(python3 - "$dir/relay/creds.json" <<'PY'
+import json, sys
+c = json.load(open(sys.argv[1]))
+print(f"vless://{c['uuid']}@5.5.77.20:{c['vless_port']}?security=reality&sni={c['sni']}"
+      f"&pbk={c['public_key']}&sid={c['short_id']}&fp=chrome&flow=xtls-rprx-vision&type=tcp#smoke")
+PY
+)"
+
+    # Та же заглушка, что и в надзоре за правилами: иначе снесённое правило
+    # вернётся через 30 секунд, и проверять будет нечего.
+    cat > "$dir/bin/iptables-restore" <<'STUB'
+#!/bin/sh
+if [ -e /tmp/nf-fail ]; then
+    echo "сбой, заданный тестом" >&2
+    exit 2
+fi
+exec /usr/sbin/iptables-restore "$@"
+STUB
+    chmod +x "$dir/bin/iptables-restore"
+
+    docker run -d --name "$c" --network "$net" --ip 5.5.77.30 \
+        --cap-add NET_ADMIN --cap-add NET_RAW --device /dev/net/tun \
+        --sysctl net.ipv4.ip_forward=1 -p "127.0.0.1:$CANARY_PANEL_PORT:8000" \
+        -e LIVE_MANAGEMENT_ENABLED=true -e AUTO_APPLY_ON_START=true \
+        -e AWG_AUTO_UPDATE_ENABLED=false -e DEFAULT_SERVER_ADDRESS=10.79.0.1/24 \
+        -e DEFAULT_LISTEN_PORT=51997 -e PUBLIC_HOST=5.5.77.30 \
+        -v "$dir/data:/opt/panel/data" -v "$dir/awg_config:/etc/amnezia/amneziawg" \
+        "$PANEL_IMAGE" >/dev/null
+    docker cp "$dir/bin/iptables-restore" "$c:/usr/local/bin/iptables-restore" >/dev/null
+    docker network connect --ip 100.64.78.30 smoke-canary-lan "$c"
+
+    if ! wait_for 60 test -s "$dir/data/INITIAL_ADMIN_PASSWORD.txt" \
+        || ! wait_for 45 curl -kfsS -o /dev/null "https://127.0.0.1:$CANARY_PANEL_PORT/"; then
+        fail "панель стенда не поднялась"
+        docker logs "$c" 2>&1 | tail -20
+        return
+    fi
+
+    local pw
+    pw="$(grep -oE '[A-Za-z0-9_-]{12,}' "$dir/data/INITIAL_ADMIN_PASSWORD.txt" | head -1)"
+    CANARY_TOKEN="$(curl -kfsS -X POST "https://127.0.0.1:$CANARY_PANEL_PORT/api/auth/login" \
+        -H 'Content-Type: application/json' -d "{\"username\":\"admin\",\"password\":\"$pw\"}" \
+        | python3 -c 'import json,sys; print(json.load(sys.stdin)["access_token"])')"
+
+    local body
+    body="$(python3 -c 'import json,sys; print(json.dumps({"cascade_enabled": True, "cascade_vless_url": sys.argv[1]}))' "$url")"
+    curl -kfsS -o /dev/null -X PUT "https://127.0.0.1:$CANARY_PANEL_PORT/api/server" \
+        -H "Authorization: Bearer $CANARY_TOKEN" -H 'Content-Type: application/json' -d "$body" \
+        || { fail "панель не приняла ссылку на релей"; return; }
+    curl -kfsS -o /dev/null -X POST "https://127.0.0.1:$CANARY_PANEL_PORT/api/server/apply" \
+        -H "Authorization: Bearer $CANARY_TOKEN" || true
+
+    if wait_for 30 canary_status_has '"running":true'; then
+        pass "каскад до релея поднят"
+    else
+        fail "каскад стенда не поднялся"
+        docker exec "$c" tail -8 /opt/panel/data/cascade.log 2>/dev/null || true
+        return
+    fi
+
+    # Как в compose: из привилегий только NET_ADMIN.
+    docker run -d --name smoke-canary --network smoke-canary-lan --ip 100.64.78.40 --init --no-healthcheck \
+        --cap-drop ALL --cap-add NET_ADMIN --device /dev/net/tun \
+        -e CANARY_INTERVAL_SECONDS=15 -e CANARY_ENDPOINT_HOST=100.64.78.30 \
+        -e CANARY_TRACE_URL=http://5.5.77.10/cdn-cgi/trace \
+        -e CANARY_DOWNLOAD_URL=http://5.5.77.10/1mb -e CANARY_DNS_SERVER=5.5.77.10 \
+        -v "$dir/data/canary:/canary" --entrypoint python "$PANEL_IMAGE" -m app.canary_probe >/dev/null
+
+    local diag='cat "$dir/data/canary/result.json"; docker logs smoke-canary 2>&1 | tail -5'
+    if wait_for 90 canary_status_has '"canary_ok":true'; then
+        pass "канарейка зелёная на рабочем стенде"
+    else
+        fail "канарейка не позеленела за 90 с"
+        eval "$diag"
+        return
+    fi
+
+    canary_status_has '"canary_exit_ip":"5.5.77.20"' \
+        && pass "трафик канарейки выходит с адреса релея" \
+        || fail "адрес выхода канарейки не адрес релея"
+
+    local visible
+    visible="$(curl -kfsS -H "Authorization: Bearer $CANARY_TOKEN" "https://127.0.0.1:$CANARY_PANEL_PORT/api/peers")"
+    [ "$visible" = "[]" ] && pass "служебный пир не виден в списке клиентов" \
+        || fail "служебный пир попал в список клиентов: $visible"
+
+    curl -kfsS -H "Authorization: Bearer $CANARY_TOKEN" "https://127.0.0.1:$CANARY_PANEL_PORT/api/status/metrics" \
+        | grep -q '^noisefloor_canary_ok 1$' \
+        && pass "noisefloor_canary_ok 1 в метриках" || fail "нет noisefloor_canary_ok 1 в метриках"
+
+    # --- снесённое правило TPROXY ---
+    docker exec "$c" touch /tmp/nf-fail
+    docker exec "$c" sh -c 'iptables-save -t mangle | grep -e "-j TPROXY" | sed "s/^-A /-D /" \
+        | while read -r rule; do eval "iptables -t mangle $rule"; done'
+    if wait_for 120 canary_status_has '"canary_ok":false'; then
+        pass "без правила TPROXY канарейка покраснела не позже 2 мин"
+    else
+        fail "канарейка не заметила снесённое правило TPROXY"
+        eval "$diag"
+    fi
+    canary_status_has '"canary_stage":"exit_ip"' \
+        && pass "причина: трафик вышел не с адреса релея" \
+        || { fail "канарейка упала не на адресе выхода"; eval "$diag"; }
+    canary_status_has '"running":true' \
+        && pass "xray при этом жив: состояния показаны раздельно" \
+        || fail "xray упал, тест проверил не то"
+
+    docker exec "$c" rm /tmp/nf-fail
+    wait_for 120 canary_status_has '"canary_ok":true' \
+        && pass "после возврата правила канарейка зелёная" \
+        || { fail "канарейка не вернулась после возврата правила"; eval "$diag"; return; }
+
+    # --- MTU 1280 и потеря фрагментов ---
+    # Настоящая чёрная дыра: панель шлёт полными пакетами, без фрагментов и без
+    # ICMP, а veth отбрасывает всё длиннее MTU приёмного конца. Фрагментация на
+    # панели не подходит: получатель соберёт пакет раньше своих цепочек. Правило
+    # -m length тоже: в ядре Docker Desktop загрузка xt_length вешает iptables.
+    docker exec "$c" ip route get 100.64.78.40 | grep -q ' dev eth1 ' \
+        || fail "стенд: канарейка не за eth1 панели"
+    docker exec smoke-canary ip link set eth0 mtu 1280
+    if wait_for 120 canary_status_has '"canary_ok":false'; then
+        pass "при MTU 1280 без фрагментов канарейка покраснела не позже 2 мин"
+    else
+        fail "канарейка не заметила потерю крупных пакетов"
+        eval "$diag"
+    fi
+    canary_status_has '"canary_stage":"download"' \
+        && pass "причина: встало скачивание, а не рукопожатие" \
+        || { fail "канарейка упала не на скачивании"; eval "$diag"; }
+
+    docker exec smoke-canary ip link set eth0 mtu 1500
+    wait_for 120 canary_status_has '"canary_ok":true' \
+        && pass "после возврата MTU канарейка зелёная" \
+        || { fail "канарейка не вернулась после возврата MTU"; eval "$diag"; }
+
+    canary_cleanup
+}
+
 # --------------------------------------------------------------- установка ----
 
 # Логику swap проверяем без настоящего swapon: ядро здесь общее с хостом.
@@ -571,7 +778,8 @@ case "${1:-}" in
     --panel-only) test_panel; test_rules; test_rules_supervision; test_install ;;
     --rules-only) test_rules; test_rules_supervision ;;
     --install-only) test_install ;;
-    "")           test_relay; test_panel; test_rules; test_rules_supervision; test_install ;;
+    --canary-only) test_canary ;;
+    "")           test_relay; test_panel; test_rules; test_rules_supervision; test_install; test_canary ;;
     *) echo "неизвестный аргумент: $1" >&2; exit 2 ;;
 esac
 

@@ -61,7 +61,10 @@ services() {
 
 service_dir() { services | awk -F'\t' -v n="$1" '$1==n{print $2; exit}'; }
 
-container_id() { (cd "$1" && docker compose ps -q 2>/dev/null | head -1); }
+# Канарейку пропускаем: здоровье и образ определяет основной контейнер.
+container_id() {
+    (cd "$1" && docker compose ps -q "$(docker compose config --services | grep -vx canary | head -1)" 2>/dev/null | head -1)
+}
 
 container_env() { # каталог переменная
     local id; id=$(container_id "$1")

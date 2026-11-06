@@ -133,6 +133,15 @@ class CascadeStatus(BaseModel):
     verified_at: UtcDatetime | None = None
     verify_error: str | None = None
     restarts: int = 0  # сколько раз супервизор поднимал упавший xray
+    # Проба через настоящий туннель. Отдельно от verified_ok: та минует awg0,
+    # iptables и MTU. None - контейнер канарейки не запущен или ещё не проверял.
+    canary_ok: bool | None = None
+    canary_checked_at: UtcDatetime | None = None
+    canary_error: str | None = None
+    canary_stage: str | None = None  # на чём упала: handshake, dns, exit_ip, download
+    canary_exit_ip: str | None = None
+    canary_duration_ms: int | None = None
+    canary_speed_bps: int | None = None
     # Синхронизация параметров с релеем
     sync_enabled: bool = False
     sync_error: str | None = None

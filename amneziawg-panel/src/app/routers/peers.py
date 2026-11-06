@@ -45,7 +45,7 @@ def _client_config(db: Session, peer: Peer, server) -> str:
 
 def _get_peer_or_404(db: Session, peer_id: int) -> Peer:
     peer = db.get(Peer, peer_id)
-    if peer is None:
+    if peer is None or peer.is_service:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Пир не найден")
     return peer
 
@@ -54,7 +54,7 @@ def _get_peer_or_404(db: Session, peer_id: int) -> Peer:
 def list_peers(db: Session = Depends(get_db), _admin: str = Depends(get_current_admin)):
     server = config_sync.get_server(db)
     live_status = config_sync.live_status_by_pubkey(server)
-    peers = db.query(Peer).order_by(Peer.created_at.asc()).all()
+    peers = db.query(Peer).filter(Peer.is_service.is_(False)).order_by(Peer.created_at.asc()).all()
     return [_to_read(peer, live_status) for peer in peers]
 
 
