@@ -55,6 +55,9 @@ REDIRECT_PORT = 12345
 # клиенту всё равно. Так запрос уходит наружу по TCP через каскад и не
 # светит настоящий адрес сервера. Включается CASCADE_DNS_VIA_CASCADE.
 DNS_REDIRECT_PORT = 12353
+# Запросы не про адреса (TXT, HTTPS, MX) DNS-модуль не обрабатывает: исходящий
+# dns-cache отдаёт их сюда, а отсюда они идут по обычному маршруту через каскад.
+DNS_FORWARD_PORT = 12354
 STATS_API_ADDR = "127.0.0.1:10086"
 
 # База geoip лежит в каталоге ассетов движка (кладётся в образ, версия
@@ -222,6 +225,15 @@ def dns_via_cascade() -> bool:
     return bool(getattr(settings, "cascade_dns_via_cascade", False)) and not _tproxy_mode()
 
 
+def xudp_enabled() -> bool:
+    return bool(getattr(settings, "cascade_xudp", False))
+
+
+def dns_cache_enabled() -> bool:
+    """Кэш имеет смысл там, где DNS клиентов вообще доходит до xray."""
+    return xudp_enabled() and (_tproxy_mode() or dns_via_cascade())
+
+
 def geoip_available() -> bool:
     return GEOIP_PATH.exists()
 
@@ -248,7 +260,12 @@ def _relay_tag(index: int) -> str:
 
 
 def _relay_outbound(tag: str, params: dict) -> dict:
+    # concurrency -1: TCP без mux, иначе Vision не работает. UDP идёт через
+    # XUDP, без него каждый новый порт источника стоил бы соединения TCP+REALITY.
+    # UDP/443 это QUIC: браузер быстрее вернётся на TCP, чем дождётся его здесь.
+    mux = {"enabled": True, "concurrency": -1, "xudpConcurrency": 16, "xudpProxyUDP443": "reject"}
     return {
+        **({"mux": mux} if xudp_enabled() else {}),
         "tag": tag,
         "protocol": "vless",
         "settings": {
@@ -341,15 +358,45 @@ def build_xray_config(params: dict, dns_server: str = "1.1.1.1", split_ru_direct
     dns_inbounds = []
     dns_outbounds = []
     dns_rules = []
+    client_dns_rules = []
+    dns_block = {}
+    dns_host, _, dns_port = (dns_server or "1.1.1.1").partition(":")
+    dns_port = int(dns_port or 53)
     if dns_via_cascade():
-        dns_host, _, dns_port = (dns_server or "1.1.1.1").partition(":")
         dns_inbounds.append({
             "tag": "dns-in",
             "listen": "0.0.0.0",
             "port": DNS_REDIRECT_PORT,
             "protocol": "dokodemo-door",
-            "settings": {"address": dns_host, "port": int(dns_port or 53), "network": "udp"},
+            "settings": {"address": dns_host, "port": dns_port, "network": "udp"},
         })
+    if dns_cache_enabled():
+        # Запросы адресов отвечает DNS-модуль движка, в нём и живёт кэш. Его
+        # собственные запросы приходят в маршрутизацию с тегом из dns.tag.
+        dns_block = {"dns": {
+            "tag": "dns-module",
+            "servers": [{"address": dns_host, "port": dns_port}],
+            "queryStrategy": "UseIP",
+        }}
+        dns_inbounds.append({
+            "tag": "dns-forward",
+            "listen": "127.0.0.1",
+            "port": DNS_FORWARD_PORT,
+            "protocol": "dokodemo-door",
+            "settings": {"address": dns_host, "port": dns_port, "network": "udp"},
+        })
+        dns_outbounds.append({
+            "tag": "dns-cache",
+            "protocol": "dns",
+            "settings": {"address": "127.0.0.1", "port": DNS_FORWARD_PORT, "network": "udp",
+                         "nonIPQuery": "skip"},
+        })
+        client_dns_rules.append({"ruleTag": "nf-dns", "type": "field", "inboundTag": ["cascade-in"],
+                                 "network": "udp", "port": 53, "outboundTag": "dns-cache"})
+        if dns_via_cascade():
+            dns_rules.append({"type": "field", "inboundTag": ["dns-in"], "outboundTag": "dns-cache"})
+        dns_rules.append({"type": "field", "inboundTag": ["dns-module", "dns-forward"], **route})
+    elif dns_via_cascade():
         if balanced:
             # proxySettings знает только конкретный исходящий, не балансировщик.
             # Поэтому при нескольких релеях запрос идёт обычным UDP через
@@ -359,14 +406,20 @@ def build_xray_config(params: dict, dns_server: str = "1.1.1.1", split_ru_direct
             dns_outbounds.append({
                 "tag": "dns-out",
                 "protocol": "dns",
-                "settings": {"network": "tcp", "address": dns_host, "port": int(dns_port or 53)},
+                "settings": {"network": "tcp", "address": dns_host, "port": dns_port},
                 # Запрос уходит не напрямую, а внутрь каскада — иначе смысл
                 # перехвата теряется: адрес сервера видел бы уже DNS-резолвер.
                 "proxySettings": {"tag": RELAY_TAG},
             })
             dns_rules.append({"type": "field", "inboundTag": ["dns-in"], "outboundTag": "dns-out"})
 
+    # Кэш идёт после nf-private: резолвер в локальной сети отвечает сам, и до
+    # geoip:ru, иначе запрос к российскому резолверу ушёл бы мимо кэша.
+    split_rules = _split_ru_rules(route) if split_ru_direct else []
+    client_rules = [*split_rules[:1], *client_dns_rules, *split_rules[1:]]
+
     return {
+        **dns_block,
         **observatory,
         # access: none — иначе движок пишет строку на КАЖДОЕ соединение
         # клиента в тот же файл, куда идут ошибки. На проде это 23 МБ за
@@ -491,7 +544,7 @@ def build_xray_config(params: dict, dns_server: str = "1.1.1.1", split_ru_direct
             **({"balancers": balancers} if balanced else {}),
             "rules": [
                 {"ruleTag": "nf-api", "type": "field", "inboundTag": ["api-in"], "outboundTag": "api"},
-                *(_split_ru_rules(route) if split_ru_direct else []),
+                *client_rules,
                 {"ruleTag": "nf-default", "type": "field", "inboundTag": ["cascade-in"], **route},
                 # Проба обязана идти тем же путём, что и клиентский трафик,
                 # иначе она проверяет не то. Правил разделения она не

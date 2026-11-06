@@ -20,6 +20,7 @@
 #   tests/smoke.sh --failover-only
 #   tests/smoke.sh --mtu-only
 #   tests/smoke.sh --split-only
+#   tests/smoke.sh --xudp-only
 #   tests/smoke.sh --rotation-only [секунд загрузки, по умолчанию 60]
 #   tests/smoke.sh --selfcheck-only
 #   RELAY_IMAGE=... PANEL_IMAGE=... tests/smoke.sh
@@ -501,9 +502,28 @@ def dns():
     sock.bind(("0.0.0.0", 53))
     while True:
         data, addr = sock.recvfrom(1500)
-        sock.sendto(data[:2] + b"\x81\x80" + data[4:6] + b"\x00\x01" + data[8:], addr)
+        name_end = data.index(b"\x00", 12) + 1
+        qtype = int.from_bytes(data[name_end:name_end + 2], "big")
+        question = data[12:name_end + 4]
+        with open("/tmp/dns-seen", "a") as seen:
+            seen.write(f"{qtype} {question.hex()}\n")
+        rdata = {1: bytes([5, 5, 77, 10]), 16: b"\x02ok"}.get(qtype)
+        answer = b"" if rdata is None else b"\xc0\x0c" + data[name_end:name_end + 4] \
+            + b"\x00\x00\x00\x3c" + len(rdata).to_bytes(2, "big") + rdata
+        sock.sendto(data[:2] + b"\x81\x80" + data[4:6] + (b"\x00\x01" if answer else b"\x00\x00")
+                    + b"\x00\x00\x00\x00" + question + answer, addr)
+
+def udp_echo(port):
+    # Отвечает адресом отправителя: так видно, откуда пришёл UDP.
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.bind(("0.0.0.0", port))
+    while True:
+        data, addr = sock.recvfrom(1500)
+        sock.sendto(addr[0].encode(), addr)
 
 threading.Thread(target=dns, daemon=True).start()
+threading.Thread(target=udp_echo, args=(3478,), daemon=True).start()
+threading.Thread(target=udp_echo, args=(443,), daemon=True).start()
 ThreadingHTTPServer(("0.0.0.0", 80), Handler).serve_forever()
 PY
     docker run -d --name smoke-canary-web --network "$net" --ip 5.5.77.10 \
@@ -1123,6 +1143,125 @@ test_split() {
     canary_cleanup
 }
 
+# Сколько новых TCP-соединений открыла панель к релею 5.5.77.20 за время $1 секунд.
+count_relay_syns() {
+    docker exec smoke-canary-panel python -c '
+import socket, sys, time
+sock = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.htons(3))
+sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1 << 24)
+sock.settimeout(1)
+end, syns = time.time() + int(sys.argv[1]), 0
+relay = bytes([5, 5, 77, 20])
+while time.time() < end:
+    try:
+        data, addr = sock.recvfrom(128)
+    except socket.timeout:
+        continue
+    if addr[4:] and addr[2] != 4:
+        continue
+    if data[12:14] != b"\x08\x00" or data[23] != 6 or data[30:34] != relay:
+        continue
+    ihl = (data[14] & 15) * 4
+    syns += data[14 + ihl + 13] & 0x12 == 0x02
+print(syns)
+' "$1"
+}
+
+# Клиент за туннелем: 100 запросов с новых портов. Печатает число ответов.
+dns_burst() {
+    docker exec smoke-canary python -c '
+import socket, struct, sys
+ok = 0
+for i in range(100):
+    name = b"\x03n%02d\x07example\x00" % i
+    query = struct.pack("!HHHHHH", i + 1, 0x0100, 1, 0, 0, 0) + name + b"\x00\x01\x00\x01"
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+        sock.settimeout(3)
+        for _ in range(2):
+            try:
+                sock.sendto(query, ("5.5.77.10", 53))
+                ok += sock.recv(1500)[:2] == query[:2]
+                break
+            except OSError:
+                continue
+print(ok)
+'
+}
+
+# Один запрос типа $2 про имя $1: печатает число ответов.
+dns_ask() {
+    docker exec smoke-canary python -c '
+import socket, struct, sys
+name = b"".join(bytes([len(p)]) + p.encode() for p in sys.argv[1].split(".")) + b"\x00"
+query = struct.pack("!HHHHHH", 7, 0x0100, 1, 0, 0, 0) + name + struct.pack("!HH", int(sys.argv[2]), 1)
+sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+sock.settimeout(4)
+sock.sendto(query, ("5.5.77.10", 53))
+print(struct.unpack("!H", sock.recv(1500)[6:8])[0])
+' "$1" "$2" 2>&1 | tail -1
+}
+
+# Отправка UDP на порт $1 из-за туннеля: адрес, каким его увидел web, или "тишина".
+udp_exit() {
+    docker exec smoke-canary python -c '
+import socket, sys
+sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+sock.settimeout(3)
+sock.sendto(b"x" * 200, ("5.5.77.10", int(sys.argv[1])))
+try:
+    print(sock.recv(1500).decode())
+except OSError:
+    print("тишина")
+' "$1"
+}
+
+test_xudp_stand() {
+    local label="$1" want="$2" syns answers
+    api_put_server '{"dns":"5.5.77.10"}' || { fail "$label: панель не приняла DNS"; return; }
+    sleep_seconds 3
+    wait_for 60 canary_status_has '"canary_ok":true' || fail "$label: канарейка не вернулась"
+    count_relay_syns 30 > "$WORKDIR/syns" &
+    local counter=$!
+    sleep_seconds 2
+    answers="$(dns_burst)"
+    wait "$counter"
+    syns="$(cat "$WORKDIR/syns")"
+    [ "$answers" = 100 ] && pass "$label: на 100 запросов 100 ответов" || fail "$label: ответов $answers из 100"
+    if [ "$syns" -le "$want" ] && [ "$label" != "без XUDP" ]; then
+        pass "$label: соединений к релею за 100 запросов: $syns"
+    elif [ "$label" = "без XUDP" ] && [ "$syns" -ge "$want" ]; then
+        pass "контроль: без XUDP соединений к релею $syns"
+    else
+        fail "$label: соединений к релею $syns, порог $want"
+    fi
+}
+
+test_xudp() {
+    echo
+    echo "UDP и DNS через каскад  ($PANEL_IMAGE)"
+    canary_stand xudp-off 60 || return
+    test_xudp_stand "без XUDP" 80
+    canary_cleanup
+
+    CANARY_PANEL_ENV="-e CASCADE_XUDP=true"
+    canary_stand xudp 60 || { CANARY_PANEL_ENV=; return; }
+    CANARY_PANEL_ENV=
+    test_xudp_stand "с XUDP" 9
+
+    local got cached
+    [ "$(dns_ask cached.example 1)" = 1 ] || fail "запрос A без ответа"
+    [ "$(dns_ask cached.example 1)" = 1 ] || fail "повторный запрос A без ответа"
+    cached="$(docker exec smoke-canary-web sh -c "grep -c '^1 .*636163686564' /tmp/dns-seen" || true)"
+    [ "$cached" = 1 ] && pass "повторный запрос ответил кэш" || fail "до резолвера дошло запросов: $cached"
+    got="$(dns_ask txt.example 16)"
+    [ "$got" = 1 ] && pass "запрос TXT проходит" || fail "запрос TXT: $got"
+    got="$(udp_exit 3478)"
+    [ "$got" = 5.5.77.20 ] && pass "UDP выходит с адреса релея" || fail "UDP: $got"
+    got="$(udp_exit 443)"
+    [ "$got" = "тишина" ] && pass "QUIC отклонён" || fail "UDP/443: $got"
+    canary_cleanup
+}
+
 selfcheck_cleanup() {
     docker rm -f smoke-selfcheck smoke-agent-relay-1 >/dev/null 2>&1 || true
     docker image rm -f nf-smoke-agent-relay:broken nf-smoke-agent-relay:current \
@@ -1437,8 +1576,9 @@ case "${1:-}" in
     --rotation-only) test_rotation "${2:-}" ;;
     --mtu-only) test_mtu ;;
     --split-only) test_split ;;
+    --xudp-only) test_xudp ;;
     --selfcheck-only) test_selfcheck ;;
-    "")           test_relay; test_panel; test_rules; test_rules_supervision; test_install; test_canary; test_failover; test_rotation; test_mtu; test_split; test_selfcheck ;;
+    "")           test_relay; test_panel; test_rules; test_rules_supervision; test_install; test_canary; test_failover; test_rotation; test_mtu; test_split; test_xudp; test_selfcheck ;;
     *) echo "неизвестный аргумент: $1" >&2; exit 2 ;;
 esac
 

@@ -86,6 +86,10 @@ class Settings(BaseSettings):
     # так выбирает релей (вход каскада разбирает домен из TLS/HTTP).
     # Включайте, если важно, чтобы DNS-резолвер не видел адрес сервера.
     cascade_dns_via_cascade: bool = False
+    # UDP через каскад одним соединением (mux/XUDP) и кэш DNS клиентов на панели.
+    # TCP остаётся без mux и совместим с Vision. Выключено, пока не проверено на
+    # настоящей сети.
+    cascade_xudp: bool = False
     # Адрес проб через каскад: кнопка «Проверить» и выбор живого релея. Ответ
     # должен быть 204.
     cascade_probe_url: str = "https://www.gstatic.com/generate_204"

@@ -190,6 +190,59 @@ class ConfigTests(unittest.TestCase):
         self.assertNotIn("routeOnly", self.sniffing(config))
         self.assertNotIn("domainStrategy", config["routing"])
 
+    def xudp(self, mode="tproxy", dns=False, split=False, reserves=(), flag=True):
+        with mock.patch.object(cascade.settings, "cascade_xudp", flag), \
+             mock.patch.object(cascade.settings, "cascade_intercept_mode", mode), \
+             mock.patch.object(cascade.settings, "cascade_dns_via_cascade", dns):
+            return cascade.build_xray_config(A, "9.9.9.9", split_ru_direct=split, reserves=reserves)
+
+    @staticmethod
+    def inbound_rule(config, inbound):
+        return next(r for r in config["routing"]["rules"] if inbound in r.get("inboundTag", []))
+
+    def test_xudp_is_off_by_default(self):
+        config = self.xudp(flag=False)
+        self.assertNotIn("mux", config["outbounds"][0])
+        self.assertNotIn("dns", config)
+        self.assertNotIn("dns-cache", [o["tag"] for o in config["outbounds"]])
+
+    def test_xudp_leaves_tcp_without_mux(self):
+        mux = self.xudp()["outbounds"][0]["mux"]
+        self.assertEqual(mux, {"enabled": True, "concurrency": -1, "xudpConcurrency": 16,
+                               "xudpProxyUDP443": "reject"})
+
+    def test_xudp_reaches_every_relay(self):
+        relays_out = [o for o in self.xudp(reserves=[B])["outbounds"] if o["protocol"] == "vless"]
+        self.assertEqual(len(relays_out), 2)
+        self.assertTrue(all("mux" in o for o in relays_out))
+
+    def test_client_dns_goes_to_cache(self):
+        config = self.xudp()
+        rule = next(r for r in config["routing"]["rules"] if r.get("ruleTag") == "nf-dns")
+        self.assertEqual((rule["port"], rule["network"], rule["outboundTag"]), (53, "udp", "dns-cache"))
+        self.assertEqual(config["dns"]["servers"], [{"address": "9.9.9.9", "port": 53}])
+
+    def test_cache_misses_go_through_the_cascade(self):
+        # Запрос мимо каскада выдал бы резолверу адрес сервера.
+        for reserves, expected in (((), {"outboundTag": "cascade-out"}),
+                                   ([B], {"balancerTag": cascade.BALANCER_TAG})):
+            config = self.xudp(reserves=reserves)
+            for inbound in ("dns-module", "dns-forward"):
+                self.assertLessEqual(expected.items(), self.inbound_rule(config, inbound).items())
+
+    def test_dns_rule_order_with_split(self):
+        tags = [r.get("ruleTag") for r in self.xudp(split=True)["routing"]["rules"]]
+        self.assertLess(tags.index("nf-private"), tags.index("nf-dns"))
+        self.assertLess(tags.index("nf-dns"), tags.index("nf-ru"))
+
+    def test_redirect_listener_uses_cache(self):
+        config = self.xudp("redirect", dns=True)
+        self.assertEqual(self.inbound_rule(config, "dns-in")["outboundTag"], "dns-cache")
+        self.assertNotIn("dns-out", [o["tag"] for o in config["outbounds"]])
+
+    def test_redirect_without_cascade_dns_has_no_cache(self):
+        self.assertNotIn("dns", self.xudp("redirect"))
+
     def test_ru_split_goes_through_balancer_too(self):
         config = cascade.build_xray_config(A, split_ru_direct=True, reserves=[B])
         fixed = [r for r in config["routing"]["rules"] if r.get("outboundTag") == "cascade-out"]
