@@ -52,6 +52,13 @@ def effective_mtu(server) -> int:
     return server.mtu or profile_mtu(getattr(server, "s4", None))
 
 
+def tunnel_mtu(server, tunnel) -> int | None:
+    """MTU дополнительного интерфейса. У AmneziaWG 2.0 свой S4, остальным хватает
+    значения awg-quick по умолчанию."""
+    s4 = getattr(tunnel, "s4", None)
+    return server.mtu or (profile_mtu(s4) if s4 else None)
+
+
 _PROC_IPV6 = Path("/proc/sys/net/ipv6/conf")
 _IPV6_MIN_MTU = 1280
 
@@ -265,8 +272,9 @@ def tunnel_config(tunnel: Tunnel, server: ServerConfig, peers: list[Peer]) -> st
         f"Address = {with_ipv6(tunnel.address, server)}",
         f"ListenPort = {tunnel.listen_port}",
     ]
-    if server.mtu:
-        lines.append(f"MTU = {server.mtu}")
+    mtu = tunnel_mtu(server, tunnel)
+    if mtu:
+        lines.append(f"MTU = {mtu}")
     lines.extend(_tunnel_obfuscation_lines(tunnel))
     blocks = ["\n".join(lines)]
     for peer in peers:
@@ -289,9 +297,8 @@ def client_config(peer: Peer, server: ServerConfig, tunnel: Tunnel | None = None
     # без него часть клиентов сама угадывает MTU по своему аплинку и на
     # сетях с меньшим реальным path MTU (мобильные операторы, двойной VPN)
     # получает PMTU black hole — см. комментарий про TCPMSS в
-    # server_interface_block. У дополнительных протоколов S4 нет, им хватает
-    # значения по умолчанию.
-    mtu = server.mtu if tunnel else effective_mtu(server)
+    # server_interface_block.
+    mtu = tunnel_mtu(server, tunnel) if tunnel else effective_mtu(server)
     if mtu:
         lines.append(f"MTU = {mtu}")
     dns = peer.dns_override or server.dns

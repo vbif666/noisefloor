@@ -8,6 +8,7 @@ test_postup_and_postdown_are_symmetric закрывает класс дефек�
 import contextlib
 import ipaddress
 import tempfile
+import types
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -336,6 +337,21 @@ class ClientConfigTests(unittest.TestCase):
         # Лучше явная заглушка, чем конфиг с пустым Endpoint, который клиент
         # молча импортирует и не подключится.
         self.assertIn("YOUR_SERVER_HOST_OR_IP", awg_config.client_config(_Peer(), server))
+
+
+
+class TunnelMtuTests(unittest.TestCase):
+    def test_awg20_mtu_follows_its_own_s4(self):
+        server = types.SimpleNamespace(mtu=None)
+        self.assertEqual(awg_config.tunnel_mtu(server, types.SimpleNamespace(s4=32)), 1392)
+
+    def test_explicit_mtu_wins(self):
+        server = types.SimpleNamespace(mtu=1280)
+        self.assertEqual(awg_config.tunnel_mtu(server, types.SimpleNamespace(s4=32)), 1280)
+
+    def test_tunnels_without_s4_keep_default(self):
+        server = types.SimpleNamespace(mtu=None)
+        self.assertIsNone(awg_config.tunnel_mtu(server, types.SimpleNamespace(s4=None)))
 
 
 if __name__ == "__main__":
