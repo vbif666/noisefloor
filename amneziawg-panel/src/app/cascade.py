@@ -962,6 +962,10 @@ def supervise(stop_event) -> None:
             db.close()
 
 
+def running_relay_count() -> int:
+    return len(_running_relays)
+
+
 def active_relay() -> str | None:
     """Адрес релея, который xray выбрал сейчас. None: живых нет, выбирать не из
     чего (один релей) или xray не ответил."""

@@ -99,6 +99,14 @@ class Settings(BaseSettings):
 
     # Канарейка: проба через настоящий туннель из отдельного контейнера.
     # Работает, только если контейнер запущен (см. docker-compose.yml).
+    # Уведомления: канал настраивается в интерфейсе, здесь только темп.
+    notify_interval_seconds: float = 30
+    # Сколько новое состояние канарейки и релеев должно продержаться.
+    notify_hold_seconds: float = 120
+    notify_min_interval_seconds: float = 300
+    notify_max_per_hour: int = 20
+    notify_telegram_api: str = "https://api.telegram.org"
+
     canary_enabled: bool = True
     # С каких адресов ждать выход через каскад, через запятую. Пусто - адрес
     # из ссылки на релей. Нужно, если релей выходит в сеть с другого адреса.

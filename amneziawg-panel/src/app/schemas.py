@@ -337,6 +337,22 @@ class TrafficHistoryPoint(BaseModel):
 
 # --- Резервные копии ---
 
+class NotifySettings(BaseModel):
+    webhook_url: str
+    telegram_chat_id: str
+    telegram_token_set: bool
+    queued: int
+    last_sent_at: str | None
+    last_error: str | None
+
+
+class NotifyUpdate(BaseModel):
+    webhook_url: str = Field(default="", max_length=2000)
+    telegram_chat_id: str = Field(default="", max_length=64)
+    # None - оставить сохранённый токен, пустая строка - удалить.
+    telegram_token: str | None = Field(default=None, max_length=200)
+
+
 class BackupStatus(BaseModel):
     last_success_at: str | None
     last_error: str | None

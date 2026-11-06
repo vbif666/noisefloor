@@ -108,7 +108,7 @@ def health() -> dict:
 
 def supervise(stop_event) -> None:
     """Фоновый цикл: пропал интерфейс — поднимаем заново."""
-    from . import config_sync
+    from . import config_sync, notify
     from .database import SessionLocal
     from .models import ServerConfig, Tunnel
 
@@ -142,6 +142,7 @@ def supervise(stop_event) -> None:
                 continue
             _record(server, True)
             print(f"[awg-supervisor] интерфейс {gone} снова поднят")
+            notify.event("awg_restart", f"интерфейс {gone} пропал и поднят заново надзором")
             backoff = BACKOFF_START_SECONDS
         except Exception as exc:  # надзор не должен умирать от одной ошибки
             print(f"[awg-supervisor] ошибка: {exc}")

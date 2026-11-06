@@ -325,6 +325,41 @@
 
         <div class="panel" style="margin-bottom:16px;">
           <div class="panel-header">
+            <h2>Уведомления</h2>
+            <span class="apply-status" id="notify-status"></span>
+          </div>
+          <div class="panel-body">
+            <p class="field-hint" style="margin-top:0;">
+              Сообщение приходит только при смене состояния: канарейка упала или
+              восстановилась, переключение релея, перезапуск интерфейса надзором,
+              восстановление правил, несовпадение отпечатка релея, обновление, сбой
+              бэкапа. Отправка идёт через каскад, а если он недоступен - напрямую.
+            </p>
+            <div class="field-group">
+              <div class="field">
+                <label for="notify-webhook">Webhook (POST с JSON <code>{"text": "..."}</code>)</label>
+                <input id="notify-webhook" placeholder="https://example.com/hook" autocomplete="off" />
+              </div>
+              <div class="field-row">
+                <div class="field">
+                  <label for="notify-token">Токен Telegram-бота</label>
+                  <input id="notify-token" type="password" autocomplete="off" />
+                </div>
+                <div class="field">
+                  <label for="notify-chat">ID чата Telegram</label>
+                  <input id="notify-chat" autocomplete="off" />
+                </div>
+              </div>
+            </div>
+            <div class="server-actions" style="margin-top:14px;">
+              <button type="button" id="notify-save-btn" class="btn btn-primary btn-sm">Сохранить</button>
+              <button type="button" id="notify-test-btn" class="btn btn-ghost btn-sm">Тестовое сообщение</button>
+            </div>
+          </div>
+        </div>
+
+        <div class="panel" style="margin-bottom:16px;">
+          <div class="panel-header">
             <h2>Резервная копия</h2>
             <span class="apply-status" id="backup-status"></span>
           </div>

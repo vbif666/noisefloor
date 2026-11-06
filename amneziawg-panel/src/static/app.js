@@ -372,7 +372,7 @@ document.querySelectorAll(".tab-btn").forEach((btn) => {
    ========================================================================== */
 
 async function loadEverything() {
-  await Promise.all([loadServer(), loadPeers(), loadBackups(), loadTunnels()]);
+  await Promise.all([loadServer(), loadPeers(), loadBackups(), loadTunnels(), loadNotify()]);
 }
 
 /* ==========================================================================
@@ -828,6 +828,63 @@ function renderCascadeSummary(c) {
   if (c.relay_label) parts.push(c.relay_label);
   el.textContent = parts.join("  ·  ");
 }
+
+/* ==========================================================================
+   Уведомления
+   ========================================================================== */
+
+function showNotify(data) {
+  $("notify-webhook").value = data.webhook_url;
+  $("notify-chat").value = data.telegram_chat_id;
+  $("notify-token").value = "";
+  $("notify-token").placeholder = data.telegram_token_set ? "сохранён, пустое поле его не меняет" : "";
+  notifyStatus(data.last_error ? `не доставлено: ${data.last_error}` : "", Boolean(data.last_error));
+}
+
+function notifyStatus(text, isError) {
+  const status = $("notify-status");
+  status.classList.remove("is-error", "is-ok");
+  status.classList.add(isError ? "is-error" : "is-ok");
+  status.textContent = text;
+}
+
+async function loadNotify() {
+  try {
+    showNotify(await api("/notify"));
+  } catch (err) {
+    notifyStatus(err.message, true);
+  }
+}
+
+async function saveNotify() {
+  const body = { webhook_url: $("notify-webhook").value, telegram_chat_id: $("notify-chat").value };
+  if ($("notify-token").value) body.telegram_token = $("notify-token").value;
+  showNotify(await api("/notify", { method: "PUT", body: JSON.stringify(body) }));
+}
+
+$("notify-save-btn").addEventListener("click", async () => {
+  try {
+    await saveNotify();
+    notifyStatus("сохранено", false);
+  } catch (err) {
+    notifyStatus(err.message, true);
+  }
+});
+
+$("notify-test-btn").addEventListener("click", async () => {
+  const btn = $("notify-test-btn");
+  btn.disabled = true;
+  notifyStatus("отправляю…", false);
+  try {
+    await saveNotify();
+    await api("/notify/test", { method: "POST" });
+    notifyStatus("доставлено", false);
+  } catch (err) {
+    notifyStatus(err.message, true);
+  } finally {
+    btn.disabled = false;
+  }
+});
 
 /* ==========================================================================
    Резервные копии

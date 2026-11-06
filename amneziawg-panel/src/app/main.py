@@ -6,11 +6,11 @@ from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 
-from . import awg_supervisor, backup, bootstrap, canary, cascade, cascade_sync, config_sync, relays, self_update, traffic_history
+from . import awg_supervisor, backup, bootstrap, canary, cascade, cascade_sync, config_sync, notify, relays, self_update, traffic_history
 from .config import settings
 from .database import Base, SessionLocal, engine, run_migrations
 from .models import ServerConfig, Tunnel
-from .routers import auth, backup as backup_router, peers, server, status, tunnels, updates
+from .routers import auth, backup as backup_router, notify as notify_router, peers, server, status, tunnels, updates
 
 STATIC_DIR = Path(__file__).resolve().parent.parent / "static"
 
@@ -38,6 +38,7 @@ _awg_supervisor_stop = threading.Event()
 _canary_stop = threading.Event()
 _backup_stop = threading.Event()
 _cascade_sync_stop = threading.Event()
+_notify_stop = threading.Event()
 _self_update_stop = threading.Event()
 
 
@@ -86,6 +87,8 @@ async def lifespan(app: FastAPI):
     # вышла ли новая версия, и показывает это в панели. Само обновление
     # делает хостовый агент по запросу администратора.
     threading.Thread(target=self_update.run, args=(_self_update_stop,), daemon=True).start()
+    # Уведомления о смене состояний. Без настроенного канала только помнит их.
+    threading.Thread(target=notify.run, args=(_notify_stop,), daemon=True).start()
     try:
         yield
     finally:
@@ -96,6 +99,7 @@ async def lifespan(app: FastAPI):
         _backup_stop.set()
         _cascade_sync_stop.set()
         _self_update_stop.set()
+        _notify_stop.set()
 
 
 app = FastAPI(title="AmneziaWG Panel", version="1.0.0", lifespan=lifespan)
@@ -118,6 +122,7 @@ app.include_router(tunnels.router, prefix="/api/tunnels", tags=["tunnels"])
 app.include_router(status.router, prefix="/api/status", tags=["status"])
 app.include_router(updates.router, prefix="/api/updates", tags=["updates"])
 app.include_router(backup_router.router, prefix="/api/backup", tags=["backup"])
+app.include_router(notify_router.router, prefix="/api/notify", tags=["notify"])
 
 if STATIC_DIR.exists():
     app.mount("/", RevalidatingStaticFiles(directory=str(STATIC_DIR), html=True), name="static")

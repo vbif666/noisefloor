@@ -25,6 +25,7 @@
 #   tests/smoke.sh --rotation-only [секунд загрузки, по умолчанию 60]
 #   tests/smoke.sh --selfcheck-only
 #   tests/smoke.sh --rollback-only
+#   tests/smoke.sh --notify-only
 #   RELAY_IMAGE=... PANEL_IMAGE=... tests/smoke.sh
 #
 # Работает на bridge-сети с портами из диапазона 291xx, поэтому безопасен
@@ -477,6 +478,15 @@ class Handler(BaseHTTPRequestHandler):
         # неверный адрес выхода сообщает текстом ошибки, этому журналу проще верить.
         with open("/tmp/seen", "a") as seen:
             seen.write(self.client_address[0] + "\n")
+    def do_POST(self):
+        # Уведомления: кто прислал и что. Адрес показывает, шло ли через каскад.
+        import json
+        body = json.loads(self.rfile.read(int(self.headers.get("Content-Length", 0))))
+        with open("/tmp/hook", "a", encoding="utf-8") as hook:
+            hook.write(f"{self.client_address[0]} {self.path} {body.get('chat_id', '')} {body['text']}\n")
+        self.send_response(200)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
     def do_GET(self):
         if self.path == "/generate_204":
             self.do_HEAD()
@@ -533,7 +543,7 @@ PY
 
     docker run -d --name smoke-canary-relay --network "$net" --ip 5.5.77.20 \
         -e LABEL=smoke-canary -e APP_CODENAME=SmokeCanary -e PUBLIC_HOST=5.5.77.20 \
-        -e ADMIN_PASSWORD=smoke-relay-pass \
+        -e ADMIN_PASSWORD=smoke-relay-pass ${CANARY_RELAY_ENV:-} \
         -v "$dir/relay:/data" "$RELAY_IMAGE" >/dev/null
     if ! wait_for 45 test -s "$dir/relay/creds.json"; then
         fail "релей стенда не поднялся"
@@ -1495,6 +1505,88 @@ EOF
     selfcheck_cleanup
 }
 
+# ------------------------------------------------------------ уведомления ----
+
+hook_log() {
+    docker exec smoke-canary-web sh -c 'cat /tmp/hook 2>/dev/null' || true
+}
+
+hook_has() {
+    [[ "$(hook_log)" == *$1* ]]
+}
+
+test_notify() {
+    echo
+    echo "Уведомления"
+    CANARY_PANEL_ENV="-e NOTIFY_INTERVAL_SECONDS=2 -e NOTIFY_HOLD_SECONDS=4 -e NOTIFY_MIN_INTERVAL_SECONDS=4 -e NOTIFY_TELEGRAM_API=http://5.5.77.10"
+    CANARY_RELAY_ENV="-e NOTIFY_WEBHOOK_URL=http://5.5.77.10/relay -e NOTIFY_PANEL_SILENT_MINUTES=0.1"
+    canary_stand notify 5 || { CANARY_PANEL_ENV=; CANARY_RELAY_ENV=; return; }
+    CANARY_PANEL_ENV=; CANARY_RELAY_ENV=
+    local api="https://127.0.0.1:$CANARY_PANEL_PORT/api/notify" auth="Authorization: Bearer $CANARY_TOKEN"
+    local json='Content-Type: application/json' dir="$WORKDIR/notify"
+
+    curl -kfsS -o /dev/null -X PUT "$api" -H "$auth" -H "$json" \
+        -d '{"webhook_url":"http://5.5.77.10/hook","telegram_chat_id":"42","telegram_token":"123:smoke"}' \
+        || { fail "настройки уведомлений не сохранились"; return; }
+    [ "$(stat -c %a "$dir/data/notify.json")" = 600 ] && pass "файл настроек с правами 600" \
+        || fail "права notify.json: $(stat -c %a "$dir/data/notify.json")"
+    curl -kfsS "$api" -H "$auth" | grep -q '123:smoke' && fail "токен бота отдаётся наружу" \
+        || pass "токен бота в API не отдаётся"
+
+    curl -kfsS -o /dev/null -X POST "$api/test" -H "$auth" || fail "тестовое сообщение не ушло"
+    hook_has '5.5.77.20 /hook*тестовое' && pass "тестовое сообщение пришло через каскад, с адреса релея" \
+        || fail "тестовое сообщение: $(hook_log)"
+    hook_has '5.5.77.20 /bot123:smoke/sendMessage 42 *тестовое' && pass "Telegram: токен в адресе, чат в теле, через каскад" \
+        || fail "тестовое сообщение в Telegram: $(hook_log)"
+
+    # --- релей лёг: канарейка красная, отправка уходит напрямую ---
+    docker stop smoke-canary-relay >/dev/null
+    if wait_for 90 hook_has '5.5.77.30 /hook*канарейка упала'; then
+        pass "канарейка упала: сообщение пришло, каскад лежит, ушло напрямую"
+    else
+        fail "нет сообщения о падении канарейки: $(hook_log)"
+    fi
+    local count
+    sleep_seconds 10
+    count="$(hook_log | grep -c ' /hook .*канарейка упала' || true)"
+    [ "$count" = 1 ] && pass "о падении сообщено один раз" || fail "сообщений о падении: $count"
+
+    docker start smoke-canary-relay >/dev/null
+    if wait_for 90 hook_has 'канарейка восстановилась'; then
+        pass "канарейка восстановилась: сообщение пришло"
+    else
+        fail "нет сообщения о восстановлении: $(hook_log)"
+    fi
+
+    # --- снесённые правила ---
+    docker exec smoke-canary-panel sh -c 'iptables-save -t mangle | grep -e "-j TPROXY" | sed "s/^-A /-D /" \
+        | while read -r rule; do eval "iptables -t mangle $rule"; done'
+    if wait_for 60 hook_has 'правила фаервола снесли'; then
+        pass "восстановление правил: сообщение пришло"
+    else
+        fail "нет сообщения о восстановлении правил: $(hook_log)"
+    fi
+
+    # --- панель перестала ходить на релей ---
+    local sync_token
+    sync_token="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["sync_token"])' "$dir/relay/creds.json")"
+    docker exec smoke-canary-panel curl -kfsS -o /dev/null -H "Authorization: Bearer $sync_token" \
+        "https://5.5.77.20:8001/api/sync" || fail "релей не ответил на синхронизацию"
+    if wait_for 45 hook_has '5.5.77.20 /relay*панель не синхронизировалась'; then
+        pass "релей сам сообщил о молчании панели"
+    else
+        fail "релей промолчал: $(hook_log)"
+    fi
+    docker exec smoke-canary-panel curl -kfsS -o /dev/null -H "Authorization: Bearer $sync_token" \
+        "https://5.5.77.20:8001/api/sync" || true
+    if wait_for 30 hook_has 'панель снова на связи'; then
+        pass "релей сообщил о восстановлении связи"
+    else
+        fail "нет сообщения о возврате панели: $(hook_log)"
+    fi
+    canary_cleanup
+}
+
 # --------------------------------------------- откат вместе с данными ----
 
 rollback_agent() { # подпись образа; настоящие compose и данные, подменён только pull
@@ -1849,7 +1941,8 @@ case "${1:-}" in
     --xudp-only) test_xudp ;;
     --selfcheck-only) test_selfcheck ;;
     --rollback-only) test_rollback ;;
-    "")           test_relay; test_panel; test_rules; test_rules_supervision; test_install; test_canary; test_failover; test_rotation; test_mtu; test_split; test_xudp; test_ipv6; test_selfcheck; test_rollback ;;
+    --notify-only) test_notify ;;
+    "")           test_relay; test_panel; test_rules; test_rules_supervision; test_install; test_canary; test_failover; test_rotation; test_mtu; test_split; test_xudp; test_ipv6; test_selfcheck; test_rollback; test_notify ;;
     *) echo "неизвестный аргумент: $1" >&2; exit 2 ;;
 esac
 

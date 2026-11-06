@@ -101,6 +101,8 @@ def ensure_rules(server: ServerConfig, interfaces: list[str]) -> awg_manager.Com
         print(f"[rules] не удалось поставить правила: {result.output}")
     elif drifted:
         print(f"[rules] правила восстановлены: {state.output}")
+        from . import notify
+        notify.event("rules_restored", f"правила фаервола снесли снаружи, надзор вернул их: {state.output}")
     return result
 
 

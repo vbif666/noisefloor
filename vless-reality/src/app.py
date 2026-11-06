@@ -46,6 +46,7 @@ from urllib.parse import quote
 
 from fastapi import Depends, FastAPI, Form, HTTPException, Request, status
 
+import notify
 import selfcheck
 import self_update
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
@@ -1375,6 +1376,7 @@ async def lifespan(app: FastAPI):
         threading.Thread(target=geohide_loop, args=(_stop_event,), daemon=True),
         threading.Thread(target=self_update.run, args=(_stop_event,), daemon=True),
         threading.Thread(target=selfcheck.run, args=(_stop_event, load_creds, XRAY_BIN), daemon=True),
+        threading.Thread(target=notify.run, args=(_stop_event,), daemon=True),
     ]
     for t in threads:
         t.start()
@@ -1495,6 +1497,7 @@ def api_sync():
     одинаковыми вручную: меняем их здесь, панель забирает изменение сама.
     Раньше после смены dest каскад молча переставал пропускать трафик,
     пока кто-нибудь не обновит ссылку на первом сервере руками."""
+    notify.watch.seen()
     creds = json.loads(CREDS_FILE.read_text())
     rot = get_rotation(creds)
     host = current_host()
