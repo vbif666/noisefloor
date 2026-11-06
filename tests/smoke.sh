@@ -1752,7 +1752,7 @@ test_install_telegram() {
     root="$(cd "$(dirname "$0")/.." && pwd)"
     for script in amneziawg-panel/install.sh vless-reality/install.sh; do
         dir="$(mktemp -d)"
-        bin="$(mktemp -d)"
+        bin="$(mktemp -d "$HOME/nf-stub.XXXXXX")"  # /tmp бывает noexec
         # Docker подменён: проверяем файл и команду, сервер не нужен.
         printf '#!/bin/sh\necho "$@" >> "%s/calls"\n' "$dir" > "$bin/docker"
         chmod +x "$bin/docker"
