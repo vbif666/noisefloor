@@ -429,8 +429,11 @@ STUB
         -e DEFAULT_SERVER_ADDRESS=10.78.0.1/24 -e DEFAULT_LISTEN_PORT=51998 \
         -e PUBLIC_HOST=203.0.113.20 \
         -v "$dir/data:/opt/panel/data" -v "$dir/awg_config:/etc/amnezia/amneziawg" \
-        -v "$dir/bin/iptables-restore:/usr/local/bin/iptables-restore:ro" \
         "$PANEL_IMAGE" >/dev/null
+
+    # Копия, а не bind mount: /tmp бывает смонтирован с noexec, и тогда sh
+    # молча проходит мимо заглушки к настоящему iptables-restore.
+    docker cp "$dir/bin/iptables-restore" "$c:/usr/local/bin/iptables-restore" >/dev/null
 
     if ! wait_for 60 test -s "$dir/data/INITIAL_ADMIN_PASSWORD.txt" \
         || ! wait_for 45 curl -kfsS -o /dev/null "https://127.0.0.1:$port/"; then
@@ -448,8 +451,9 @@ STUB
     [ -n "$token" ] || { fail "не удалось войти в панель"; return; }
 
     status_has() {
-        curl -kfsS -H "Authorization: Bearer $token" "https://127.0.0.1:$port/api/status" \
-            | grep -q "$1"
+        local body
+        body="$(curl -kfsS -H "Authorization: Bearer $token" "https://127.0.0.1:$port/api/status")"
+        [[ "$body" == *$1* ]]
     }
     rules_back() {
         docker exec "$c" sh -c 'iptables -S FORWARD | grep -q NOISEFLOOR-FWD'
@@ -477,10 +481,11 @@ STUB
 
     docker exec "$c" touch /tmp/nf-fail
     docker exec "$c" iptables -F FORWARD
-    if wait_for 60 status_has '"rules_error":"[^"]*TPROXY'; then
+    if wait_for 60 status_has '"rules_ok":false*TPROXY'; then
         pass "панель показывает ошибку правил в статусе"
     else
         fail "ошибка правил не видна в статусе панели"
+        docker logs "$c" 2>&1 | grep -v "GET /api" | tail -8
     fi
 
     docker exec "$c" rm /tmp/nf-fail
