@@ -287,6 +287,7 @@ services:
       ADMIN_USERNAME: "\${ADMIN_USERNAME:-admin}"
       ADMIN_PASSWORD: "\${ADMIN_PASSWORD:-}"
       APP_CODENAME: "\${APP_CODENAME:-Relay-01}"
+      SELFCHECK_INTERVAL_SECONDS: "\${SELFCHECK_INTERVAL_SECONDS:-120}"
     volumes:
       - ./data:/data
 EOF

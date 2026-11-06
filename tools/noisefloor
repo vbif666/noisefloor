@@ -23,7 +23,7 @@
 set -euo pipefail
 
 AGENT_VERSION=2
-SERVICES_FILE=/etc/noisefloor/services
+SERVICES_FILE=${NOISEFLOOR_SERVICES_FILE:-/etc/noisefloor/services}
 REQUEST_TARGET=""
 REPO=vbif666/noisefloor
 PANEL_IMAGE=vbif666/noisefloor-amneziawg-panel

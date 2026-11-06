@@ -59,7 +59,8 @@ LABEL org.opencontainers.image.source="https://github.com/vbif666/noisefloor" \
 
 EXPOSE 8001 8443
 
-# Здоровье = xray запущен. По нему хостовый агент обновлений решает,
+# Здоровье = xray запущен и клиент проходит через REALITY (src/selfcheck.py).
+# По нему хостовый агент обновлений решает,
 # удалось ли обновление или пора откатываться.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
     CMD curl -kfsS -o /dev/null "https://127.0.0.1:${PANEL_PORT}/api/health" || exit 1

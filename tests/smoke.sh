@@ -17,6 +17,7 @@
 #   tests/smoke.sh --rules-only
 #   tests/smoke.sh --install-only
 #   tests/smoke.sh --canary-only
+#   tests/smoke.sh --selfcheck-only
 #   RELAY_IMAGE=... PANEL_IMAGE=... tests/smoke.sh
 #
 # Работает на bridge-сети с портами из диапазона 291xx, поэтому безопасен
@@ -607,6 +608,146 @@ STUB
     canary_cleanup
 }
 
+# ---------------------------------------- самопроверка релея и откат агента ----
+
+selfcheck_cleanup() {
+    docker rm -f smoke-selfcheck smoke-agent-relay-1 >/dev/null 2>&1 || true
+    docker image rm -f nf-smoke-agent-relay:broken nf-smoke-agent-relay:current \
+        nf-smoke-agent-relay:previous nf-smoke-agent-relay:stable >/dev/null 2>&1 || true
+}
+
+selfcheck_health() {
+    docker exec smoke-selfcheck sh -c 'curl -ksS "https://127.0.0.1:${PANEL_PORT}/api/health"' 2>/dev/null
+}
+
+selfcheck_health_has() {
+    [[ "$(selfcheck_health)" == *$1* ]]
+}
+
+agent_relay_healthy() {
+    [ "$(docker inspect smoke-agent-relay-1 --format '{{.State.Health.Status}}' 2>/dev/null)" = healthy ]
+}
+
+# Заменяет закрытый ключ в конфиге на чужой: xray запускается, клиенты не проходят.
+BREAK_REALITY_PY='
+import json, os, re, signal, subprocess
+out = subprocess.run(["xray", "x25519"], capture_output=True, text=True).stdout
+key = re.search(r"Private\s*[Kk]ey:\s*(\S+)", out).group(1)
+path = "/data/xray-config.json"
+config = json.load(open(path))
+config["inbounds"][0]["streamSettings"]["realitySettings"]["privateKey"] = key
+json.dump(config, open(path, "w"))
+# Сторож поднимет xray уже с испорченным конфигом.
+for pid in filter(str.isdigit, os.listdir("/proc")):
+    try:
+        cmd = open(f"/proc/{pid}/cmdline", "rb").read()
+    except OSError:
+        continue
+    if cmd.startswith(b"/usr/local/bin/xray") and b"xray-config.json" in cmd:
+        os.kill(int(pid), signal.SIGTERM)
+'
+
+test_selfcheck() {
+    echo
+    echo "Самопроверка релея  ($RELAY_IMAGE)"
+    local dir="$WORKDIR/selfcheck" c=smoke-selfcheck
+    mkdir -p "$dir/data" "$dir/agent/data"
+    selfcheck_cleanup
+    trap 'selfcheck_cleanup; canary_cleanup; docker rm -f smoke-rules-panel >/dev/null 2>&1 || true; cleanup' EXIT
+
+    docker run -d --name "$c" -e LABEL=smoke -e APP_CODENAME=Smoke -e PUBLIC_HOST=127.0.0.1 \
+        -e SELFCHECK_INTERVAL_SECONDS=10 -e SELFCHECK_RETRY_SECONDS=5 \
+        -v "$dir/data:/data" "$RELAY_IMAGE" >/dev/null
+
+    if wait_for 60 selfcheck_health_has '"selfcheck":"ok"'; then
+        pass "самопроверка прошла через настоящий REALITY"
+    else
+        fail "самопроверка не дошла до ok: $(selfcheck_health)"
+        docker logs "$c" 2>&1 | tail -10
+        return
+    fi
+
+    docker exec -i "$c" python3 -c "$BREAK_REALITY_PY"
+    if wait_for 60 selfcheck_health_has '"selfcheck":"failed"'; then
+        pass "сломанный realitySettings: /api/health отвечает 503"
+    else
+        fail "/api/health не заметил сломанный REALITY: $(selfcheck_health)"
+    fi
+    selfcheck_health | grep -q '"xray_running":true' \
+        && pass "процесс xray при этом жив: раньше такой релей считался здоровым" \
+        || fail "xray не запущен, тест проверил не то"
+    docker rm -f "$c" >/dev/null
+
+    # --- агент: настоящие контейнеры и compose, подменён только docker pull ---
+    local d="$dir/agent" repo=nf-smoke-agent-relay broken="$dir/broken"
+    mkdir -p "$broken"
+    docker tag "$RELAY_IMAGE" "$repo:current"
+    cat > "$broken/Dockerfile" <<EOF
+FROM $RELAY_IMAGE
+RUN sed -i 's/"privateKey": creds\["private_key"\]/"privateKey": "cGxlYXNlLWJyZWFrLXJlYWxpdHktZm9yLXNtb2tlLTA"/' /app/app.py
+EOF
+    if ! docker build -q -t "$repo:broken" "$broken" >/dev/null; then
+        fail "сломанный образ не собрался"
+        return
+    fi
+    if [ "$(docker run --rm --entrypoint grep "$repo:broken" -c 'cGxlYXNlLWJyZWFrLXJlYWxpdHktZm9yLXNtb2tlLTA' /app/app.py)" = 0 ]; then
+        fail "стенд: правка не попала в образ"
+        return
+    fi
+    docker tag "$repo:broken" "$repo:stable"
+
+    cat > "$d/docker-compose.yml" <<EOF
+name: smoke-agent
+services:
+  relay:
+    image: $repo:current
+    container_name: smoke-agent-relay-1
+    environment:
+      LABEL: smoke
+      APP_CODENAME: Smoke
+      PUBLIC_HOST: 127.0.0.1
+      SELFCHECK_RETRY_SECONDS: 5
+    volumes:
+      - ./data:/data
+EOF
+    (cd "$d" && docker compose up -d >/dev/null 2>&1)
+    if ! wait_for 90 agent_relay_healthy; then
+        fail "исходный релей не стал healthy"
+        return
+    fi
+    pass "исходная версия здорова"
+
+    local before
+    before="$(docker inspect smoke-agent-relay-1 --format '{{.Image}}')"
+    printf 'relay=%s\n' "$d" > "$dir/services"
+    # Функция, а не файл в PATH: /tmp бывает смонтирован с noexec.
+    local rc=0
+    (
+        docker() {
+            [ "$1" = pull ] && return 0
+            command docker "$@"
+        }
+        export -f docker
+        NOISEFLOOR_SERVICES_FILE="$dir/services" \
+            bash "$(cd "$(dirname "$0")/.." && pwd)/tools/noisefloor" update relay
+    ) >"$dir/agent.log" 2>&1 || rc=$?
+
+    grep -q 'новая версия не поднялась' "$dir/agent.log" \
+        && pass "агент поставил новую версию и не дождался здоровья" \
+        || { fail "агент не дошёл до проверки здоровья"; tail -5 "$dir/agent.log"; return; }
+    [ "$rc" != 0 ] && pass "агент сообщил, что обновление не удалось" \
+        || { fail "агент посчитал сломанный релиз удачным"; tail -5 "$dir/agent.log"; }
+    [ "$(docker inspect smoke-agent-relay-1 --format '{{.Image}}')" = "$before" ] \
+        && pass "агент вернул прежний образ" \
+        || { fail "после обновления работает не прежний образ"; tail -5 "$dir/agent.log"; }
+    grep -q '"rolled_back": true' "$d/data/update-result.json" \
+        && pass "откат записан в update-result.json" \
+        || fail "нет записи об откате: $(cat "$d/data/update-result.json" 2>/dev/null)"
+
+    (cd "$d" && docker compose down >/dev/null 2>&1) || true
+    selfcheck_cleanup
+}
+
 # --------------------------------------------------------------- установка ----
 
 # Логику swap проверяем без настоящего swapon: ядро здесь общее с хостом.
@@ -779,7 +920,8 @@ case "${1:-}" in
     --rules-only) test_rules; test_rules_supervision ;;
     --install-only) test_install ;;
     --canary-only) test_canary ;;
-    "")           test_relay; test_panel; test_rules; test_rules_supervision; test_install; test_canary ;;
+    --selfcheck-only) test_selfcheck ;;
+    "")           test_relay; test_panel; test_rules; test_rules_supervision; test_install; test_canary; test_selfcheck ;;
     *) echo "неизвестный аргумент: $1" >&2; exit 2 ;;
 esac
 

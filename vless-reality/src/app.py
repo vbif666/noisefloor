@@ -45,6 +45,7 @@ from urllib.parse import quote
 
 from fastapi import Depends, FastAPI, Form, HTTPException, Request, status
 
+import selfcheck
 import self_update
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 import qrcode
@@ -1029,6 +1030,11 @@ def watchdog_tick(stop_event: threading.Event) -> bool:
 IP_RE = re.compile(r"(\d{1,3}(?:\.\d{1,3}){3}|\[[0-9a-fA-F:]+\]):\d+ accepted")
 
 
+def is_own_probe(ip: str) -> bool:
+    """Самопроверка ходит через вход с loopback: это не клиент."""
+    return ip == "127.0.0.1"
+
+
 def tail_access_log(stop_event: threading.Event):
     ACCESS_LOG.touch(exist_ok=True)
     # Двоичный режим: нужен tell() как настоящая позиция в байтах.
@@ -1049,7 +1055,7 @@ def tail_access_log(stop_event: threading.Event):
                 continue
             line = raw.decode("utf-8", "replace")
             m = IP_RE.search(line)
-            if m and "vless-in" in line:
+            if m and "vless-in" in line and not is_own_probe(m.group(1)):
                 with state_lock:
                     state["connected"] = True
                     state["last_connect"] = datetime.now(timezone.utc).isoformat()
@@ -1133,6 +1139,7 @@ async def lifespan(app: FastAPI):
         threading.Thread(target=rotation_loop, args=(_stop_event,), daemon=True),
         threading.Thread(target=geohide_loop, args=(_stop_event,), daemon=True),
         threading.Thread(target=self_update.run, args=(_stop_event,), daemon=True),
+        threading.Thread(target=selfcheck.run, args=(_stop_event, load_creds, XRAY_BIN), daemon=True),
     ]
     for t in threads:
         t.start()
@@ -1186,17 +1193,22 @@ def api_status():
     s["port"] = creds.get("vless_port")
     s["rotation"] = get_rotation(creds) if creds else None
     s["accepted_snis"] = active_server_names(creds) if creds else []
+    s["selfcheck"] = selfcheck.snapshot()
     return JSONResponse(s)
 
 
 @app.get(HEALTH_PATH)
 def api_health():
-    """Живо ли: процесс xray запущен. 503, если нет, — так Docker и агент
-    обновлений видят состояние без пароля."""
+    """Живо ли: процесс xray запущен и клиент проходит через REALITY. 503,
+    если нет, — так Docker и агент обновлений видят состояние без пароля.
+    Ручка открытая, поэтому текста ошибки здесь нет: он в /api/status."""
     with state_lock:
         running = bool(state["xray_running"])
-    return JSONResponse({"ok": running, "xray_running": running, "version": build_info()},
-                        status_code=200 if running else 503)
+    check = selfcheck.snapshot()
+    ok = running and selfcheck.healthy(check)
+    return JSONResponse({"ok": ok, "xray_running": running, "selfcheck": check["state"],
+                         "version": build_info()},
+                        status_code=200 if ok else 503)
 
 
 @app.get("/api/metrics", response_class=Response)
@@ -1209,6 +1221,9 @@ def api_metrics():
         "# HELP noisefloor_relay_xray_up Жив ли процесс xray",
         "# TYPE noisefloor_relay_xray_up gauge",
         f"noisefloor_relay_xray_up {int(bool(s['xray_running']))}",
+        "# HELP noisefloor_relay_selfcheck_ok Проходит ли клиент через REALITY (последняя самопроверка)",
+        "# TYPE noisefloor_relay_selfcheck_ok gauge",
+        f"noisefloor_relay_selfcheck_ok {int(selfcheck.healthy())}",
         "# HELP noisefloor_relay_client_connected Было ли хоть одно подключение клиента",
         "# TYPE noisefloor_relay_client_connected gauge",
         f"noisefloor_relay_client_connected {int(bool(s['connected']))}",
