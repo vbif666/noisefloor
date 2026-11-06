@@ -24,6 +24,7 @@
 #   tests/smoke.sh --xudp-only
 #   tests/smoke.sh --rotation-only [секунд загрузки, по умолчанию 60]
 #   tests/smoke.sh --selfcheck-only
+#   tests/smoke.sh --rollback-only
 #   RELAY_IMAGE=... PANEL_IMAGE=... tests/smoke.sh
 #
 # Работает на bridge-сети с портами из диапазона 291xx, поэтому безопасен
@@ -1494,6 +1495,180 @@ EOF
     selfcheck_cleanup
 }
 
+# --------------------------------------------- откат вместе с данными ----
+
+rollback_agent() { # подпись образа; настоящие compose и данные, подменён только pull
+    docker tag "nf-smoke-rollback:$1" nf-smoke-rollback:stable
+    local rc=0
+    (
+        docker() {
+            [ "$1" = pull ] && return 0
+            command docker "$@"
+        }
+        export -f docker
+        NOISEFLOOR_SERVICES_FILE="$RB_DIR/services" NOISEFLOOR_HEALTH_TIMEOUT=45 NOISEFLOOR_CANARY_TIMEOUT=45 \
+            bash "$(cd "$(dirname "$0")/.." && pwd)/tools/noisefloor" "${@:2}"
+    ) >"$RB_DIR/agent-$1.log" 2>&1 || rc=$?
+    return "$rc"
+}
+
+rollback_peers() {
+    curl -kfsS -H "Authorization: Bearer $CANARY_TOKEN" "https://127.0.0.1:$CANARY_PANEL_PORT/api/peers" || true
+}
+
+rollback_add_peer() {
+    curl -kfsS -o /dev/null -X POST -H "Authorization: Bearer $CANARY_TOKEN" -H 'Content-Type: application/json' \
+        -d "{\"name\":\"$1\"}" "https://127.0.0.1:$CANARY_PANEL_PORT/api/peers"
+}
+
+rollback_image() {
+    docker inspect smoke-canary-panel --format '{{.Image}}'
+}
+
+test_rollback() {
+    echo
+    echo "Откат вместе с данными"
+    canary_stand rollback 5 || return
+    RB_DIR="$WORKDIR/rollback"
+    local dir="$RB_DIR" repo=nf-smoke-rollback build="$WORKDIR/rollback-build"
+
+    # Те же настройки, что у панели стенда, но под управлением compose.
+    docker tag "$PANEL_IMAGE" "$repo:current"
+    docker rm -f smoke-canary-panel >/dev/null
+    cat > "$dir/docker-compose.yml" <<EOF
+name: smoke-rollback
+services:
+  panel:
+    image: $repo:current
+    container_name: smoke-canary-panel
+    cap_add: [NET_ADMIN, NET_RAW]
+    devices: [/dev/net/tun]
+    sysctls:
+      net.ipv4.ip_forward: 1
+    ports: ["127.0.0.1:$CANARY_PANEL_PORT:8000"]
+    environment:
+      LIVE_MANAGEMENT_ENABLED: "true"
+      AUTO_APPLY_ON_START: "true"
+      AWG_AUTO_UPDATE_ENABLED: "false"
+      DEFAULT_SERVER_ADDRESS: 10.79.0.1/24
+      DEFAULT_LISTEN_PORT: "51997"
+      PUBLIC_HOST: 5.5.77.30
+      CASCADE_PROBE_URL: http://5.5.77.10/generate_204
+    volumes:
+      - ./data:/opt/panel/data
+      - ./awg_config:/etc/amnezia/amneziawg
+    networks:
+      smoke-canary-net: {ipv4_address: 5.5.77.30}
+      smoke-canary-lan: {ipv4_address: 100.64.78.30}
+networks:
+  smoke-canary-net: {external: true}
+  smoke-canary-lan: {external: true}
+EOF
+    (cd "$dir" && docker compose up -d >/dev/null 2>&1)
+    if ! wait_for 90 canary_status_has '"canary_ok":true'; then
+        fail "панель под compose не вернула зелёную канарейку"
+        return
+    fi
+    printf 'panel=%s\n' "$dir" > "$dir/services"
+    rollback_add_peer before-update
+    local before
+    before="$(rollback_image)"
+
+    mkdir -p "$build/migration" "$build/cascade" "$build/good"
+    {
+        echo "FROM $PANEL_IMAGE"
+        cat <<'EOF'
+RUN sed -i 's|^def run_migrations() -> None:$|&\n    import pathlib, sqlite3\n    pathlib.Path("/opt/panel/data/logs").mkdir(exist_ok=True)\n    pathlib.Path("/opt/panel/data/logs/broken-migration").touch()\n    db = sqlite3.connect("/opt/panel/data/awg_panel.db")\n    db.execute("alter table peers rename to peers_new")\n    db.commit()\n    raise RuntimeError("сломанная миграция")|' /opt/panel/app/database.py
+EOF
+    } > "$build/migration/Dockerfile"
+    {
+        echo "FROM $PANEL_IMAGE"
+        echo "RUN sed -i 's/^        port = parsed.port$/        port = 1/' /opt/panel/app/cascade.py"
+    } > "$build/cascade/Dockerfile"
+    printf 'FROM %s\nLABEL smoke=good\n' "$PANEL_IMAGE" > "$build/good/Dockerfile"
+    local kind
+    for kind in migration cascade good; do
+        docker build -q -t "$repo:$kind" "$build/$kind" >/dev/null \
+            || { fail "образ $kind не собрался"; return; }
+    done
+
+    # --- сломанная миграция портит базу и роняет новую версию ---
+    mkdir "$dir/data.pre-old1" "$dir/data.pre-old2"
+    touch -t 202001010000 "$dir/data.pre-old1"
+    touch -t 202001020000 "$dir/data.pre-old2"
+    if rollback_agent migration update panel; then
+        fail "агент посчитал сломанную миграцию удачей"
+        tail -5 "$dir/agent-migration.log"
+    else
+        pass "сломанная миграция: агент сообщил о неудаче"
+    fi
+    [ -e "$dir/data/logs/broken-migration" ] \
+        && pass "миграция новой версии успела выполниться" \
+        || { fail "сломанная миграция не запускалась, тест проверил не то"; tail -5 "$dir/agent-migration.log"; }
+    [ "$(rollback_image)" = "$before" ] && pass "возвращён прежний образ" \
+        || fail "после отката работает не прежний образ"
+    [[ "$(rollback_peers)" == *before-update* ]] && pass "база возвращена: клиент на месте" \
+        || { fail "база не возвращена: $(rollback_peers)"; tail -5 "$dir/agent-migration.log"; }
+    if wait_for 60 canary_status_has '"canary_ok":true'; then
+        pass "после отката каскад работает"
+    else
+        fail "после отката каскад не вернулся"
+    fi
+    [ -d "$dir/data.pre-old2" ] && [ ! -e "$dir/data.pre-old1" ] \
+        && [ "$(find "$dir" -maxdepth 1 -name 'data.pre-*' | wc -l)" = 2 ] \
+        && pass "хранятся две последние копии" || fail "копии: $(ls -d "$dir"/data.pre-*)"
+    local snapshot
+    snapshot="$(find "$dir" -maxdepth 1 -name 'data.pre-*' ! -name data.pre-old2)"
+    [ -s "$snapshot/awg_panel.db" ] && [ ! -e "$snapshot/logs" ] && [ ! -e "$snapshot/canary" ] \
+        && pass "в копии база, логов и каталога канарейки нет" || fail "состав копии: $(ls "$snapshot")"
+
+    # --- новая версия здорова, но каскад не вернулся ---
+    if rollback_agent cascade update panel; then
+        fail "агент не заметил сломанный каскад"
+        tail -5 "$dir/agent-cascade.log"
+    else
+        grep -q 'каскад работал до обновления' "$dir/agent-cascade.log" \
+            && pass "здоровая панель с красной канарейкой откатывается" \
+            || { fail "откат не из-за канарейки"; tail -5 "$dir/agent-cascade.log"; }
+    fi
+    [ "$(rollback_image)" = "$before" ] && pass "возвращён прежний образ" \
+        || fail "после отката работает не прежний образ"
+    grep -q 'каскад работал до обновления' "$dir/data/update-result.json" \
+        && pass "причина записана в update-result.json" || fail "$(cat "$dir/data/update-result.json")"
+    if wait_for 60 canary_status_has '"canary_ok":true'; then
+        pass "каскад снова зелёный"
+    else
+        fail "каскад не вернулся после второго отката"
+    fi
+
+    # --- удачное обновление и откат руками через время ---
+    if rollback_agent good update panel; then
+        pass "исправная версия ставится, канарейка дождалась"
+    else
+        fail "исправная версия откатилась"
+        tail -5 "$dir/agent-good.log"
+        return
+    fi
+    [ "$(rollback_image)" != "$before" ] || fail "образ не сменился"
+    rollback_add_peer after-update
+    if rollback_agent good rollback panel; then
+        if wait_for 45 curl -kfsS -o /dev/null "https://127.0.0.1:$CANARY_PANEL_PORT/api/health" \
+            && [ "$(rollback_image)" = "$before" ] && [[ "$(rollback_peers)" != *after-update* ]]; then
+            pass "откат руками вернул образ и данные на момент обновления"
+        else
+            fail "откат руками: $(rollback_peers)"
+        fi
+    else
+        fail "откат руками не удался"
+        tail -5 "$dir/agent-good.log"
+    fi
+    [ -s "$dir/data.before-rollback/awg_panel.db" ] \
+        && pass "данные после обновления сохранены рядом" || fail "нет data.before-rollback"
+    [ ! -e "$dir/.rollback-data" ] && pass "повторный откат данные не тронет" || fail "метка отката осталась"
+
+    canary_cleanup
+}
+
 # --------------------------------------------------------------- установка ----
 
 # Логику swap проверяем без настоящего swapon: ядро здесь общее с хостом.
@@ -1673,7 +1848,8 @@ case "${1:-}" in
     --split-only) test_split ;;
     --xudp-only) test_xudp ;;
     --selfcheck-only) test_selfcheck ;;
-    "")           test_relay; test_panel; test_rules; test_rules_supervision; test_install; test_canary; test_failover; test_rotation; test_mtu; test_split; test_xudp; test_ipv6; test_selfcheck ;;
+    --rollback-only) test_rollback ;;
+    "")           test_relay; test_panel; test_rules; test_rules_supervision; test_install; test_canary; test_failover; test_rotation; test_mtu; test_split; test_xudp; test_ipv6; test_selfcheck; test_rollback ;;
     *) echo "неизвестный аргумент: $1" >&2; exit 2 ;;
 esac
 
