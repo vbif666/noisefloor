@@ -219,6 +219,34 @@ class TrafficSample(Base):
     cascade_downlink = Column(Integer, nullable=False, default=0)
 
 
+class FallbackConfig(Base):
+    """Запасной вход VLESS, см. fallback.py. Одна строка, выключен по умолчанию."""
+
+    __tablename__ = "fallback_config"
+
+    id = Column(Integer, primary_key=True)
+    enabled = Column(Boolean, default=False, nullable=False)
+    port = Column(Integer, nullable=False, default=443)
+    sni = Column(String(253), nullable=False)
+    dest = Column(String(260), nullable=False)
+    private_key = Column(String(64), nullable=False)
+    public_key = Column(String(64), nullable=False)
+    short_id = Column(String(16), nullable=False)
+    updated_at = Column(DateTime, default=_utcnow, onupdate=_utcnow)
+
+
+class FallbackClient(Base):
+    """Клиент запасного входа. Отдельно от peers: нет ни ключей, ни адреса в подсети."""
+
+    __tablename__ = "fallback_clients"
+
+    id = Column(Integer, primary_key=True)
+    name = Column(String(128), nullable=False)
+    uuid = Column(String(36), nullable=False, unique=True)
+    enabled = Column(Boolean, default=True, nullable=False)
+    created_at = Column(DateTime, default=_utcnow)
+
+
 class Peer(Base):
     __tablename__ = "peers"
 

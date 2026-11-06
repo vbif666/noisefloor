@@ -87,6 +87,16 @@ ALL_DOWN_MODES = ("block", "direct")
 # короче 10 с xray молча поднимает до 10 с, поэтому sampling 1: при двух окно
 # выросло бы до 40 с, а релей обязан смениться за 30. Одна потерянная проба
 # релей не убивает: в окне их две.
+# Запасной вход VLESS, см. fallback.py.
+FALLBACK_TAG = "fallback-in"
+# Вход открыт в интернет, и в отличие от клиента AWG его адрес никак не ограничен.
+FALLBACK_BLOCKED_IPS = (
+    "0.0.0.0/8", "10.0.0.0/8", "100.64.0.0/10", "127.0.0.0/8", "169.254.0.0/16", "172.16.0.0/12",
+    "192.168.0.0/16", "224.0.0.0/4", "240.0.0.0/4", "::1/128", "fc00::/7", "fe80::/10",
+)
+# Порты, которые слушает сам xray: совпадение с ними уронило бы его целиком.
+RESERVED_TCP_PORTS = frozenset({10086, PROBE_PORT, REDIRECT_PORT, DNS_REDIRECT_PORT, DNS_FORWARD_PORT})
+
 OBSERVE_INTERVAL = "10s"
 OBSERVE_SAMPLING = 1
 OBSERVE_TIMEOUT = "4s"
@@ -130,6 +140,7 @@ _wanted = False
 _verify_soon = threading.Event()
 # Тег исходящего -> адрес релея в запущенном конфиге.
 _running_relays: dict[str, str] = {}
+_fallback_warning: str | None = None
 
 
 class VlessParseError(ValueError):
@@ -324,6 +335,42 @@ def _balancing_block(all_down: str) -> dict:
     ]
 
 
+def _fallback_inbound(fallback: dict) -> dict:
+    return {
+        "tag": FALLBACK_TAG,
+        "listen": "0.0.0.0",
+        "port": fallback["port"],
+        "protocol": "vless",
+        "settings": {
+            "clients": [{"id": uuid, "flow": "xtls-rprx-vision"} for uuid in fallback["clients"]],
+            "decryption": "none",
+        },
+        "streamSettings": {
+            "network": "tcp",
+            "security": "reality",
+            "realitySettings": {
+                "dest": fallback["dest"],
+                "serverNames": [fallback["sni"]],
+                "privateKey": fallback["private_key"],
+                "shortIds": [fallback["short_id"]],
+            },
+        },
+    }
+
+
+def _fallback_rules(relay_route: dict) -> list[dict]:
+    """Только через релей: тот маршрут, что и у пробы, он никогда не выпускает
+    напрямую. Разделения здесь нет: клиент VLESS присылает имена, а не адреса, и
+    решать по ним на сервере было бы нечем. Имя, которое на релее разрешится в
+    локальный адрес, этими правилами не поймать: кроме localhost их не знает никто."""
+    tagged = {"type": "field", "inboundTag": [FALLBACK_TAG]}
+    return [
+        {"ruleTag": "nf-vless-private", **tagged, "ip": list(FALLBACK_BLOCKED_IPS), "outboundTag": "block"},
+        {"ruleTag": "nf-vless-local", **tagged, "domain": ["full:localhost"], "outboundTag": "block"},
+        {"ruleTag": "nf-vless", **tagged, **relay_route},
+    ]
+
+
 def _split_ru_rules(route: dict | None = None) -> list[dict]:
     """Правила разделения: российские адреса — напрямую, остальное — в каскад.
 
@@ -347,7 +394,8 @@ def _split_ru_rules(route: dict | None = None) -> list[dict]:
 
 
 def build_xray_config(params: dict, dns_server: str = "1.1.1.1", split_ru_direct: bool = False,
-                      reserves: list[dict] | tuple = (), all_down: str = "block") -> dict:
+                      reserves: list[dict] | tuple = (), all_down: str = "block",
+                      fallback: dict | None = None) -> dict:
     # Один релей без выпуска напрямую выбирать не из чего: конфиг и трафик
     # остаются ровно такими, как до появления списка.
     balanced = bool(reserves) or all_down == "direct"
@@ -524,6 +572,7 @@ def build_xray_config(params: dict, dns_server: str = "1.1.1.1", split_ru_direct
                 },
             },
             *dns_inbounds,
+            *([_fallback_inbound(fallback)] if fallback else []),
         ],
         "outbounds": [
             *(_relay_outbound(_relay_tag(i), p) for i, p in enumerate([params, *reserves])),
@@ -544,6 +593,7 @@ def build_xray_config(params: dict, dns_server: str = "1.1.1.1", split_ru_direct
             **({"balancers": balancers} if balanced else {}),
             "rules": [
                 {"ruleTag": "nf-api", "type": "field", "inboundTag": ["api-in"], "outboundTag": "api"},
+                *(_fallback_rules(probe_route) if fallback else []),
                 *client_rules,
                 {"ruleTag": "nf-default", "type": "field", "inboundTag": ["cascade-in"], **route},
                 # Проба обязана идти тем же путём, что и клиентский трафик,
@@ -572,6 +622,35 @@ def is_running() -> bool:
     return _proc is not None and _proc.poll() is None
 
 
+def _fallback_port() -> int | None:
+    """Порт запасного входа в запущенном конфиге."""
+    if not is_running() or not _last_config:
+        return None
+    return next((i["port"] for i in _last_config["inbounds"] if i["tag"] == FALLBACK_TAG), None)
+
+
+def fallback_listening() -> bool:
+    return _fallback_port() is not None
+
+
+def fallback_warning() -> str | None:
+    return _fallback_warning
+
+
+def _resolve_fallback(server) -> dict | None:
+    """Параметры входа, если его можно поднять. Занятый порт не должен стоить
+    каскада всем остальным клиентам: без входа xray запустится."""
+    global _fallback_warning
+    from . import fallback
+
+    _fallback_warning = None
+    wanted = fallback.params(server)
+    if wanted and wanted["port"] != _fallback_port() and not fallback.port_free(wanted["port"]):
+        _fallback_warning = f"Запасной вход не запущен: порт {wanted['port']}/tcp занят"
+        return None
+    return wanted
+
+
 def intercept_suspended(server) -> bool:
     """Снят ли перехват клиентов на то время, пока xray не работает.
 
@@ -590,8 +669,9 @@ def sync(server) -> str | None:
     либо каскад просто выключен). Вызывается из config_sync.apply_current_config,
     то есть при каждом сохранении/apply/restart настроек сервера — best effort,
     как и всё остальное управление в этой панели."""
-    global _proc, _last_config, _wanted, _running_relays
+    global _proc, _last_config, _wanted, _running_relays, _fallback_warning
     with _lock:
+        _fallback_warning = None
         urls = relay_urls(server)
         if not getattr(server, "cascade_enabled", False) or not urls:
             _wanted = False
@@ -630,8 +710,11 @@ def sync(server) -> str | None:
         if geoip_missing:
             split = False
 
+        wanted_fallback = _resolve_fallback(server)
+        partial_error = partial_error or _fallback_warning
         config = build_xray_config(parsed[0], dns_server, split_ru_direct=split,
-                                   reserves=parsed[1:], all_down=all_down_mode(server))
+                                   reserves=parsed[1:], all_down=all_down_mode(server),
+                                   fallback=wanted_fallback)
         relay_hosts = {_relay_tag(i): p["host"] for i, p in enumerate(parsed)}
 
         # Ничего не поменялось — не трогаем работающий процесс: перезапуск

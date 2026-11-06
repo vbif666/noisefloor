@@ -26,6 +26,7 @@
 #   tests/smoke.sh --selfcheck-only
 #   tests/smoke.sh --rollback-only
 #   tests/smoke.sh --notify-only
+#   tests/smoke.sh --fallback-only
 #   RELAY_IMAGE=... PANEL_IMAGE=... tests/smoke.sh
 #
 # Работает на bridge-сети с портами из диапазона 291xx, поэтому безопасен
@@ -444,7 +445,8 @@ sleep_seconds() {
 }
 
 canary_cleanup() {
-    docker rm -f smoke-canary smoke-canary-panel smoke-canary-relay smoke-canary-relay2 smoke-canary-web >/dev/null 2>&1 || true
+    docker rm -f smoke-canary smoke-canary-panel smoke-canary-relay smoke-canary-relay2 smoke-canary-web smoke-canary-fb >/dev/null 2>&1 || true
+    docker network rm smoke-canary-priv >/dev/null 2>&1 || true
     docker network rm smoke-canary-net smoke-canary-lan smoke-canary-ru >/dev/null 2>&1 || true
 }
 
@@ -1587,6 +1589,158 @@ test_notify() {
     canary_cleanup
 }
 
+# ------------------------------------------------------- запасной вход ----
+
+fallback_get() {
+    curl -kfsS "https://127.0.0.1:$CANARY_PANEL_PORT/api/fallback" -H "Authorization: Bearer $CANARY_TOKEN"
+}
+
+fallback_put() {
+    curl -kfsS -o /dev/null -X PUT "https://127.0.0.1:$CANARY_PANEL_PORT/api/fallback" \
+        -H "Authorization: Bearer $CANARY_TOKEN" -H 'Content-Type: application/json' -d "$1"
+}
+
+fallback_has() {
+    [[ "$(fallback_get 2>/dev/null || true)" == *$1* ]]
+}
+
+fallback_client_enabled() {
+    curl -kfsS -o /dev/null -X PATCH "https://127.0.0.1:$CANARY_PANEL_PORT/api/fallback/clients/$1" \
+        -H "Authorization: Bearer $CANARY_TOKEN" -H 'Content-Type: application/json' -d "{\"enabled\":$2}" \
+        || fail "клиент $1 не переключён"
+}
+
+fb_curl() {
+    docker exec smoke-canary-fb curl -sS -o /dev/null --max-time 8 --proxy socks5h://127.0.0.1:1080 "$@"
+}
+
+test_fallback() {
+    echo
+    echo "Запасной вход VLESS"
+    canary_stand fallback 5 || return
+    local dir="$WORKDIR/fallback" sni relay_port settings link
+    grep -q fallback-in "$dir/data/cascade-xray-config.json" \
+        && fail "вход есть в конфиге без включения" || pass "по умолчанию входа в конфиге нет"
+    fallback_has '"enabled":false' && pass "по умолчанию выключен" || fail "выключен ли: $(fallback_get)"
+
+    sni="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["sni"])' "$dir/relay/creds.json")"
+    # Камуфляж стенда: сам релей. Снаружи он неотличим от сайта и в сеть выходить не надо.
+    relay_port="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["vless_port"])' "$dir/relay/creds.json")"
+    settings="{\"enabled\":true,\"port\":18443,\"sni\":\"$sni\",\"dest\":\"5.5.77.20:$relay_port\"}"
+    fallback_put "$settings" || { fail "настройки входа не сохранились"; return; }
+    fallback_has '"listening":false' && pass "без клиентов порт закрыт" || fail "порт без клиентов: $(fallback_get)"
+    if curl -ks -o /dev/null -w '%{http_code}' -X PUT "https://127.0.0.1:$CANARY_PANEL_PORT/api/fallback" \
+        -H "Authorization: Bearer $CANARY_TOKEN" -H 'Content-Type: application/json' \
+        -d "{\"enabled\":true,\"port\":10087,\"sni\":\"$sni\",\"dest\":\"5.5.77.20:$relay_port\"}" | grep -q 422; then
+        pass "порт самого xray не принимается"
+    else
+        fail "порт самого xray принят"
+    fi
+
+    link="$(curl -kfsS -X POST "https://127.0.0.1:$CANARY_PANEL_PORT/api/fallback/clients" \
+        -H "Authorization: Bearer $CANARY_TOKEN" -H 'Content-Type: application/json' -d '{"name":"смок"}' \
+        | python3 -c 'import json,sys; print(json.load(sys.stdin)["link"])')"
+    if wait_for 20 fallback_has '"listening":true'; then
+        pass "вход слушает порт после добавления клиента"
+    else
+        fail "вход не поднялся: $(fallback_get)"
+        return
+    fi
+
+    [[ "$link" == vless://*@100.64.78.30:18443\?* ]] && pass "в ссылке адрес сервера и порт входа" \
+        || fail "ссылка: ${link%%\?*}"
+
+    # Настоящий клиент: всё берётся из выданной ссылки, кроме адреса. В стенде
+    # адрес сервера внутренний, снаружи панель видна как 5.5.77.30.
+    python3 - "$link" > "$dir/fb-client.json" <<'PY'
+import json, sys
+from urllib.parse import parse_qs, urlparse
+u = urlparse(sys.argv[1])
+q = {k: v[0] for k, v in parse_qs(u.query).items()}
+print(json.dumps({
+    "log": {"loglevel": "warning"},
+    "inbounds": [{"listen": "127.0.0.1", "port": 1080, "protocol": "socks", "settings": {"auth": "noauth"}}],
+    "outbounds": [{"protocol": "vless",
+        "settings": {"vnext": [{"address": "5.5.77.30", "port": u.port,
+            "users": [{"id": u.username, "encryption": "none", "flow": q["flow"]}]}]},
+        "streamSettings": {"network": "tcp", "security": "reality", "realitySettings": {
+            "serverName": q["sni"], "fingerprint": q["fp"], "publicKey": q["pbk"], "shortId": q["sid"]}}}],
+}))
+PY
+    docker run -d --name smoke-canary-fb --network smoke-canary-net --ip 5.5.77.40 \
+        -v "$dir/fb-client.json:/c.json:ro" --entrypoint xray "$PANEL_IMAGE" run -config /c.json >/dev/null
+    sleep_seconds 2
+
+    web_forget
+    if fb_curl http://5.5.77.10/generate_204 && web_saw 5.5.77.20; then
+        pass "клиент VLESS вышел в сеть с адреса релея"
+    else
+        fail "клиент VLESS не прошёл"
+        docker logs smoke-canary-fb 2>&1 | tail -5
+        return
+    fi
+    web_saw 5.5.77.30 && fail "трафик вышел с адреса панели" || pass "мимо релея трафик не ушёл"
+
+    # Проверяется результат, а не правило панели nf-vless-private: на xray 26.7.28
+    # запрос не доходит и без него (мутацией проверено), само правило держат unit-тесты.
+    docker network create --subnet 10.77.0.0/24 smoke-canary-priv >/dev/null
+    docker network connect --ip 10.77.0.10 smoke-canary-priv smoke-canary-web
+    docker network connect --ip 10.77.0.20 smoke-canary-priv smoke-canary-relay
+    web_forget
+    docker exec smoke-canary-relay curl -sS -o /dev/null --max-time 5 http://10.77.0.10/generate_204 \
+        || fail "контроль: релей не видит частную сеть"
+    web_saw 10.77.0.20 && pass "контроль: частный адрес доступен с релея" || fail "контроль: запрос релея не дошёл"
+    web_forget
+    fb_curl http://10.77.0.10/generate_204 2>/dev/null || true
+    web_saw 10.77.0.20 && fail "клиент дотянулся до частной сети релея" || pass "частная сеть релея закрыта"
+
+    # --- занятый порт не должен стоить каскада ---
+    docker exec -d smoke-canary-panel python -m http.server 18444 >/dev/null
+    sleep_seconds 2
+    fallback_put "${settings/18443/18444}" || fail "смена порта не сохранилась"
+    if fallback_has 'порт 18444/tcp занят'; then
+        pass "занятый порт: предупреждение, вход не поднят"
+    else
+        fail "занятый порт: $(fallback_get)"
+    fi
+    wait_for 15 canary_status_has '"running":true' && pass "каскад при занятом порте работает" \
+        || fail "занятый порт уронил каскад"
+    fallback_put "$settings" || fail "возврат порта не сохранился"
+
+    # --- переживает перезапуск панели ---
+    docker restart smoke-canary-panel >/dev/null
+    if wait_for 60 fallback_has '"listening":true'; then
+        pass "после перезапуска панели вход поднялся сам"
+    else
+        fail "после перезапуска входа нет: $(fallback_get)"
+    fi
+    sleep_seconds 2
+    web_forget
+    if wait_for 20 fb_curl http://5.5.77.10/generate_204 && web_saw 5.5.77.20; then
+        pass "та же ссылка работает после перезапуска"
+    else
+        fail "ссылка перестала работать после перезапуска"
+    fi
+
+    # --- выключенный клиент не проходит, хотя порт открыт вторым клиентом ---
+    curl -kfsS -o /dev/null -X POST "https://127.0.0.1:$CANARY_PANEL_PORT/api/fallback/clients" \
+        -H "Authorization: Bearer $CANARY_TOKEN" -H 'Content-Type: application/json' -d '{"name":"второй"}' \
+        || fail "второй клиент не создан"
+    fallback_client_enabled 1 false
+    if wait_for 20 fallback_has '"listening":true' && ! fb_curl http://5.5.77.10/generate_204 2>/dev/null; then
+        pass "выключенный клиент не проходит при открытом порте"
+    else
+        fail "выключенный клиент прошёл: $(fallback_get)"
+    fi
+    fallback_client_enabled 2 false
+    fallback_has '"listening":false' && pass "без включённых клиентов порт закрыт" \
+        || fail "порт после выключения клиентов: $(fallback_get)"
+    fallback_put "${settings/true/false}" || fail "вход не выключился"
+    grep -q fallback-in "$dir/data/cascade-xray-config.json" \
+        && fail "вход остался в конфиге" || pass "выключение убирает вход из конфига"
+    canary_cleanup
+}
+
 # --------------------------------------------- откат вместе с данными ----
 
 rollback_agent() { # подпись образа; настоящие compose и данные, подменён только pull
@@ -1942,7 +2096,8 @@ case "${1:-}" in
     --selfcheck-only) test_selfcheck ;;
     --rollback-only) test_rollback ;;
     --notify-only) test_notify ;;
-    "")           test_relay; test_panel; test_rules; test_rules_supervision; test_install; test_canary; test_failover; test_rotation; test_mtu; test_split; test_xudp; test_ipv6; test_selfcheck; test_rollback; test_notify ;;
+    --fallback-only) test_fallback ;;
+    "")           test_relay; test_panel; test_rules; test_rules_supervision; test_install; test_canary; test_failover; test_rotation; test_mtu; test_split; test_xudp; test_ipv6; test_selfcheck; test_rollback; test_notify; test_fallback ;;
     *) echo "неизвестный аргумент: $1" >&2; exit 2 ;;
 esac
 

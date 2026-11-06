@@ -337,6 +337,39 @@ class TrafficHistoryPoint(BaseModel):
 
 # --- Резервные копии ---
 
+class FallbackClientRead(BaseModel):
+    id: int
+    name: str
+    enabled: bool
+    link: str
+
+
+class FallbackClientCreate(BaseModel):
+    name: str = Field(min_length=1, max_length=128, pattern=r"^[^\r\n]+$")
+
+
+class FallbackClientUpdate(BaseModel):
+    enabled: bool
+
+
+class FallbackRead(BaseModel):
+    enabled: bool
+    port: int
+    sni: str
+    dest: str
+    cascade_running: bool
+    listening: bool
+    warning: str | None
+    clients: list[FallbackClientRead]
+
+
+class FallbackUpdate(BaseModel):
+    enabled: bool
+    port: int = Field(ge=1, le=65535)
+    sni: str = Field(min_length=1, max_length=253)
+    dest: str = Field(min_length=1, max_length=260)
+
+
 class NotifySettings(BaseModel):
     webhook_url: str
     telegram_chat_id: str

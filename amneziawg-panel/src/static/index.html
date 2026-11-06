@@ -325,6 +325,49 @@
 
         <div class="panel" style="margin-bottom:16px;">
           <div class="panel-header">
+            <h2>Запасной вход VLESS</h2>
+            <span class="apply-status" id="fallback-status"></span>
+          </div>
+          <div class="panel-body">
+            <p class="field-hint" style="margin-top:0;">
+              Для сетей, где режут UDP и AmneziaWG не поднимается. Подключение по TCP,
+              дальше через тот же каскад. Работает, только когда каскад запущен. Порт
+              нужно открыть по TCP в фаерволе хостинга. Любое изменение здесь
+              перезапускает xray и рвёт текущие соединения клиентов каскада.
+            </p>
+            <div class="field-group">
+              <label style="display:flex;gap:8px;align-items:center;">
+                <input id="fallback-enabled" type="checkbox" style="width:auto;" /> Включить запасной вход
+              </label>
+              <div class="field-row">
+                <div class="field">
+                  <label for="fallback-port">Порт TCP</label>
+                  <input id="fallback-port" type="number" min="1" max="65535" />
+                </div>
+                <div class="field">
+                  <label for="fallback-sni">SNI</label>
+                  <input id="fallback-sni" autocomplete="off" />
+                </div>
+                <div class="field">
+                  <label for="fallback-dest">Камуфляжный сайт (имя:порт)</label>
+                  <input id="fallback-dest" autocomplete="off" />
+                </div>
+              </div>
+            </div>
+            <div class="server-actions" style="margin-top:14px;">
+              <button type="button" id="fallback-save-btn" class="btn btn-primary btn-sm">Сохранить</button>
+            </div>
+            <div id="fallback-clients" style="margin-top:14px;"></div>
+            <div class="server-actions" style="margin-top:14px;">
+              <input id="fallback-client-name" placeholder="Имя клиента" autocomplete="off" style="max-width:220px;" />
+              <button type="button" id="fallback-add-btn" class="btn btn-ghost btn-sm">Добавить клиента</button>
+            </div>
+            <div class="qr-wrap" id="fallback-qr-wrap" hidden><img id="fallback-qr-img" alt="QR-код ссылки" width="220" height="220" /></div>
+          </div>
+        </div>
+
+        <div class="panel" style="margin-bottom:16px;">
+          <div class="panel-header">
             <h2>Уведомления</h2>
             <span class="apply-status" id="notify-status"></span>
           </div>

@@ -10,7 +10,7 @@ from . import awg_supervisor, backup, bootstrap, canary, cascade, cascade_sync, 
 from .config import settings
 from .database import Base, SessionLocal, engine, run_migrations
 from .models import ServerConfig, Tunnel
-from .routers import auth, backup as backup_router, notify as notify_router, peers, server, status, tunnels, updates
+from .routers import auth, backup as backup_router, fallback as fallback_router, notify as notify_router, peers, server, status, tunnels, updates
 
 STATIC_DIR = Path(__file__).resolve().parent.parent / "static"
 
@@ -123,6 +123,7 @@ app.include_router(status.router, prefix="/api/status", tags=["status"])
 app.include_router(updates.router, prefix="/api/updates", tags=["updates"])
 app.include_router(backup_router.router, prefix="/api/backup", tags=["backup"])
 app.include_router(notify_router.router, prefix="/api/notify", tags=["notify"])
+app.include_router(fallback_router.router, prefix="/api/fallback", tags=["fallback"])
 
 if STATIC_DIR.exists():
     app.mount("/", RevalidatingStaticFiles(directory=str(STATIC_DIR), html=True), name="static")

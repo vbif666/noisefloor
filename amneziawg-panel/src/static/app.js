@@ -372,7 +372,7 @@ document.querySelectorAll(".tab-btn").forEach((btn) => {
    ========================================================================== */
 
 async function loadEverything() {
-  await Promise.all([loadServer(), loadPeers(), loadBackups(), loadTunnels(), loadNotify()]);
+  await Promise.all([loadServer(), loadPeers(), loadBackups(), loadTunnels(), loadNotify(), loadFallback()]);
 }
 
 /* ==========================================================================
@@ -828,6 +828,106 @@ function renderCascadeSummary(c) {
   if (c.relay_label) parts.push(c.relay_label);
   el.textContent = parts.join("  ·  ");
 }
+
+/* ==========================================================================
+   Запасной вход VLESS
+   ========================================================================== */
+
+function fallbackState(data) {
+  if (data.warning) return [data.warning, true];
+  if (!data.enabled) return ["выключен", false];
+  if (data.listening) return ["работает", false];
+  if (!data.cascade_running) return ["ждёт каскад", true];
+  if (!data.clients.some((c) => c.enabled)) return ["нет включённых клиентов", true];
+  return ["не запущен", true];
+}
+
+function showFallback(data) {
+  $("fallback-enabled").checked = data.enabled;
+  $("fallback-port").value = data.port;
+  $("fallback-sni").value = data.sni;
+  $("fallback-dest").value = data.dest;
+  fallbackStatus(...fallbackState(data));
+  $("fallback-clients").innerHTML = data.clients.map((c) => `
+    <div class="field">
+      <label>${escapeHtml(c.name)}${c.enabled ? "" : " (выключен)"}</label>
+      <input readonly value="${escapeHtml(c.link)}" />
+      <div class="server-actions" style="margin-top:6px;">
+        <button type="button" class="btn btn-sm" data-fb-copy="${escapeHtml(c.link)}">Скопировать ссылку</button>
+        <button type="button" class="btn btn-sm" data-fb-qr="${c.id}">QR</button>
+        <button type="button" class="btn btn-sm" data-fb-toggle="${c.id}" data-fb-enabled="${c.enabled ? "1" : ""}">${c.enabled ? "Выключить" : "Включить"}</button>
+        <button type="button" class="btn btn-danger btn-sm" data-fb-delete="${c.id}">Удалить</button>
+      </div>
+    </div>`).join("");
+}
+
+function fallbackStatus(text, isError) {
+  const status = $("fallback-status");
+  status.classList.remove("is-error", "is-ok");
+  status.classList.add(isError ? "is-error" : "is-ok");
+  status.textContent = text;
+}
+
+async function loadFallback() {
+  try {
+    showFallback(await api("/fallback"));
+  } catch (err) {
+    fallbackStatus(err.message, true);
+  }
+}
+
+async function fallbackAction(action) {
+  try {
+    await action();
+    await loadFallback();
+  } catch (err) {
+    fallbackStatus(err.message, true);
+  }
+}
+
+$("fallback-save-btn").addEventListener("click", () => fallbackAction(() => api("/fallback", {
+  method: "PUT",
+  body: JSON.stringify({
+    enabled: $("fallback-enabled").checked,
+    port: Number($("fallback-port").value),
+    sni: $("fallback-sni").value.trim(),
+    dest: $("fallback-dest").value.trim(),
+  }),
+})));
+
+$("fallback-add-btn").addEventListener("click", () => fallbackAction(async () => {
+  const name = $("fallback-client-name").value.trim();
+  if (!name) throw new Error("Укажите имя клиента");
+  await api("/fallback/clients", { method: "POST", body: JSON.stringify({ name }) });
+  $("fallback-client-name").value = "";
+}));
+
+$("fallback-clients").addEventListener("click", async (event) => {
+  const btn = event.target.closest("button");
+  if (!btn) return;
+  if (btn.dataset.fbCopy) {
+    try {
+      await navigator.clipboard.writeText(btn.dataset.fbCopy);
+      showToast("Ссылка скопирована в буфер обмена");
+    } catch (_) {
+      showToast("Не удалось скопировать - выделите текст вручную", true);
+    }
+  } else if (btn.dataset.fbQr) {
+    const res = await apiBlob(`/fallback/clients/${btn.dataset.fbQr}/qrcode`);
+    const img = $("fallback-qr-img");
+    if (img.dataset.objectUrl) URL.revokeObjectURL(img.dataset.objectUrl);
+    img.dataset.objectUrl = URL.createObjectURL(await res.blob());
+    img.src = img.dataset.objectUrl;
+    $("fallback-qr-wrap").hidden = false;
+  } else if (btn.dataset.fbToggle) {
+    await fallbackAction(() => api(`/fallback/clients/${btn.dataset.fbToggle}`, {
+      method: "PATCH",
+      body: JSON.stringify({ enabled: !btn.dataset.fbEnabled }),
+    }));
+  } else if (btn.dataset.fbDelete && confirm("Удалить клиента? Его ссылка перестанет работать.")) {
+    await fallbackAction(() => api(`/fallback/clients/${btn.dataset.fbDelete}`, { method: "DELETE" }));
+  }
+});
 
 /* ==========================================================================
    Уведомления
