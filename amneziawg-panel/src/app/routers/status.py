@@ -21,6 +21,7 @@ def get_status(db: Session = Depends(get_db), _admin: str = Depends(get_current_
     server = config_sync.get_server(db)
     live_status = config_sync.live_status_by_pubkey(server)
     peers = db.query(Peer).all()
+    rules = config_sync.rules_status()
 
     peer_statuses = []
     for peer in peers:
@@ -63,6 +64,8 @@ def get_status(db: Session = Depends(get_db), _admin: str = Depends(get_current_
             )
             for t in config_sync.get_tunnels(db)
         ],
+        rules_ok=rules["ok"],
+        rules_error=rules["error"],
     )
 
 
@@ -106,6 +109,12 @@ def metrics(db: Session = Depends(get_db), _admin: str = Depends(get_current_adm
         "# HELP noisefloor_interface_restarts_total Сколько раз надзор поднимал пропавший интерфейс",
         "# TYPE noisefloor_interface_restarts_total counter",
         f"noisefloor_interface_restarts_total {awg_supervisor.health().get('restarts', 0)}",
+        "# HELP noisefloor_rules_ok Стоят ли правила фаервола как задумано",
+        "# TYPE noisefloor_rules_ok gauge",
+        f"noisefloor_rules_ok {int(config_sync.rules_status()['ok'] is not False)}",
+        "# HELP noisefloor_rules_restored_total Сколько раз надзор вернул снесённые снаружи правила",
+        "# TYPE noisefloor_rules_restored_total counter",
+        f"noisefloor_rules_restored_total {config_sync.rules_status()['restored']}",
         "# HELP noisefloor_peers_total Всего клиентов в панели",
         "# TYPE noisefloor_peers_total gauge",
         f"noisefloor_peers_total {len(peers)}",

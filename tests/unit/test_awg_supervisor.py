@@ -90,6 +90,8 @@ class SuperviseTests(unittest.TestCase):
              mock.patch.object(awg_supervisor.awg_manager, "interface_is_up", side_effect=lambda *_: next(states)), \
              mock.patch.object(awg_supervisor.settings, "auto_apply_on_start", True), \
              mock.patch("app.config_sync.apply_current_config", return_value=result) as apply, \
+             mock.patch("app.config_sync.interface_names", return_value=["awg0"]), \
+             mock.patch("app.config_sync.ensure_rules") as self.ensure_rules, \
              mock.patch("app.database.SessionLocal", return_value=fake_db):
             awg_supervisor.supervise(stop)
         return apply
@@ -110,6 +112,10 @@ class SuperviseTests(unittest.TestCase):
         apply = self._run_one_pass([True])
         apply.assert_not_called()
         self.assertEqual(awg_supervisor.health()["restarts"], 0)
+
+    def test_checks_firewall_rules_while_interface_is_up(self):
+        self._run_one_pass([True])
+        self.ensure_rules.assert_called_once()
 
     def test_reports_failure_when_reapply_did_not_help(self):
         apply = self._run_one_pass([False, False], apply_ok=False)

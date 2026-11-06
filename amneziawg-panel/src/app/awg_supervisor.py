@@ -18,6 +18,11 @@
 либо интерфейс поднимается автоматически при старте, либо панель уже хоть
 раз успешно применяла конфиг. Свежая установка с выключенным авто-применением
 ничего не должна — и здоровьем не страдает.
+
+Тот же цикл сверяет с ядром правила фаервола (config_sync.ensure_rules): ufw
+reset или iptables -F интерфейс не трогают, а клиенты остаются без NAT и
+каскада. На здоровье контейнера сбой правил не влияет, иначе агент обновлений
+откатил бы невиновную версию. Ошибка видна в статусе и в метриках.
 """
 from __future__ import annotations
 
@@ -115,6 +120,9 @@ def supervise(stop_event) -> None:
             tunnels = list(db.query(Tunnel).all())
             if check(server, tunnels):
                 backoff = BACKOFF_START_SECONDS
+                # Интерфейс на месте, но правила могли снести снаружи.
+                if server is not None and expected_up(server):
+                    config_sync.ensure_rules(server, config_sync.interface_names(db, server))
                 continue
 
             with _lock:

@@ -51,9 +51,12 @@ Google, YouTube, Cloudflare) и все DNS-запросы уходили мим�
 должно считать локальными.
 
 ```
-ip rule add fwmark 1 lookup 100
-ip route add local default dev lo table 100
+ip rule add fwmark 0x4e46 lookup 20231
+ip route add local default dev lo table 20231
 ```
+
+Метка и таблица свои, чтобы не столкнуться с чужим TPROXY на том же хосте.
+Пара `1`/`100` из прошлых версий снимается при обновлении.
 
 Со стороны xray вход должен принимать `tcp,udp` и иметь `sockopt.tproxy` —
 иначе он не увидит исходного адреса назначения.

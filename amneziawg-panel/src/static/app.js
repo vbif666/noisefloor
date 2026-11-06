@@ -1149,6 +1149,11 @@ async function pollStatus() {
     pill.classList.remove("is-up", "is-down");
     if (!s.live_management_available) {
       text.textContent = `${s.interface_name} · только генерация конфигов`;
+    } else if (s.interface_up && s.rules_ok === false) {
+      // Интерфейс жив, но без правил у клиентов нет NAT и каскада: «активен»
+      // здесь было бы неправдой.
+      pill.classList.add("is-down");
+      text.textContent = `${s.interface_name}: правила фаервола не применены`;
     } else if (s.interface_up) {
       pill.classList.add("is-up");
       text.textContent = `${s.interface_name} активен`;
@@ -1156,6 +1161,8 @@ async function pollStatus() {
       pill.classList.add("is-down");
       text.textContent = `${s.interface_name} не поднят`;
     }
+
+    pill.title = s.rules_ok === false ? (s.rules_error || "") : "";
 
     renderLiveMtu(s.interface_mtu);
 

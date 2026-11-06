@@ -148,8 +148,13 @@ def server_interface_block(server: ServerConfig, extra_interfaces: list[str] | t
         # Теперь вся работа у noisefloor-rules: он держит правила в
         # собственных цепочках и очищает их перед заполнением, поэтому
         # повторный запуск не может ничего продублировать.
+        #
+        # "|| true": ненулевой код PostUp заставил бы awg-quick снять только
+        # что поднятый интерфейс, и из-за одного правила VPN пропал бы целиком.
+        # Сбой не теряется: сразу за подъёмом config_sync.ensure_rules сам
+        # сверяет правила, получает ошибку и показывает её в статусе.
         up, down = rules_commands(server, [server.interface_name, *extra_interfaces])
-        lines.append("PostUp = " + " ".join(up))
+        lines.append("PostUp = " + " ".join(up) + " || true")
         lines.append("PostDown = " + " ".join(down))
     return "\n".join(lines)
 

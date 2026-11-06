@@ -58,6 +58,8 @@ scrape_configs:
 |---|---|
 | `noisefloor_interface_up` | `0` — VPN-сервер лежит |
 | `noisefloor_interface_restarts_total` | растёт — интерфейс пропадает и его поднимает надзор; ищите OOM |
+| `noisefloor_rules_ok` | `0` — правила фаервола не встали, текст ошибки в статусе панели |
+| `noisefloor_rules_restored_total` | растёт — кто-то сносит правила снаружи (ufw, iptables -F, чужой скрипт) |
 | `noisefloor_cascade_verified` | `0` при включённом каскаде — данные через него не идут |
 | `noisefloor_cascade_restarts_total` | быстро растёт — каскад в цикле падений |
 | `noisefloor_peers_online` | ноль дольше обычного |

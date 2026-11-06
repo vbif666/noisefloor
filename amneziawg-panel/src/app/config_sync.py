@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import threading
 from datetime import datetime, timezone
 
 from sqlalchemy.orm import Session, object_session
@@ -7,12 +8,21 @@ from sqlalchemy.orm import Session, object_session
 from . import awg_config, awg_manager, cascade, wg_status
 from .models import Peer, ServerConfig, Tunnel
 
-# Какой командой noisefloor-rules правила стоят сейчас. PostUp основного
-# интерфейса срабатывает только при его подъёме, а горячее применение
-# (syncconf) его не трогает. Поэтому, когда включили новый протокол или
-# переключили каскад, правила надо поставить заново самим — иначе клиенты
-# нового интерфейса остаются без NAT и каскада. None — ещё не знаем.
-_applied_rules: list[str] | None = None
+# Код `noisefloor-rules check`: правила снесли снаружи (ufw reset, iptables -F).
+RULES_DRIFT_EXIT_CODE = 4
+
+_rules_lock = threading.Lock()
+_rules_status: dict = {
+    "ok": None,            # None: ещё не проверяли или правил быть не должно
+    "error": None,
+    "restored": 0,         # сколько раз вернули снесённые снаружи правила
+    "last_restored_at": None,
+}
+
+
+def rules_status() -> dict:
+    with _rules_lock:
+        return dict(_rules_status)
 
 
 def get_server(db: Session) -> ServerConfig:
@@ -53,22 +63,37 @@ def _apply_tunnels(db: Session, server: ServerConfig, peers: list[Peer], *,
         db.add(tunnel)
 
 
-def _ensure_rules(server: ServerConfig, interfaces: list[str], main_was_up: bool, restart: bool,
-                  main_ok: bool) -> None:
-    global _applied_rules
-    if not server.egress_interface:
-        return
+def ensure_rules(server: ServerConfig, interfaces: list[str]) -> awg_manager.CommandResult | None:
+    """Привести правила к нужному виду, сверяясь с ядром, а не с памятью.
+
+    Запомненные аргументы последнего запуска ничего не говорили о том, что
+    стоит на самом деле: снесённые снаружи правила считались применёнными, и
+    вернуть их мог только перезапуск туннеля. PostUp тут не помогает: при
+    горячем применении (syncconf) он не срабатывает, а его сбой намеренно не
+    снимает интерфейс.
+
+    None: правил здесь быть не должно или управлять ими нечем."""
+    if not server.egress_interface or not awg_manager.tools_available():
+        return None
     up, _down = awg_config.rules_commands(server, interfaces)
-    if main_ok and (restart or not main_was_up):
-        _applied_rules = up  # PostUp только что отработал с этими аргументами
-        return
-    if up == _applied_rules or not awg_manager.tools_available():
-        return
+    state = awg_manager.run_rules([up[0], "check", *up[2:]])
+    if state.ok:
+        with _rules_lock:
+            _rules_status.update(ok=True, error=None)
+        return state
+
+    drifted = state.code == RULES_DRIFT_EXIT_CODE
     result = awg_manager.run_rules(up)
-    if result.ok:
-        _applied_rules = up
-    else:
-        print(f"[rules] не удалось переставить правила: {result.output}")
+    with _rules_lock:
+        _rules_status.update(ok=result.ok, error=None if result.ok else result.output)
+        if result.ok and drifted:
+            _rules_status["restored"] += 1
+            _rules_status["last_restored_at"] = datetime.now(timezone.utc).isoformat()
+    if not result.ok:
+        print(f"[rules] не удалось поставить правила: {result.output}")
+    elif drifted:
+        print(f"[rules] правила восстановлены: {state.output}")
+    return result
 
 
 def apply_current_config(db: Session, *, restart: bool = False,
@@ -103,14 +128,17 @@ def apply_current_config(db: Session, *, restart: bool = False,
     interfaces = interface_names(db, server)
     config_text = awg_config.full_server_config(server, peers, interfaces[1:])
 
-    main_was_up = awg_manager.tools_available() and awg_manager.interface_is_up(server.interface_name)
     if restart:
         result = awg_manager.restart(server.interface_name, config_text)
     else:
         result = awg_manager.apply(server.interface_name, config_text)
 
     _apply_tunnels(db, server, peers, restart_tunnels=restart_tunnels)
-    _ensure_rules(server, interfaces, main_was_up, restart, result.ok)
+    rules = ensure_rules(server, interfaces)
+    if result.ok and rules is not None and not rules.ok:
+        # Интерфейс поднят, но без правил у клиентов нет ни NAT, ни каскада:
+        # для админа это неудачное применение, а не успех.
+        result = awg_manager.CommandResult(False, f"правила фаервола не применены: {rules.output}")
 
     server.last_apply_status = "ok" if result.ok else "error"
     server.last_apply_error = None if result.ok else result.output

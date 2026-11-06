@@ -283,6 +283,9 @@ class StatusResponse(BaseModel):
     listen_port: int | None
     peers: list[LivePeerStatus]
     tunnels: list[TunnelLiveStatus] = []
+    # None: правила ещё не проверялись или их здесь быть не должно.
+    rules_ok: bool | None = None
+    rules_error: str | None = None
 
 
 class TrafficHistoryPoint(BaseModel):

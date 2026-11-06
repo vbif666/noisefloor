@@ -24,6 +24,20 @@
 #       [--cascade-port 12345] [--cascade-dns-port 12353] \
 #       [--mode tproxy|redirect|off] [--isolate-clients] [--block-quic]
 #   noisefloor-rules down --iface awg0 [--iface ...] --egress eth0
+#   noisefloor-rules check <те же аргументы, что у up>
+#
+# 3. Атомарность. Цепочки заливаются через iptables-restore --noflush, по
+#    одной транзакции на таблицу. Правило, которое ядро не приняло (например,
+#    нет модуля xt_TPROXY), откатывает всю таблицу, а up завершается с
+#    ненулевым кодом. Раньше коды iptables не проверялись вовсе, и такой
+#    сбой выглядел как успех: клиенты молча шли напрямую с адреса панели.
+#    Таблицы перехвата заливаются раньше filter: пока перехват не встал,
+#    новые разрешающие правила FORWARD не появляются.
+#
+# check ничего не меняет и сверяет ожидаемое с тем, что реально стоит в ядре.
+# Коды возврата: 0 — всё на месте; 3 — правила ставились с другими
+# аргументами или неизвестно, с какими; 4 — правила снесли снаружи
+# (ufw reset, iptables -F); 1 — ошибка вызова.
 
 set -u
 
@@ -34,8 +48,22 @@ CASCADE_DNS_PORT=""
 MODE="off"
 ISOLATE="no"
 BLOCK_QUIC="no"
-MARK=1
-RT_TABLE=100
+
+# Метка и таблица маршрутизации только наши. С меткой 1 и таблицей 100 легко
+# столкнуться с чужим TPROXY на том же хосте, а down вдобавок чистил таблицу
+# целиком, вместе с чужими маршрутами.
+MARK=0x4e46
+RT_TABLE=20231
+# То, что ставили версии до этой. Снимается точечно, только эта пара.
+LEGACY_MARK=0x1
+LEGACY_RT_TABLE=100
+
+# Отпечаток последнего успешного up. /run живёт, пока жив контейнер: после
+# перезапуска файла нет, и up просто отработает ещё раз, атомарно и без
+# разрыва соединений.
+STATE_FILE="${NOISEFLOOR_RULES_STATE:-/run/noisefloor-rules.state}"
+EXIT_CONFIG_CHANGED=3
+EXIT_DRIFT=4
 
 FWD_CHAIN="NOISEFLOOR-FWD"
 NAT_POST_CHAIN="NOISEFLOOR-POST"
@@ -51,20 +79,88 @@ LOCAL_NETS="127.0.0.0/8 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 169.254.0.0/16 2
 log() { echo "[rules] $*"; }
 die() { echo "[rules] ОШИБКА: $*" >&2; exit 1; }
 
-# Создать цепочку или очистить, если уже есть, — ключ к идемпотентности.
+ipt() { iptables -w 5 "$@"; }
+
+# Правила сначала складываются в файлы по таблицам, а в ядро идут только
+# целиком. WORK создаётся в main.
+#
+# Объявить цепочку: при --noflush существующая очищается в той же транзакции.
 ensure_chain() {
-    iptables -t "$1" -N "$2" 2>/dev/null || iptables -t "$1" -F "$2"
+    printf ':%s - [0:0]\n' "$2" >> "$WORK/$1"
 }
 
-# Поставить переход в нашу цепочку, только если его ещё нет.
+# rule ТАБЛИЦА АРГУМЕНТЫ — строка в формате iptables-restore.
+rule() {
+    _table_name="$1"; shift
+    printf '%s\n' "$*" >> "$WORK/$_table_name"
+}
+
+# Переход в цепочку; недостающие дописываются в finalize_table.
 ensure_jump() {
-    iptables -t "$1" -C "$2" -j "$3" 2>/dev/null || iptables -t "$1" -I "$2" 1 -j "$3"
+    printf '%s %s %s\n' "$1" "$2" "$3" >> "$WORK/jumps"
 }
 
+# Цепочка, которой при этих настройках быть не должно (сменился режим).
+retire_chain() {
+    printf '%s %s %s\n' "$1" "$2" "$3" >> "$WORK/retired"
+}
+
+chain_exists() {
+    ipt -t "$1" -S "$2" >/dev/null 2>&1
+}
+
+jump_exists() {
+    ipt -t "$1" -C "$2" -j "$3" 2>/dev/null
+}
+
+# Снять цепочку сразу, без транзакции: используется только в down, где
+# отсутствие цепочки ошибкой не считается.
 drop_chain() {
-    iptables -t "$1" -D "$2" -j "$3" 2>/dev/null || true
-    iptables -t "$1" -F "$3" 2>/dev/null || true
-    iptables -t "$1" -X "$3" 2>/dev/null || true
+    ipt -t "$1" -D "$2" -j "$3" 2>/dev/null || true
+    ipt -t "$1" -F "$3" 2>/dev/null || true
+    ipt -t "$1" -X "$3" 2>/dev/null || true
+}
+
+# Дописать в транзакцию таблицы всё, что зависит от текущего состояния ядра:
+# недостающие переходы и снятие цепочек, ставших лишними.
+finalize_table() {
+    while read -r _t _parent _chain; do
+        [ "$_t" = "$1" ] || continue
+        jump_exists "$_t" "$_parent" "$_chain" \
+            || rule "$_t" -I "$_parent" 1 -j "$_chain"
+    done < "$WORK/jumps"
+    while read -r _t _parent _chain; do
+        [ "$_t" = "$1" ] || continue
+        if jump_exists "$_t" "$_parent" "$_chain"; then
+            rule "$_t" -D "$_parent" -j "$_chain"
+        fi
+        if chain_exists "$_t" "$_chain"; then
+            rule "$_t" -F "$_chain"
+            rule "$_t" -X "$_chain"
+        fi
+    done < "$WORK/retired"
+}
+
+# Залить таблицу одной транзакцией. Любой отказ останавливает up: следующие
+# таблицы не трогаются, эта остаётся в прежнем состоянии.
+restore_table() {
+    [ -s "$WORK/$1" ] || return 0
+    {
+        printf '*%s\n' "$1"
+        cat "$WORK/$1"
+        printf 'COMMIT\n'
+    } > "$WORK/payload"
+    if ! _err="$(iptables-restore -w 5 --noflush < "$WORK/payload" 2>&1)"; then
+        case "$_err" in
+            *TPROXY*) die "таблица $1: ядро не приняло TPROXY (нет модуля xt_TPROXY?), клиенты не попадут в каскад: $_err" ;;
+            *)        die "таблица $1 не применена: $_err" ;;
+        esac
+    fi
+}
+
+# Отпечаток считается по рендеру ДО finalize_table: тот зависит от ядра.
+signature() {
+    cat "$WORK/filter" "$WORK/nat" "$WORK/mangle" "$WORK/jumps" "$WORK/retired" 2>/dev/null | cksum
 }
 
 parse_args() {
@@ -83,9 +179,11 @@ parse_args() {
     [ -n "$IFACES" ] || die "не задан --iface"
 }
 
-# --------------------------------------------------------------------- up ---
+# ----------------------------------------------------------------- рендер ---
 
-cmd_up() {
+# Собирает правила в файлы и ничего не меняет в ядре: одним и тем же рендером
+# пользуются up и check.
+render_rules() {
     [ -n "$EGRESS" ] || die "не задан --egress"
 
     # --- форвардинг клиентского трафика ---
@@ -98,7 +196,7 @@ cmd_up() {
         # интерфейсам (клиенты другого протокола) — тоже соседи.
         for IFACE in $IFACES; do
             for OTHER in $IFACES; do
-                iptables -t filter -A "$FWD_CHAIN" -i "$IFACE" -o "$OTHER" -j DROP
+                rule filter -A "$FWD_CHAIN" -i "$IFACE" -o "$OTHER" -j DROP
             done
         done
     fi
@@ -116,12 +214,12 @@ cmd_up() {
             # порты, их это не касается.
             # Закрываем порт с icmp-port-unreachable: браузер мгновенно
             # откатывается на TCP, а не ждёт таймаута.
-            iptables -t filter -A "$FWD_CHAIN" -i "$IFACE" -p udp --dport 443 \
+            rule filter -A "$FWD_CHAIN" -i "$IFACE" -p udp --dport 443 \
                 -j REJECT --reject-with icmp-port-unreachable
         fi
 
-        iptables -t filter -A "$FWD_CHAIN" -i "$IFACE" -j ACCEPT
-        iptables -t filter -A "$FWD_CHAIN" -o "$IFACE" -j ACCEPT
+        rule filter -A "$FWD_CHAIN" -i "$IFACE" -j ACCEPT
+        rule filter -A "$FWD_CHAIN" -o "$IFACE" -j ACCEPT
         # Клиент не знает реального path MTU до сервера; без клэмпа крупные
         # TCP-сегменты молча теряются на сетях с меньшим MTU (мобильный интернет,
         # второй VPN поверх), а мелкие проходят — классическая PMTU black hole.
@@ -131,30 +229,28 @@ cmd_up() {
         # сервера уходил нетронутым, тот продолжал слать сегменты под свой MTU
         # 1500 — и в туннель они не влезали. Симптом ровно тот же: мелкие
         # страницы открываются, крупные загрузки встают.
-        iptables -t filter -A "$FWD_CHAIN" -i "$IFACE" -o "$EGRESS" \
+        rule filter -A "$FWD_CHAIN" -i "$IFACE" -o "$EGRESS" \
             -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
-        iptables -t filter -A "$FWD_CHAIN" -i "$EGRESS" -o "$IFACE" \
+        rule filter -A "$FWD_CHAIN" -i "$EGRESS" -o "$IFACE" \
             -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
     done
     ensure_jump filter FORWARD "$FWD_CHAIN"
 
     # --- NAT наружу ---
     ensure_chain nat "$NAT_POST_CHAIN"
-    iptables -t nat -A "$NAT_POST_CHAIN" -o "$EGRESS" -j MASQUERADE
+    rule nat -A "$NAT_POST_CHAIN" -o "$EGRESS" -j MASQUERADE
     ensure_jump nat POSTROUTING "$NAT_POST_CHAIN"
 
     # --- перехват в каскад ---
-    # Старые цепочки перехвата всегда убираем: режим мог смениться.
-    drop_chain nat PREROUTING "$NAT_PRE_CHAIN"
-    drop_chain mangle PREROUTING "$MANGLE_PRE_CHAIN"
-    teardown_tproxy_routing
-
+    # Цепочки чужого режима снимаются: режим мог смениться.
     case "$MODE" in
         off)
-            log "каскад выключен: трафик идёт напрямую через MASQUERADE"
+            retire_chain nat PREROUTING "$NAT_PRE_CHAIN"
+            retire_chain mangle PREROUTING "$MANGLE_PRE_CHAIN"
             ;;
         redirect)
             [ -n "$CASCADE_PORT" ] || die "режим redirect требует --cascade-port"
+            retire_chain mangle PREROUTING "$MANGLE_PRE_CHAIN"
             # Произвольный UDP через REDIRECT не заворачивается: исходный
             # адрес назначения на UDP-сокете не восстановить без TPROXY.
             # DNS — исключение: ему всё равно, кто ответит, поэтому запрос
@@ -168,43 +264,37 @@ cmd_up() {
             # у себя — соединение просто умирало по таймауту.
             for IFACE in $IFACES; do
                 for net in $LOCAL_NETS; do
-                    iptables -t nat -A "$NAT_PRE_CHAIN" -i "$IFACE" -d "$net" -j RETURN
+                    rule nat -A "$NAT_PRE_CHAIN" -i "$IFACE" -d "$net" -j RETURN
                 done
                 if [ -n "$CASCADE_DNS_PORT" ]; then
-                    iptables -t nat -A "$NAT_PRE_CHAIN" -i "$IFACE" -p udp --dport 53 \
+                    rule nat -A "$NAT_PRE_CHAIN" -i "$IFACE" -p udp --dport 53 \
                         -j REDIRECT --to-ports "$CASCADE_DNS_PORT"
                 fi
-                iptables -t nat -A "$NAT_PRE_CHAIN" -i "$IFACE" -p tcp -j REDIRECT --to-ports "$CASCADE_PORT"
+                rule nat -A "$NAT_PRE_CHAIN" -i "$IFACE" -p tcp -j REDIRECT --to-ports "$CASCADE_PORT"
             done
             ensure_jump nat PREROUTING "$NAT_PRE_CHAIN"
-            if [ -n "$CASCADE_DNS_PORT" ]; then
-                log "каскад в режиме redirect (TCP порт $CASCADE_PORT, DNS порт $CASCADE_DNS_PORT)"
-            else
-                log "каскад в режиме redirect (только TCP), порт $CASCADE_PORT"
-            fi
             ;;
         tproxy)
             [ -n "$CASCADE_PORT" ] || die "режим tproxy требует --cascade-port"
-            setup_tproxy_routing
+            retire_chain nat PREROUTING "$NAT_PRE_CHAIN"
             ensure_chain mangle "$MANGLE_PRE_CHAIN"
             # Служебные адреса мимо каскада, иначе клиент теряет и соседей
             # по туннелю, и сам сервер.
             for IFACE in $IFACES; do
                 for net in $LOCAL_NETS; do
-                    iptables -t mangle -A "$MANGLE_PRE_CHAIN" -i "$IFACE" -d "$net" -j RETURN
+                    rule mangle -A "$MANGLE_PRE_CHAIN" -i "$IFACE" -d "$net" -j RETURN
                 done
                 # Закрытый QUIC обязан миновать перехват: иначе TPROXY
                 # заберёт пакет раньше, чем он дойдёт до REJECT в FORWARD.
                 if [ "$BLOCK_QUIC" = "yes" ]; then
-                    iptables -t mangle -A "$MANGLE_PRE_CHAIN" -i "$IFACE" -p udp --dport 443 -j RETURN
+                    rule mangle -A "$MANGLE_PRE_CHAIN" -i "$IFACE" -p udp --dport 443 -j RETURN
                 fi
-                iptables -t mangle -A "$MANGLE_PRE_CHAIN" -i "$IFACE" -p tcp \
+                rule mangle -A "$MANGLE_PRE_CHAIN" -i "$IFACE" -p tcp \
                     -j TPROXY --on-port "$CASCADE_PORT" --tproxy-mark "$MARK"
-                iptables -t mangle -A "$MANGLE_PRE_CHAIN" -i "$IFACE" -p udp \
+                rule mangle -A "$MANGLE_PRE_CHAIN" -i "$IFACE" -p udp \
                     -j TPROXY --on-port "$CASCADE_PORT" --tproxy-mark "$MARK"
             done
             ensure_jump mangle PREROUTING "$MANGLE_PRE_CHAIN"
-            log "каскад в режиме tproxy (TCP и UDP, включая QUIC и DNS), порт $CASCADE_PORT"
             ;;
         *)
             die "неизвестный режим: $MODE"
@@ -218,36 +308,132 @@ cmd_up() {
     # connection detected" от сканеров — каждый, кто подключится с eth0,
     # получает адресом назначения сам слушатель. Пускаем на эти порты
     # только туннель и локалхост.
-    drop_chain filter INPUT "$IN_CHAIN"
     if [ "$MODE" != "off" ] && [ -n "$CASCADE_PORT" ]; then
         ensure_chain filter "$IN_CHAIN"
         for IFACE in $IFACES; do
-            iptables -t filter -A "$IN_CHAIN" -i "$IFACE" -j RETURN
+            rule filter -A "$IN_CHAIN" -i "$IFACE" -j RETURN
         done
-        iptables -t filter -A "$IN_CHAIN" -i lo -j RETURN
-        iptables -t filter -A "$IN_CHAIN" -p tcp --dport "$CASCADE_PORT" -j DROP
-        iptables -t filter -A "$IN_CHAIN" -p udp --dport "$CASCADE_PORT" -j DROP
+        rule filter -A "$IN_CHAIN" -i lo -j RETURN
+        rule filter -A "$IN_CHAIN" -p tcp --dport "$CASCADE_PORT" -j DROP
+        rule filter -A "$IN_CHAIN" -p udp --dport "$CASCADE_PORT" -j DROP
         if [ -n "$CASCADE_DNS_PORT" ]; then
-            iptables -t filter -A "$IN_CHAIN" -p udp --dport "$CASCADE_DNS_PORT" -j DROP
+            rule filter -A "$IN_CHAIN" -p udp --dport "$CASCADE_DNS_PORT" -j DROP
         fi
         ensure_jump filter INPUT "$IN_CHAIN"
+    else
+        retire_chain filter INPUT "$IN_CHAIN"
+    fi
+}
+
+# --------------------------------------------------------------------- up ---
+
+cmd_up() {
+    render_rules
+    _sig="$(signature)"
+
+    # Маршрут метки ставится раньше перехвата: помеченному пакету без него
+    # некуда идти.
+    if [ "$MODE" = "tproxy" ]; then
+        setup_tproxy_routing
+    fi
+
+    # Таблица, в которой появляется перехват, идёт первой: если он не
+    # встанет, разрешающие правила FORWARD не обновятся.
+    case "$MODE" in
+        redirect) _order="nat mangle filter" ;;
+        *)        _order="mangle nat filter" ;;
+    esac
+    for _table in $_order; do
+        finalize_table "$_table"
+        restore_table "$_table"
+    done
+
+    if [ "$MODE" != "tproxy" ]; then
+        teardown_tproxy_routing
+    fi
+    teardown_legacy_routing
+    printf '%s\n' "$_sig" 2>/dev/null > "$STATE_FILE" || true
+
+    case "$MODE" in
+        off)      log "каскад выключен: трафик идёт напрямую через MASQUERADE" ;;
+        tproxy)   log "каскад в режиме tproxy (TCP и UDP, включая QUIC и DNS), порт $CASCADE_PORT" ;;
+        redirect)
+            if [ -n "$CASCADE_DNS_PORT" ]; then
+                log "каскад в режиме redirect (TCP порт $CASCADE_PORT, DNS порт $CASCADE_DNS_PORT)"
+            else
+                log "каскад в режиме redirect (только TCP), порт $CASCADE_PORT"
+            fi
+            ;;
+    esac
+}
+
+# ------------------------------------------------------------------ check ---
+
+cmd_check() {
+    render_rules
+    _sig="$(signature)"
+    if [ ! -f "$STATE_FILE" ] || [ "$(cat "$STATE_FILE" 2>/dev/null)" != "$_sig" ]; then
+        log "правила ставились с другими настройками"
+        exit "$EXIT_CONFIG_CHANGED"
+    fi
+
+    _drift=""
+    for _table in filter nat mangle; do
+        [ -f "$WORK/$_table" ] || continue
+        for _chain in $(sed -n 's/^:\([^ ]*\) .*/\1/p' "$WORK/$_table"); do
+            _want="$(grep -c "^-A $_chain " "$WORK/$_table" || true)"
+            _got="$(ipt -t "$_table" -S "$_chain" 2>/dev/null | grep -c '^-A' || true)"
+            [ "$_want" = "$_got" ] || _drift="$_drift $_table/$_chain:$_got/$_want"
+        done
+    done
+    while read -r _t _parent _chain; do
+        jump_exists "$_t" "$_parent" "$_chain" || _drift="$_drift $_t/$_parent->$_chain"
+    done < "$WORK/jumps"
+    while read -r _t _parent _chain; do
+        if chain_exists "$_t" "$_chain"; then
+            _drift="$_drift $_t/$_chain:лишняя"
+        fi
+    done < "$WORK/retired"
+    if [ "$MODE" = "tproxy" ]; then
+        ip rule list 2>/dev/null | grep -q "fwmark $MARK lookup $RT_TABLE" \
+            || _drift="$_drift ip-rule"
+        ip route show table "$RT_TABLE" 2>/dev/null | grep -q "^local default" \
+            || _drift="$_drift ip-route"
+    fi
+
+    if [ -n "$_drift" ]; then
+        log "правила расходятся с ожидаемыми:$_drift"
+        exit "$EXIT_DRIFT"
     fi
 }
 
 # TPROXY отдаёт помеченные пакеты локальному сокету, а для этого ядру нужен
 # отдельный маршрут: всё помеченное считать местным.
 setup_tproxy_routing() {
-    ip rule list 2>/dev/null | grep -q "fwmark 0x$MARK lookup $RT_TABLE" \
-        || ip rule add fwmark "$MARK" lookup "$RT_TABLE"
+    ip rule list 2>/dev/null | grep -q "fwmark $MARK lookup $RT_TABLE" \
+        || ip rule add fwmark "$MARK" lookup "$RT_TABLE" \
+        || die "не удалось добавить ip rule для метки $MARK"
     ip route show table "$RT_TABLE" 2>/dev/null | grep -q "^local default" \
-        || ip route add local default dev lo table "$RT_TABLE"
+        || ip route add local default dev lo table "$RT_TABLE" \
+        || die "не удалось добавить маршрут в таблицу $RT_TABLE"
+}
+
+# Только своё правило и свой маршрут. "ip route flush table" здесь нельзя: он
+# снёс бы чужие маршруты, окажись таблица не только нашей.
+remove_routing() {
+    while ip rule list 2>/dev/null | grep -q "fwmark $1 lookup $2"; do
+        ip rule del fwmark "$1" lookup "$2" 2>/dev/null || break
+    done
+    ip route del local default dev lo table "$2" 2>/dev/null || true
 }
 
 teardown_tproxy_routing() {
-    while ip rule list 2>/dev/null | grep -q "fwmark 0x$MARK lookup $RT_TABLE"; do
-        ip rule del fwmark "$MARK" lookup "$RT_TABLE" 2>/dev/null || break
-    done
-    ip route flush table "$RT_TABLE" 2>/dev/null || true
+    remove_routing "$MARK" "$RT_TABLE"
+}
+
+# Остатки версий с меткой 1 и таблицей 100 после обновления на месте.
+teardown_legacy_routing() {
+    remove_routing "$LEGACY_MARK" "$LEGACY_RT_TABLE"
 }
 
 # ------------------------------------------------------------------- down ---
@@ -259,17 +445,25 @@ cmd_down() {
     drop_chain nat PREROUTING "$NAT_PRE_CHAIN"
     drop_chain mangle PREROUTING "$MANGLE_PRE_CHAIN"
     teardown_tproxy_routing
+    teardown_legacy_routing
+    rm -f "$STATE_FILE"
     log "правила сняты"
 }
 
 # ------------------------------------------------------------------- main ---
 
-[ $# -ge 1 ] || die "нужна команда: up или down"
+[ $# -ge 1 ] || die "нужна команда: up, down или check"
 COMMAND="$1"; shift
 parse_args "$@"
 
+WORK="$(mktemp -d)" || die "не удалось создать временный каталог"
+trap 'rm -rf "$WORK"' EXIT
+: > "$WORK/jumps"
+: > "$WORK/retired"
+
 case "$COMMAND" in
-    up)   cmd_up ;;
-    down) cmd_down ;;
+    up)    cmd_up ;;
+    check) cmd_check ;;
+    down)  cmd_down ;;
     *)    die "неизвестная команда: $COMMAND" ;;
 esac

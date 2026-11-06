@@ -37,17 +37,18 @@ SCRIPT = _find_script()
 class RulesScriptTests(unittest.TestCase):
     def setUp(self):
         self.text = SCRIPT.read_text(encoding="utf-8")
-        self.up = self.text.split("cmd_up() {", 1)[1].split("cmd_down() {", 1)[0]
+        self.render = self.text.split("render_rules() {", 1)[1].split("cmd_up() {", 1)[0]
+        self.up = self.text.split("cmd_up() {", 1)[1].split("cmd_check() {", 1)[0]
         self.down = self.text.split("cmd_down() {", 1)[1]
 
     def test_every_chain_created_in_up_is_removed_in_down(self):
-        created = set(re.findall(r'ensure_chain \w+ "\$(\w+)"', self.up))
+        created = set(re.findall(r'ensure_chain \w+ "\$(\w+)"', self.render))
         removed = set(re.findall(r'drop_chain \w+ \w+ "\$(\w+)"', self.down))
         self.assertTrue(created)
         self.assertEqual(created - removed, set(), "цепочка создаётся, но не снимается в down")
 
     def test_redirect_returns_local_networks_before_the_cascade(self):
-        redirect = self.up.split("redirect)", 1)[1].split(";;", 1)[0]
+        redirect = self.render.split("redirect)", 1)[1].split(";;", 1)[0]
         self.assertIn("for net in $LOCAL_NETS", redirect)
         self.assertLess(
             redirect.index("LOCAL_NETS"), redirect.index("-p tcp -j REDIRECT"),
@@ -55,17 +56,41 @@ class RulesScriptTests(unittest.TestCase):
         )
 
     def test_mss_is_clamped_in_both_directions(self):
-        clamps = re.findall(r'-i "\$(\w+)" -o "\$(\w+)" \\\n\s+-p tcp .*TCPMSS', self.up)
+        clamps = re.findall(r'-i "\$(\w+)" -o "\$(\w+)" \\\n\s+-p tcp .*TCPMSS', self.render)
         self.assertIn(("IFACE", "EGRESS"), clamps)
         self.assertIn(("EGRESS", "IFACE"), clamps)
 
     def test_cascade_port_is_closed_for_everything_but_the_tunnel(self):
-        self.assertIn('-A "$IN_CHAIN" -i "$IFACE" -j RETURN', self.up)
-        self.assertIn('-p tcp --dport "$CASCADE_PORT" -j DROP', self.up)
+        self.assertIn('-A "$IN_CHAIN" -i "$IFACE" -j RETURN', self.render)
+        self.assertIn('-p tcp --dport "$CASCADE_PORT" -j DROP', self.render)
 
     def test_quic_is_rejected_not_dropped(self):
         # DROP заставил бы браузер ждать таймаута, прежде чем взять TCP.
-        self.assertRegex(self.up, r'--dport 443 \\\n\s+-j REJECT --reject-with icmp-port-unreachable')
+        self.assertRegex(self.render, r'--dport 443 \\\n\s+-j REJECT --reject-with icmp-port-unreachable')
+
+    def test_no_rule_bypasses_the_transaction(self):
+        # Отдельный "iptables -A" вернул бы ровно то, что здесь чинили: код
+        # возврата никто не смотрит, и половина правил встаёт молча.
+        self.assertNotRegex(self.render + self.up, r'(?m)^\s*iptables ')
+
+    def test_interception_goes_before_filter(self):
+        # filter разрешает форвардинг. Если он встанет раньше перехвата, а
+        # перехват не встанет, клиенты выйдут напрямую с адреса панели.
+        self.assertIn('_order="mangle nat filter"', self.up)
+        self.assertIn('redirect) _order="nat mangle filter"', self.up)
+
+    def test_failed_restore_stops_the_script(self):
+        restore = self.text.split("restore_table() {", 1)[1].split("\n}\n", 1)[0]
+        self.assertIn("if ! _err=", restore)
+        self.assertIn("die ", restore)
+
+    def test_foreign_routing_table_is_never_flushed(self):
+        code = [l for l in self.text.splitlines() if not l.lstrip().startswith("#")]
+        self.assertFalse([l for l in code if "ip route flush" in l])
+
+    def test_mark_and_table_are_not_the_common_defaults(self):
+        self.assertRegex(self.text, r'(?m)^MARK=0x4e46$')
+        self.assertRegex(self.text, r'(?m)^RT_TABLE=20231$')
 
     def test_blocked_quic_bypasses_tproxy(self):
         # TPROXY в mangle/PREROUTING срабатывает раньше FORWARD: без
@@ -89,7 +114,7 @@ class MultipleInterfacesTests(unittest.TestCase):
 
     def setUp(self):
         self.text = SCRIPT.read_text(encoding="utf-8")
-        self.up = self.text.split("cmd_up() {", 1)[1].split("cmd_down() {", 1)[0]
+        self.up = self.text.split("render_rules() {", 1)[1].split("cmd_up() {", 1)[0]
 
     def test_iface_flag_accumulates(self):
         self.assertIn('--iface)         IFACES="${IFACES:+$IFACES }$2"', self.text)

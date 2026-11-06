@@ -283,10 +283,10 @@ test_rules() {
         echo "quic_return=$(iptables -t mangle -S NOISEFLOOR-TPROXY | grep -n "dport 443 -j RETURN" | head -1 | cut -d: -f1)"
         echo "udp_tproxy=$(iptables -t mangle -S NOISEFLOOR-TPROXY | grep -n "p udp -j TPROXY" | head -1 | cut -d: -f1)"
         echo "tproxy_quic=$(iptables -S NOISEFLOOR-FWD | grep -c "dport 443 -j REJECT")"
-        echo "iprules=$(ip rule list | grep -c "lookup 100")"
+        echo "iprules=$(ip rule list | grep -c "lookup 20231")"
         noisefloor-rules down --iface awg0 --egress eth0 >/dev/null
         echo "left=$(iptables-save | grep -c NOISEFLOOR || true)"
-        echo "left_iprules=$(ip rule list | grep -c "lookup 100" || true)"
+        echo "left_iprules=$(ip rule list | grep -c "lookup 20231" || true)"
     ' 2>/dev/null)"
 
     check() {
@@ -368,6 +368,127 @@ test_rules() {
     check left 0 \
         && pass "down убирает и правила redirect-режима" \
         || fail "после down остались следы правил redirect-режима"
+
+    # Ядро не приняло TPROXY: up обязан упасть, а не притвориться успешным.
+    # Подмена iptables-restore вместо настоящего отсутствия модуля: выгружать
+    # модули в тесте нельзя, ядро общее с хостом.
+    out="$(docker run --rm --cap-add NET_ADMIN --cap-add NET_RAW \
+        --entrypoint sh "$PANEL_IMAGE" -c '
+        ip link add awg0 type dummy && ip link set awg0 up
+        mkdir -p /tmp/fake
+        cat > /tmp/fake/iptables-restore <<STUB
+#!/bin/sh
+in="\$(cat)"
+case "\$in" in *TPROXY*) echo "Extension TPROXY revision 0 not supported" >&2; exit 2 ;; esac
+printf "%s\n" "\$in" | /usr/sbin/iptables-restore "\$@"
+STUB
+        chmod +x /tmp/fake/iptables-restore
+        PATH=/tmp/fake:$PATH noisefloor-rules up --iface awg0 --egress eth0 \
+            --cascade-port 12345 --mode tproxy >/dev/null 2>&1
+        echo "rc=$?"
+        echo "fwd_jumps=$(iptables -S FORWARD | grep -c NOISEFLOOR-FWD || true)"
+        echo "masquerade=$(iptables -t nat -S | grep -c MASQUERADE || true)"
+    ' 2>/dev/null)"
+
+    check rc 1 \
+        && pass "без TPROXY up завершается с ошибкой" \
+        || fail "сбой TPROXY не виден по коду возврата"
+
+    check fwd_jumps 0 && check masquerade 0 \
+        && pass "без перехвата форвардинг наружу не открывается" \
+        || fail "перехват не встал, а клиенты всё равно выходят напрямую"
+}
+
+# ------------------------------------------- надзор за правилами, вживую ----
+
+# Настоящая панель с живым управлением: свой netns, свой awg-интерфейс на
+# amneziawg-go. Сеть хоста не затрагивается.
+test_rules_supervision() {
+    echo
+    echo "Надзор за правилами  ($PANEL_IMAGE)"
+    local dir="$WORKDIR/live" c=smoke-rules-panel port=29102
+    mkdir -p "$dir/data" "$dir/awg_config" "$dir/bin"
+    trap 'docker rm -f smoke-rules-panel >/dev/null 2>&1 || true; cleanup' EXIT
+
+    # Подмена, которая по файлу-флагу делает любую заливку неудачной: так
+    # проверяется, что панель показывает ошибку, а не только код возврата.
+    cat > "$dir/bin/iptables-restore" <<'STUB'
+#!/bin/sh
+if [ -e /tmp/nf-fail ]; then
+    echo "Extension TPROXY revision 0 not supported" >&2
+    exit 2
+fi
+exec /usr/sbin/iptables-restore "$@"
+STUB
+    chmod +x "$dir/bin/iptables-restore"
+
+    docker run -d --name "$c" --cap-add NET_ADMIN --cap-add NET_RAW --device /dev/net/tun \
+        -p "127.0.0.1:$port:8000" \
+        -e LIVE_MANAGEMENT_ENABLED=true -e AUTO_APPLY_ON_START=true \
+        -e AWG_AUTO_UPDATE_ENABLED=false -e AWG_INTERFACE=awg-smoke0 \
+        -e DEFAULT_SERVER_ADDRESS=10.78.0.1/24 -e DEFAULT_LISTEN_PORT=51998 \
+        -e PUBLIC_HOST=203.0.113.20 \
+        -v "$dir/data:/opt/panel/data" -v "$dir/awg_config:/etc/amnezia/amneziawg" \
+        -v "$dir/bin/iptables-restore:/usr/local/bin/iptables-restore:ro" \
+        "$PANEL_IMAGE" >/dev/null
+
+    if ! wait_for 60 test -s "$dir/data/INITIAL_ADMIN_PASSWORD.txt" \
+        || ! wait_for 45 curl -kfsS -o /dev/null "https://127.0.0.1:$port/"; then
+        fail "панель с живым управлением не поднялась"
+        docker logs "$c" 2>&1 | tail -20
+        return
+    fi
+
+    local pw token
+    pw="$(grep -oE '[A-Za-z0-9_-]{12,}' "$dir/data/INITIAL_ADMIN_PASSWORD.txt" | head -1)"
+    token="$(curl -kfsS -X POST "https://127.0.0.1:$port/api/auth/login" \
+        -H 'Content-Type: application/json' \
+        -d "{\"username\":\"admin\",\"password\":\"$pw\"}" \
+        | python3 -c 'import json,sys; print(json.load(sys.stdin)["access_token"])' 2>/dev/null || true)"
+    [ -n "$token" ] || { fail "не удалось войти в панель"; return; }
+
+    status_has() {
+        curl -kfsS -H "Authorization: Bearer $token" "https://127.0.0.1:$port/api/status" \
+            | grep -q "$1"
+    }
+    rules_back() {
+        docker exec "$c" sh -c 'iptables -S FORWARD | grep -q NOISEFLOOR-FWD'
+    }
+
+    if wait_for 30 rules_back; then
+        pass "панель поставила правила при старте"
+    else
+        fail "правила не появились после старта"
+        docker logs "$c" 2>&1 | tail -20
+        return
+    fi
+
+    docker exec "$c" iptables -F FORWARD
+    if wait_for 60 rules_back; then
+        pass "снесённые правила вернулись не позже чем за 60 с"
+    else
+        fail "снесённые правила за 60 с не вернулись"
+    fi
+
+    curl -kfsS -H "Authorization: Bearer $token" "https://127.0.0.1:$port/api/status/metrics" \
+        | grep -q '^noisefloor_rules_restored_total 1$' \
+        && pass "восстановление видно в метриках" \
+        || fail "noisefloor_rules_restored_total не вырос"
+
+    docker exec "$c" touch /tmp/nf-fail
+    docker exec "$c" iptables -F FORWARD
+    if wait_for 60 status_has '"rules_error":"[^"]*TPROXY'; then
+        pass "панель показывает ошибку правил в статусе"
+    else
+        fail "ошибка правил не видна в статусе панели"
+    fi
+
+    docker exec "$c" rm /tmp/nf-fail
+    if wait_for 60 status_has '"rules_ok":true'; then
+        pass "после устранения причины ошибка ушла"
+    else
+        fail "ошибка правил висит и после восстановления"
+    fi
 }
 
 # ------------------------------------------------------------------ main ----
@@ -377,9 +498,9 @@ dim "рабочий каталог: $WORKDIR"
 
 case "${1:-}" in
     --relay-only) test_relay ;;
-    --panel-only) test_panel; test_rules ;;
-    --rules-only) test_rules ;;
-    "")           test_relay; test_panel; test_rules ;;
+    --panel-only) test_panel; test_rules; test_rules_supervision ;;
+    --rules-only) test_rules; test_rules_supervision ;;
+    "")           test_relay; test_panel; test_rules; test_rules_supervision ;;
     *) echo "неизвестный аргумент: $1" >&2; exit 2 ;;
 esac
 

@@ -25,6 +25,7 @@ AWG_BIN = shutil.which("awg")
 class CommandResult:
     ok: bool
     output: str
+    code: int = 0
 
 
 def tools_available() -> bool:
@@ -43,7 +44,8 @@ def _run(cmd: list[str]) -> CommandResult:
     except subprocess.TimeoutExpired:
         return CommandResult(False, f"Команда не ответила за 30с: {' '.join(cmd)}")
     if result.returncode != 0:
-        return CommandResult(False, (result.stderr or result.stdout or "неизвестная ошибка").strip())
+        return CommandResult(False, (result.stderr or result.stdout or "неизвестная ошибка").strip(),
+                             result.returncode)
     return CommandResult(True, result.stdout.strip())
 
 
