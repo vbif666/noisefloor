@@ -1313,6 +1313,11 @@ v6_refused() {
     [ "${got#* }" = ConnectionRefusedError ]
 }
 
+dual_get() {
+    got="$(docker exec smoke-canary curl -sS -m 5 -o /dev/null -w '%{http_code} %{time_total}' http://dual.example/ 2>&1 || true)"
+    [ "${got%% *}" = 200 ]
+}
+
 test_ipv6() {
     echo
     echo "IPv6 клиентов  ($PANEL_IMAGE)"
@@ -1347,7 +1352,10 @@ print(re.search(r"fd[0-9a-f:]+/128", json.load(open("/canary/config.json"))["con
 
     docker exec smoke-canary sh -c 'printf "5.5.77.10 dual.example\n2001:db8::10 dual.example\n" >> /etc/hosts'
     docker exec smoke-canary-relay sh -c 'echo "5.5.77.10 dual.example" >> /etc/hosts'
-    got="$(docker exec smoke-canary curl -sS -m 5 -o /dev/null -w '%{http_code} %{time_total}' http://dual.example/ 2>&1 || true)"
+    # Имя разрешает xray релея, а Go держит /etc/hosts в кэше до 5 секунд: свежая
+    # запись видна не сразу. Время берётся из удачной попытки, поэтому медленный
+    # откат с IPv6 на IPv4 проверка по-прежнему ловит.
+    wait_for 15 dual_get || true
     [ "${got%% *}" = 200 ] && [ "${got#* }" \< 1 ] \
         && pass "сайт с A и AAAA открывается без задержки ($got)" || fail "dual-stack: $got"
 
