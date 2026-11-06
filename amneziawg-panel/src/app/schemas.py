@@ -51,6 +51,7 @@ class ServerRead(BaseModel):
     listen_port: int
     dns: str
     mtu: int | None
+    effective_mtu: int
     endpoint_host: str
     egress_interface: str
     cascade_enabled: bool

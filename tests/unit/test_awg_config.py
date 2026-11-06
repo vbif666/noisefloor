@@ -186,6 +186,35 @@ class ServerConfigTests(unittest.TestCase):
         self.assertIn("PrivateKey = SERVER_PRIVATE_KEY=", text)
 
 
+class MtuTests(unittest.TestCase):
+    def test_profile_keeps_packet_inside_link_mtu(self):
+        for s4, expected in ((None, 1424), (0, 1424), (12, 1412), (20, 1404), (32, 1392)):
+            self.assertEqual(awg_config.profile_mtu(s4), expected)
+            self.assertLessEqual(20 + 8 + (s4 or 0) + 32 + expected, 1500)
+
+    def test_default_1420_fragments_with_big_s4(self):
+        # Проблема из плана: при S4 > 20 пакет на 1420 выходит за 1500.
+        self.assertGreater(20 + 8 + 21 + 32 + 1420, 1500)
+
+    def server(self, **values):
+        server = _Server()
+        server.mtu = None
+        server.s4 = 32
+        for key, value in values.items():
+            setattr(server, key, value)
+        return server
+
+    def test_written_to_server_and_client(self):
+        server = self.server()
+        self.assertIn("MTU = 1392", awg_config.server_interface_block(server))
+        self.assertIn("MTU = 1392", awg_config.client_config(_Peer(), server))
+
+    def test_explicit_value_wins(self):
+        server = self.server(mtu=1280)
+        self.assertIn("MTU = 1280", awg_config.server_interface_block(server))
+        self.assertIn("MTU = 1280", awg_config.client_config(_Peer(), server))
+
+
 class ClientConfigTests(unittest.TestCase):
     def test_obfuscation_comes_from_server_not_peer(self):
         # Профиль обфускации общий на туннель: разойдётся — хендшейк не пройдёт.

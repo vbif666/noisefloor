@@ -55,6 +55,12 @@ class ServerConfig(Base):
     dns = Column(String(255), default="1.1.1.1")
     mtu = Column(Integer, nullable=True)
 
+    @property
+    def effective_mtu(self) -> int:
+        from .awg_config import effective_mtu
+        return effective_mtu(self)
+
+
     # Публичный адрес/домен, на который будут подключаться клиенты
     endpoint_host = Column(String(255), default="")
     # Интерфейс с выходом в интернет, для NAT (PostUp/PostDown MASQUERADE)

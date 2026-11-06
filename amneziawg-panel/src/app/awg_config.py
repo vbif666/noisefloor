@@ -23,6 +23,30 @@ _OBFS_STR_FIELDS = ("h1", "h2", "h3", "h4")
 _CPS_FIELDS = ("i1", "i2", "i3", "i4", "i5")
 
 
+# Самый длинный пакет данных AmneziaWG 3.1 в UDP: S4 + заголовок 16 + содержимое
+# + тег 16 (amneziawg-go v3.1.20260828, device/send.go). Больше ничего не растит
+# максимум: I1-I5 уходят только перед рукопожатием, а ContentPaddingAddition и
+# RandomTrailers ограничены peer.udpWindow, то есть самым длинным пакетом,
+# который пир уже видел. Запас соответствует плану и почти закрывает разницу с
+# внешним IPv6 (20 байт).
+_LINK_MTU = 1500
+_IPV4_HEADER = 20
+_UDP_HEADER = 8
+_WG_DATA_OVERHEAD = 32
+_MTU_MARGIN = 16
+
+
+def profile_mtu(s4: int | None) -> int:
+    """MTU, при котором полноразмерный пакет не фрагментируется. Значение
+    awg-quick по умолчанию (1420) при S4 больше 20 выходит за 1500 байт."""
+    return _LINK_MTU - _IPV4_HEADER - _UDP_HEADER - _WG_DATA_OVERHEAD - _MTU_MARGIN - (s4 or 0)
+
+
+def effective_mtu(server) -> int:
+    """Явный MTU или рассчитанный из профиля основного интерфейса."""
+    return server.mtu or profile_mtu(getattr(server, "s4", None))
+
+
 def _obfuscation_lines(obj) -> list[str]:
     lines: list[str] = []
     for field in _OBFS_INT_FIELDS:
@@ -136,9 +160,8 @@ def server_interface_block(server: ServerConfig, extra_interfaces: list[str] | t
         f"PrivateKey = {server.private_key}",
         f"Address = {server.address}",
         f"ListenPort = {server.listen_port}",
+        f"MTU = {effective_mtu(server)}",
     ]
-    if server.mtu:
-        lines.append(f"MTU = {server.mtu}")
     lines.extend(_obfuscation_lines(server))
     if server.egress_interface:
         # Раньше здесь собиралась цепочка из шести iptables-команд через
@@ -219,9 +242,11 @@ def client_config(peer: Peer, server: ServerConfig, tunnel: Tunnel | None = None
     # без него часть клиентов сама угадывает MTU по своему аплинку и на
     # сетях с меньшим реальным path MTU (мобильные операторы, двойной VPN)
     # получает PMTU black hole — см. комментарий про TCPMSS в
-    # server_interface_block.
-    if server.mtu:
-        lines.append(f"MTU = {server.mtu}")
+    # server_interface_block. У дополнительных протоколов S4 нет, им хватает
+    # значения по умолчанию.
+    mtu = server.mtu if tunnel else effective_mtu(server)
+    if mtu:
+        lines.append(f"MTU = {mtu}")
     dns = peer.dns_override or server.dns
     if dns:
         lines.append(f"DNS = {dns}")

@@ -79,7 +79,7 @@ class NaiveDatetimeTests(unittest.TestCase):
         naive = datetime(2026, 9, 5, 15, 0, 0)
         server = ServerRead(
             id=1, interface_name="awg0", public_key="k", address="10.13.13.1/24",
-            listen_port=443, dns="1.1.1.1", mtu=None, endpoint_host="example.com",
+            listen_port=443, dns="1.1.1.1", mtu=None, effective_mtu=1424, endpoint_host="example.com",
             egress_interface="eth0", cascade_enabled=False, cascade_vless_url="",
             cascade_last_error=None, cascade_synced_at=naive,
             jc=1, jmin=1, jmax=2, s1=0, s2=0, s3=0, s4=0,

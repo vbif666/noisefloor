@@ -128,11 +128,11 @@ def expected_exit_ips(server: ServerConfig) -> list[str]:
 
 
 def build_config(peer: Peer, server: ServerConfig) -> dict:
-    from .awg_config import client_config
+    from .awg_config import client_config, effective_mtu
     return {
         "conf": client_config(peer, server),
         "address": peer.address,
-        "mtu": server.mtu,
+        "mtu": effective_mtu(server),
         "dns": (server.dns or "").split(",")[0].strip(),
         "listen_port": server.listen_port,
         "expected_exit_ips": expected_exit_ips(server),

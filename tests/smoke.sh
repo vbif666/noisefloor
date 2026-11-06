@@ -18,6 +18,7 @@
 #   tests/smoke.sh --install-only
 #   tests/smoke.sh --canary-only
 #   tests/smoke.sh --failover-only
+#   tests/smoke.sh --mtu-only
 #   tests/smoke.sh --rotation-only [секунд загрузки, по умолчанию 60]
 #   tests/smoke.sh --selfcheck-only
 #   RELAY_IMAGE=... PANEL_IMAGE=... tests/smoke.sh
@@ -1025,6 +1026,57 @@ for pid in filter(str.isdigit, os.listdir("/proc")):
     canary_cleanup
 }
 
+# Сколько фрагментов порта AWG прошло через eth0 панели за $1 секунд.
+count_fragments() {
+    docker exec smoke-canary-panel python -c '
+import socket, struct, sys, time
+# ETH_P_ALL: сокет на ETH_P_IP не видит исходящие пакеты, а фрагменты идут наружу.
+sock = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.htons(3))
+sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1 << 24)
+sock.settimeout(1)
+end, frags, seen = time.time() + int(sys.argv[1]), 0, 0
+biggest = (0, "", "")
+while time.time() < end:
+    try:
+        data, addr = sock.recvfrom(65535)
+    except socket.timeout:
+        continue
+    if not addr[0].startswith("eth") or addr[1] != 0x0800 or len(data) < 34 or data[23] != 17:
+        continue
+    seen += 1
+    flags = struct.unpack("!H", data[20:22])[0]
+    frags += bool(flags & 0x3fff)
+    if len(data) - 14 > biggest[0]:
+        biggest = (len(data) - 14, addr[0], hex(flags))
+print(frags, seen, *biggest)
+' "$1"
+}
+
+test_mtu() {
+    echo
+    echo "MTU из профиля  ($PANEL_IMAGE)"
+    canary_stand mtu 5 || return
+    local frags
+
+    # Контроль: тот же стенд при MTU 1420 обязан дать фрагменты, иначе счётчик слеп.
+    api_put_server '{"s4":32,"mtu":1420}' || { fail "панель не приняла профиль"; return; }
+    sleep_seconds 20
+    wait_for 60 canary_status_has '"canary_ok":true' || fail "стенд: канарейка не вернулась при MTU 1420"
+    frags="$(count_fragments 70)"
+    [ "${frags%% *}" -gt 0 ] && pass "контроль: при S4 32 и MTU 1420 есть фрагменты ($frags)" \
+        || fail "контроль: фрагментов нет даже при MTU 1420 ($frags)"
+
+    api_put_server '{"mtu":null}' || { fail "панель не сбросила MTU"; return; }
+    sleep_seconds 20
+    wait_for 60 canary_status_has '"canary_ok":true' || fail "стенд: канарейка не вернулась при расчётном MTU"
+    docker exec smoke-canary-panel cat /sys/class/net/awg0/mtu | grep -qx 1392 \
+        && pass "на интерфейсе расчётный MTU 1392" || fail "на интерфейсе не 1392"
+    frags="$(count_fragments 70)"
+    [ "${frags%% *}" = 0 ] && pass "при расчётном MTU фрагментов нет ($frags)" \
+        || fail "при расчётном MTU есть фрагменты ($frags)"
+    canary_cleanup
+}
+
 selfcheck_cleanup() {
     docker rm -f smoke-selfcheck smoke-agent-relay-1 >/dev/null 2>&1 || true
     docker image rm -f nf-smoke-agent-relay:broken nf-smoke-agent-relay:current \
@@ -1337,8 +1389,9 @@ case "${1:-}" in
     --canary-only) test_canary ;;
     --failover-only) test_failover ;;
     --rotation-only) test_rotation "${2:-}" ;;
+    --mtu-only) test_mtu ;;
     --selfcheck-only) test_selfcheck ;;
-    "")           test_relay; test_panel; test_rules; test_rules_supervision; test_install; test_canary; test_failover; test_rotation; test_selfcheck ;;
+    "")           test_relay; test_panel; test_rules; test_rules_supervision; test_install; test_canary; test_failover; test_rotation; test_mtu; test_selfcheck ;;
     *) echo "неизвестный аргумент: $1" >&2; exit 2 ;;
 esac
 
