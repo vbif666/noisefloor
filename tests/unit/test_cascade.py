@@ -360,21 +360,12 @@ class SplitRuRoutingTests(unittest.TestCase):
         for tag in ("nf-private", "nf-fallback", "nf-ru"):
             self.assertLess(tags.index(tag), tags.index("nf-default"))
 
-    def test_names_are_resolved_on_demand_not_only_on_no_match(self):
-        """Регрессия, найденная на живом трафике 2026-09-10.
-
-        С IPIfNonMatch разделение выглядело рабочим, а весь трафик шёл в
-        каскад: этот режим разрешает имя только когда НИ ОДНО правило не
-        совпало, — а правило «всё остальное» совпадает на первом же
-        проходе, по тегу входа. До geoip очередь не доходила никогда."""
-        self.assertEqual(self._config(True)["routing"]["domainStrategy"], "IPOnDemand")
-
-    def test_engine_dns_does_not_go_through_the_cascade(self):
-        """Тоже с живого сервера: с явным адресом DNS-сервера служебные
-        запросы движка попадали под «всё остальное» и уезжали в каскад —
-        каждое определение «российский адрес или нет» стоило похода в
-        Амстердам. localhost уходит мимо маршрутизации."""
-        self.assertEqual(self._config(True)["dns"]["servers"], ["localhost"])
+    def test_engine_resolves_nothing(self):
+        # Регрессия 2026-09-10 жила в разрешении имён движком: теперь движок их
+        # не разрешает, сравнивается адрес клиента.
+        config = self._config(True)
+        self.assertEqual(config["routing"]["domainStrategy"], "AsIs")
+        self.assertNotIn("dns", config)
 
     def test_direct_outbound_resolves_to_ipv4(self):
         # Иначе российский сайт с записью AAAA уезжает в IPv6, которого в

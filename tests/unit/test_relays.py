@@ -160,6 +160,36 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(rule["balancerTag"], "relays")
         self.assertNotIn("dns-out", [o["tag"] for o in config["outbounds"]])
 
+    def rendered(self, mode="tproxy", dns=False, split=True):
+        with mock.patch.object(cascade.settings, "cascade_intercept_mode", mode), \
+             mock.patch.object(cascade.settings, "cascade_dns_via_cascade", dns):
+            return cascade.build_xray_config(A, split_ru_direct=split)
+
+    @staticmethod
+    def sniffing(config):
+        return next(i for i in config["inbounds"] if i["tag"] == "cascade-in")["sniffing"]
+
+    def test_split_compares_geoip_with_client_address(self):
+        for config in (self.rendered(), self.rendered("redirect", dns=True)):
+            self.assertIs(self.sniffing(config)["routeOnly"], True)
+            self.assertEqual(config["routing"]["domainStrategy"], "AsIs")
+            self.assertNotIn("dns", config)
+
+    def test_redirect_without_cascade_dns_warns(self):
+        self.assertIs(self.sniffing(self.rendered("redirect"))["routeOnly"], True)
+        with mock.patch.object(cascade.settings, "cascade_intercept_mode", "redirect"):
+            self.assertIn("redirect", cascade._split_warning(True))
+            self.assertIsNone(cascade._split_warning(False))
+            with mock.patch.object(cascade.settings, "cascade_dns_via_cascade", True):
+                self.assertIsNone(cascade._split_warning(True))
+        self.assertIsNone(cascade._split_warning(True))
+
+    def test_no_split_config_is_unchanged(self):
+        # Имя по-прежнему разрешает релей.
+        config = self.rendered(split=False)
+        self.assertNotIn("routeOnly", self.sniffing(config))
+        self.assertNotIn("domainStrategy", config["routing"])
+
     def test_ru_split_goes_through_balancer_too(self):
         config = cascade.build_xray_config(A, split_ru_direct=True, reserves=[B])
         fixed = [r for r in config["routing"]["rules"] if r.get("outboundTag") == "cascade-out"]

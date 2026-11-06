@@ -19,6 +19,7 @@
 #   tests/smoke.sh --canary-only
 #   tests/smoke.sh --failover-only
 #   tests/smoke.sh --mtu-only
+#   tests/smoke.sh --split-only
 #   tests/smoke.sh --rotation-only [секунд загрузки, по умолчанию 60]
 #   tests/smoke.sh --selfcheck-only
 #   RELAY_IMAGE=... PANEL_IMAGE=... tests/smoke.sh
@@ -440,7 +441,7 @@ sleep_seconds() {
 
 canary_cleanup() {
     docker rm -f smoke-canary smoke-canary-panel smoke-canary-relay smoke-canary-relay2 smoke-canary-web >/dev/null 2>&1 || true
-    docker network rm smoke-canary-net smoke-canary-lan >/dev/null 2>&1 || true
+    docker network rm smoke-canary-net smoke-canary-lan smoke-canary-ru >/dev/null 2>&1 || true
 }
 
 # Стенд: поддельный интернет, релей 5.5.77.20, панель 5.5.77.30, канарейка.
@@ -545,7 +546,7 @@ STUB
         -e LIVE_MANAGEMENT_ENABLED=true -e AUTO_APPLY_ON_START=true \
         -e AWG_AUTO_UPDATE_ENABLED=false -e DEFAULT_SERVER_ADDRESS=10.79.0.1/24 \
         -e DEFAULT_LISTEN_PORT=51997 -e PUBLIC_HOST=5.5.77.30 \
-        -e CASCADE_PROBE_URL=http://5.5.77.10/generate_204 \
+        -e CASCADE_PROBE_URL=http://5.5.77.10/generate_204 ${CANARY_PANEL_ENV:-} \
         -v "$dir/data:/opt/panel/data" -v "$dir/awg_config:/etc/amnezia/amneziawg" \
         "$PANEL_IMAGE" >/dev/null
     docker cp "$dir/bin/iptables-restore" "$c:/usr/local/bin/iptables-restore" >/dev/null
@@ -1077,6 +1078,51 @@ test_mtu() {
     canary_cleanup
 }
 
+# Что видит сайт, когда клиент ходит через настоящий туннель.
+tunnel_get() {
+    # Отказ curl здесь результат проверки, set -e не должен оборвать прогон.
+    docker exec smoke-canary curl -sS --max-time 10 "$@" 2>&1 || true
+}
+
+split_checks() {
+    local c=smoke-canary-panel label="$1" got
+    # Российский адрес на стенде и подмена: DNS хоста отвечает им на чужой домен.
+    docker network create --subnet 77.88.8.0/24 smoke-canary-ru >/dev/null
+    docker network connect --ip 77.88.8.8 smoke-canary-ru smoke-canary-web
+    docker network connect --ip 77.88.8.30 smoke-canary-ru "$c"
+    docker exec "$c" sh -c 'echo "77.88.8.8 blocked.example" >> /etc/hosts'
+    # Релей резолвит имя сам: у него ответ настоящий.
+    docker exec smoke-canary-relay sh -c 'echo "5.5.77.10 blocked.example" >> /etc/hosts'
+
+    api_put_server '{"split_ru_direct":true,"dns":"5.5.77.10"}' || { fail "$label: панель не включила разделение"; return; }
+    sleep_seconds 3
+    wait_for 40 canary_status_has '"canary_ok":true' || fail "$label: канарейка не вернулась после включения"
+
+    got="$(tunnel_get http://77.88.8.8/ip)"
+    [ "$got" = "ip=77.88.8.30" ] && pass "$label: российский адрес идёт напрямую" \
+        || fail "$label: российский адрес: $got"
+    got="$(tunnel_get --resolve blocked.example:80:5.5.77.10 http://blocked.example/ip)"
+    [ "$got" = "ip=5.5.77.20" ] && pass "$label: домен с подменой на хосте идёт через каскад" \
+        || fail "$label: домен с подменой на хосте: $got"
+    got="$(tunnel_get http://5.5.77.10/ip)"
+    [ "$got" = "ip=5.5.77.20" ] && pass "$label: остальное идёт через каскад" || fail "$label: остальное: $got"
+}
+
+test_split() {
+    echo
+    echo "Разделение РФ/не-РФ  ($PANEL_IMAGE)"
+    canary_stand split 5 || return
+    split_checks tproxy
+    canary_cleanup
+
+    # dns.server панели - web стенда: канарейка спрашивает его через слушатель.
+    CANARY_PANEL_ENV="-e CASCADE_INTERCEPT_MODE=redirect -e CASCADE_DNS_VIA_CASCADE=true"
+    canary_stand split-redirect 5 || { CANARY_PANEL_ENV=; return; }
+    CANARY_PANEL_ENV=
+    split_checks redirect
+    canary_cleanup
+}
+
 selfcheck_cleanup() {
     docker rm -f smoke-selfcheck smoke-agent-relay-1 >/dev/null 2>&1 || true
     docker image rm -f nf-smoke-agent-relay:broken nf-smoke-agent-relay:current \
@@ -1390,8 +1436,9 @@ case "${1:-}" in
     --failover-only) test_failover ;;
     --rotation-only) test_rotation "${2:-}" ;;
     --mtu-only) test_mtu ;;
+    --split-only) test_split ;;
     --selfcheck-only) test_selfcheck ;;
-    "")           test_relay; test_panel; test_rules; test_rules_supervision; test_install; test_canary; test_failover; test_rotation; test_mtu; test_selfcheck ;;
+    "")           test_relay; test_panel; test_rules; test_rules_supervision; test_install; test_canary; test_failover; test_rotation; test_mtu; test_split; test_selfcheck ;;
     *) echo "неизвестный аргумент: $1" >&2; exit 2 ;;
 esac
 

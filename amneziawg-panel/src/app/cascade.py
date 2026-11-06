@@ -366,21 +366,7 @@ def build_xray_config(params: dict, dns_server: str = "1.1.1.1", split_ru_direct
             })
             dns_rules.append({"type": "field", "inboundTag": ["dns-in"], "outboundTag": "dns-out"})
 
-    # Вход каскада разбирает домен из TLS/HTTP, поэтому до правил доезжает
-    # имя, а не адрес, — и чтобы geoip:ru вообще срабатывал, движку нужно
-    # сначала разрешить имя (domainStrategy ниже).
-    #
-    # servers: localhost — это системный резолвер, и запрос уходит мимо
-    # маршрутизации. С явным адресом (1.1.1.1) служебные запросы самого
-    # движка попадали под правило «всё остальное» и уезжали в каскад: на
-    # каждое определение «российский адрес или нет» получался поход в
-    # Амстердам и обратно. Проверено на живом сервере.
-    dns_block = {}
-    if split_ru_direct:
-        dns_block = {"dns": {"servers": ["localhost"], "queryStrategy": "UseIPv4"}}
-
     return {
-        **dns_block,
         **observatory,
         # access: none — иначе движок пишет строку на КАЖДОЕ соединение
         # клиента в тот же файл, куда идут ошибки. На проде это 23 МБ за
@@ -475,6 +461,13 @@ def build_xray_config(params: dict, dns_server: str = "1.1.1.1", split_ru_direct
                 "sniffing": {
                     "enabled": True,
                     "destOverride": ["http", "tls", "quic"] if _tproxy_mode() else ["http", "tls"],
+                    # Разделение сравнивает geoip с адресом, который клиент
+                    # получил от своего DNS, а имя нужно только для правил.
+                    # Без routeOnly имя заменило бы адрес, и сравнивать было
+                    # бы не с чем. Панель при этом ничего не резолвит, поэтому
+                    # заглушка от DNS хоста на решение не влияет. Наш релей
+                    # разбирает имя сам и резолвит его на своей стороне.
+                    **({"routeOnly": True} if split_ru_direct else {}),
                 },
             },
             *dns_inbounds,
@@ -486,19 +479,15 @@ def build_xray_config(params: dict, dns_server: str = "1.1.1.1", split_ru_direct
             # (то есть из его кэша), и берётся именно v4. Без этого имя
             # разрешалось второй раз, системным резолвером, и российский
             # сайт с записью AAAA уезжал в IPv6 — которого в туннеле нет.
+            # Имя сюда приходит только без разделения маршрутов, при выпуске
+            # напрямую с мёртвыми релеями: с routeOnly здесь адрес клиента.
             {"tag": "direct", "protocol": "freedom", "settings": {"domainStrategy": "UseIPv4"}},
             {"tag": "block", "protocol": "blackhole"},
         ],
         "routing": {
-            # AsIs, пока разделения нет: сравнивать домен с geoip незачем,
-            # а разрешение имён стоило бы запроса на каждое соединение.
-            #
-            # Именно IPOnDemand, а не IPIfNonMatch: последний разрешает имя
-            # только если НИ ОДНО правило не совпало, а у нас есть правило
-            # «всё остальное» — оно совпадает на первом же проходе, по тегу
-            # входа, и до geoip дело не доходит никогда. С этим разделение
-            # выглядело работающим, а весь трафик шёл в каскад.
-            **({"domainStrategy": "IPOnDemand"} if split_ru_direct else {}),
+            # AsIs: имена не разрешаем. geoip сравнивается с адресом клиента,
+            # см. routeOnly у входа cascade-in.
+            **({"domainStrategy": "AsIs"} if split_ru_direct else {}),
             **({"balancers": balancers} if balanced else {}),
             "rules": [
                 {"ruleTag": "nf-api", "type": "field", "inboundTag": ["api-in"], "outboundTag": "api"},
@@ -633,7 +622,16 @@ def sync(server) -> str | None:
                 f"Разделение маршрутов включено, но базы geoip нет ({GEOIP_PATH}) — "
                 "весь трафик идёт через каскад. Обновите образ панели: база кладётся в него при сборке."
             )
-        return _tproxy_sockopt_error(log_offset) or partial_error
+        return _tproxy_sockopt_error(log_offset) or partial_error or _split_warning(split)
+
+
+def _split_warning(split: bool) -> str | None:
+    if split and not _tproxy_mode() and not dns_via_cascade():
+        return (
+            "Разделение маршрутов в режиме redirect без CASCADE_DNS_VIA_CASCADE: DNS клиентов идёт "
+            "мимо каскада, и заблокированный домен с подменённым ответом может уйти напрямую."
+        )
+    return None
 
 
 def _changed_outbounds(old: dict | None, new: dict) -> list[dict] | None:
