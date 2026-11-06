@@ -27,6 +27,7 @@
 #   tests/smoke.sh --rollback-only
 #   tests/smoke.sh --notify-only
 #   tests/smoke.sh --fallback-only
+#   tests/smoke.sh --telegram-install-only
 #   RELAY_IMAGE=... PANEL_IMAGE=... tests/smoke.sh
 #
 # Работает на bridge-сети с портами из диапазона 291xx, поэтому безопасен
@@ -1741,6 +1742,53 @@ PY
     canary_cleanup
 }
 
+# ------------------------------------------- бот Telegram из установщика ----
+
+test_install_telegram() {
+    echo
+    echo "Бот Telegram в install.sh"
+    local script dir bin out
+    local token=123456:ABC-def_1 root
+    root="$(cd "$(dirname "$0")/.." && pwd)"
+    for script in amneziawg-panel/install.sh vless-reality/install.sh; do
+        dir="$(mktemp -d)"
+        bin="$(mktemp -d)"
+        # Docker подменён: проверяем файл и команду, сервер не нужен.
+        printf '#!/bin/sh\necho "$@" >> "%s/calls"\n' "$dir" > "$bin/docker"
+        chmod +x "$bin/docker"
+        printf 'KEEP=1\nNOTIFY_TELEGRAM_TOKEN=9:old\nNOTIFY_TELEGRAM_CHAT_ID=1\nLAST=x\n' > "$dir/.env"
+
+        out="$(NOTIFY_TELEGRAM_TOKEN=$token PATH="$bin:$PATH" bash "$root/$script" \
+            --telegram-only --telegram-chat-id 145 --dir "$dir" 2>&1)" || fail "$script: $out"
+        if [ "$(grep -c '^NOTIFY_TELEGRAM_TOKEN=' "$dir/.env" || true)" = 1 ] \
+            && grep -qx "NOTIFY_TELEGRAM_TOKEN=$token" "$dir/.env" \
+            && grep -qx 'NOTIFY_TELEGRAM_CHAT_ID=145' "$dir/.env" \
+            && grep -qx 'KEEP=1' "$dir/.env" && grep -qx 'LAST=x' "$dir/.env"; then
+            pass "$script: значения заменены, остальное цело"
+        else
+            fail "$script: .env: $(sed 's/=.*/=/' "$dir/.env" | tr '\n' ' ')"
+        fi
+        [ "$(stat -c %a "$dir/.env")" = 600 ] && pass "$script: .env с правами 600" || fail "$script: права .env"
+        grep -qx 'compose up -d' "$dir/calls" && pass "$script: контейнеры обновлены" || fail "$script: нет compose up"
+        [[ "$out" == *"$token"* ]] && fail "$script: токен в выводе" || pass "$script: токена нет в выводе"
+        [ "$(find "$dir" -name '.env.*' | wc -l)" = 0 ] && pass "$script: временных файлов нет" \
+            || fail "$script: остался временный файл"
+
+        cp "$dir/.env" "$dir/before"
+        if PATH="$bin:$PATH" bash "$root/$script" --telegram-only --telegram-token "$token" --dir "$dir" >/dev/null 2>&1; then
+            fail "$script: токен без chat_id принят"
+        elif PATH="$bin:$PATH" bash "$root/$script" --telegram-only --telegram-chat-id 1 \
+            --telegram-token "$(printf '1:a\nEVIL=1')" --dir "$dir" >/dev/null 2>&1; then
+            fail "$script: токен с переводом строки принят"
+        elif cmp -s "$dir/.env" "$dir/before"; then
+            pass "$script: неполные и неверные значения отвергнуты, .env не тронут"
+        else
+            fail "$script: .env изменился при отказе"
+        fi
+        rm -rf "$dir" "$bin"
+    done
+}
+
 # --------------------------------------------- откат вместе с данными ----
 
 rollback_agent() { # подпись образа; настоящие compose и данные, подменён только pull
@@ -2097,7 +2145,8 @@ case "${1:-}" in
     --rollback-only) test_rollback ;;
     --notify-only) test_notify ;;
     --fallback-only) test_fallback ;;
-    "")           test_relay; test_panel; test_rules; test_rules_supervision; test_install; test_canary; test_failover; test_rotation; test_mtu; test_split; test_xudp; test_ipv6; test_selfcheck; test_rollback; test_notify; test_fallback ;;
+    --telegram-install-only) test_install_telegram ;;
+    "")           test_relay; test_panel; test_rules; test_rules_supervision; test_install; test_canary; test_failover; test_rotation; test_mtu; test_split; test_xudp; test_ipv6; test_selfcheck; test_rollback; test_notify; test_fallback; test_install_telegram ;;
     *) echo "неизвестный аргумент: $1" >&2; exit 2 ;;
 esac
 

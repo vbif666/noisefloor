@@ -118,6 +118,40 @@ class ModuleCase(unittest.TestCase):
                             "telegram_chat_id": "42"})
 
 
+class EnvBotTests(ModuleCase):
+    def env(self):
+        patcher = mock.patch.object(notify, "settings", SimpleNamespace(
+            notify_telegram_token="1:env", notify_telegram_chat_id="7"))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_env_works_without_saved_settings(self):
+        self.env()
+        notify.CONFIG_PATH.unlink()
+        config = notify.load_config()
+        self.assertEqual((config["telegram_token"], config["telegram_chat_id"]), ("1:env", "7"))
+        self.assertTrue(notify.configured(config))
+
+    def test_token_from_env_is_not_shown(self):
+        self.env()
+        notify.CONFIG_PATH.unlink()
+        self.assertNotIn("1:env", json.dumps(notify.public_settings()))
+        self.assertTrue(notify.public_settings()["telegram_token_set"])
+
+    def test_saved_wins(self):
+        self.env()
+        self.assertEqual(notify.load_config()["telegram_token"], "123:secret")
+
+    def test_cleared_in_interface_stays_cleared(self):
+        self.env()
+        notify.save_config({"webhook_url": "", "telegram_token": "", "telegram_chat_id": ""})
+        self.assertFalse(notify.configured(notify.load_config()))
+
+    def test_no_env_no_file_means_not_configured(self):
+        notify.CONFIG_PATH.unlink()
+        self.assertFalse(notify.configured(notify.load_config()))
+
+
 class DeliveryTests(ModuleCase):
     def calls(self, code="200", running=True):
         run = mock.Mock(return_value=SimpleNamespace(stdout=code, stderr="", returncode=0))

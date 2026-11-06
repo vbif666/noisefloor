@@ -116,13 +116,15 @@ class Limiter:
 # ------------------------------------------------------------- настройки ---
 
 def load_config() -> dict:
-    config = {"webhook_url": "", "telegram_token": "", "telegram_chat_id": ""}
+    config = {"webhook_url": "", "telegram_token": settings.notify_telegram_token,
+              "telegram_chat_id": settings.notify_telegram_chat_id}
     try:
         saved = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         saved = {}
     if isinstance(saved, dict):
-        config.update({k: str(saved[k]) for k in config if saved.get(k)})
+        # Сохранённое важнее .env, и пустое тоже: иначе бота не выключить из интерфейса.
+        config.update({k: str(saved[k] or "") for k in config if k in saved})
     return config
 
 

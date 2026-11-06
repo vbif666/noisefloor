@@ -29,6 +29,9 @@ PANEL_PORT="${PANEL_PORT:-8001}"
 # www.microsoft.com брать нельзя — он отдаёт слишком большой сертификат, и
 # библиотека REALITY молча рвёт каждое подключение (XTLS/Xray-core#6356).
 REALITY_DEST="${REALITY_DEST:-dl.google.com:443}"
+TELEGRAM_TOKEN="${NOTIFY_TELEGRAM_TOKEN:-}"
+TELEGRAM_CHAT_ID="${NOTIFY_TELEGRAM_CHAT_ID:-}"
+TELEGRAM_ONLY=0
 FORCE=0
 SKIP_DOCKER=0
 
@@ -42,6 +45,9 @@ usage() {
   --vless-port ПОРТ     порт VLESS (по умолчанию 8443)
   --panel-port ПОРТ     порт страницы релея (по умолчанию 8001)
   --dest ДОМЕН:ПОРТ     камуфляжный домен (по умолчанию dl.google.com:443)
+  --telegram-token ТОКЕН   токен бота для уведомлений (необязательно, можно NOTIFY_TELEGRAM_TOKEN в окружении)
+  --telegram-chat-id ID    куда писать: chat_id или @канал
+  --telegram-only          только записать эти значения в готовую установку и перезапустить
   --dir ПУТЬ            каталог установки (по умолчанию /opt/noisefloor-relay)
   --force               перезаписать существующий .env
   --skip-docker         не устанавливать Docker, считать что он есть
@@ -57,6 +63,9 @@ while [ $# -gt 0 ]; do
         --vless-port)  VLESS_PORT="$2"; shift 2 ;;
         --panel-port)  PANEL_PORT="$2"; shift 2 ;;
         --dest)        REALITY_DEST="$2"; shift 2 ;;
+        --telegram-token)       TELEGRAM_TOKEN="$2"; shift 2 ;;
+        --telegram-chat-id)     TELEGRAM_CHAT_ID="$2"; shift 2 ;;
+        --telegram-only)        TELEGRAM_ONLY=1; shift ;;
         --dir)         INSTALL_DIR="$2"; shift 2 ;;
         --force)       FORCE=1; shift ;;
         --skip-docker) SKIP_DOCKER=1; shift ;;
@@ -70,6 +79,45 @@ warn() { printf '\033[1;33m[внимание]\033[0m %s\n' "$*"; }
 die()  { printf '\033[1;31m[ошибка]\033[0m %s\n' "$*" >&2; exit 1; }
 
 [ "$(id -u)" -eq 0 ] || die "нужны права root: запустите через sudo"
+
+# --- Уведомления в Telegram ---------------------------------------------------
+
+check_telegram() {
+    if [ -n "$TELEGRAM_TOKEN" ] && [ -z "$TELEGRAM_CHAT_ID" ]; then
+        die "для Telegram нужен и --telegram-chat-id"
+    fi
+    if [ -z "$TELEGRAM_TOKEN" ] && [ -n "$TELEGRAM_CHAT_ID" ]; then
+        die "для Telegram нужен и --telegram-token"
+    fi
+    [ -n "$TELEGRAM_TOKEN" ] || return 0
+    # Значения идут в .env: перевод строки в них дописал бы туда что угодно.
+    [[ "$TELEGRAM_TOKEN" =~ ^[0-9]+:[A-Za-z0-9_-]+$ ]] \
+        || die "токен бота выглядит иначе: нужен вид 123456:ABC-DEF"
+    [[ "$TELEGRAM_CHAT_ID" =~ ^(-?[0-9]+|@[A-Za-z0-9_]+)$ ]] \
+        || die "chat_id должен быть числом или @именем канала"
+}
+
+# Работает и на готовом .env: остальные настройки не трогает.
+write_telegram() {
+    [ -n "$TELEGRAM_TOKEN" ] || return 0
+    local tmp
+    tmp="$(mktemp .env.XXXXXX)"
+    grep -Ev '^NOTIFY_TELEGRAM_(TOKEN|CHAT_ID)=' .env > "$tmp" || true
+    printf 'NOTIFY_TELEGRAM_TOKEN=%s\nNOTIFY_TELEGRAM_CHAT_ID=%s\n' "$TELEGRAM_TOKEN" "$TELEGRAM_CHAT_ID" >> "$tmp"
+    chmod 600 "$tmp"
+    mv "$tmp" .env
+}
+
+check_telegram
+if [ "$TELEGRAM_ONLY" -eq 1 ]; then
+    [ -n "$TELEGRAM_TOKEN" ] || die "--telegram-only требует токен и chat_id"
+    [ -f "$INSTALL_DIR/.env" ] || die "в $INSTALL_DIR нет .env: сначала установка"
+    cd "$INSTALL_DIR"
+    write_telegram
+    docker compose up -d
+    log "Telegram настроен, контейнеры обновлены"
+    exit 0
+fi
 
 if [ -r /etc/os-release ]; then
     . /etc/os-release
@@ -317,6 +365,7 @@ ADMIN_PASSWORD=
 EOF
     umask 022
 fi
+write_telegram
 
 # --- Запуск -----------------------------------------------------------------
 
