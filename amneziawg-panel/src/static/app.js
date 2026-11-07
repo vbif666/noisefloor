@@ -341,6 +341,7 @@ function pollUntilBack() {
 
 $("update-btn").addEventListener("click", () => {
   switchTab("server");
+  expandPanelOf($("update-available-box"));
   $("update-available-box").scrollIntoView({ behavior: "smooth", block: "center" });
 });
 $("self-check-btn").addEventListener("click", () => loadSelfUpdate(true));
@@ -1728,7 +1729,66 @@ function buildSignalStrip() {
    Старт
    ========================================================================== */
 
+/* ==========================================================================
+   Сворачиваемые блоки вкладки «Сервер»
+   ========================================================================== */
+
+// Блоки свёрнуты по умолчанию: открывается тот, на который нажали.
+// Открытые запоминаются в браузере, статусы в заголовках видны и в свёрнутом виде.
+const OPEN_PANELS_KEY = "noisefloor_open_panels";
+
+function loadOpenPanels() {
+  try { return new Set(JSON.parse(localStorage.getItem(OPEN_PANELS_KEY) || "[]")); }
+  catch (_) { return new Set(); }
+}
+
+function saveOpenPanels(set) {
+  try { localStorage.setItem(OPEN_PANELS_KEY, JSON.stringify([...set])); } catch (_) { /* приватный режим */ }
+}
+
+function setPanelOpen(panel, open) {
+  panel.classList.toggle("is-collapsed", !open);
+  panel.querySelector(".panel-header").setAttribute("aria-expanded", String(open));
+  const set = loadOpenPanels();
+  if (open) set.add(panel.dataset.panel); else set.delete(panel.dataset.panel);
+  saveOpenPanels(set);
+}
+
+function expandPanelOf(el) {
+  const panel = el && el.closest(".panel.collapsible");
+  if (panel && panel.classList.contains("is-collapsed")) setPanelOpen(panel, true);
+}
+
+function initCollapsiblePanels() {
+  const open = loadOpenPanels();
+  document.querySelectorAll("#tab-server .panel").forEach((panel) => {
+    const header = panel.querySelector(".panel-header");
+    const title = header && header.querySelector("h2");
+    if (!title) return;
+    panel.classList.add("collapsible");
+    panel.dataset.panel = title.textContent.trim();
+    panel.classList.toggle("is-collapsed", !open.has(panel.dataset.panel));
+    header.setAttribute("role", "button");
+    header.setAttribute("tabindex", "0");
+    header.setAttribute("aria-expanded", String(open.has(panel.dataset.panel)));
+    const toggle = () => setPanelOpen(panel, panel.classList.contains("is-collapsed"));
+    header.addEventListener("click", (e) => {
+      if (e.target.closest("button, a, input, select, label")) return;
+      toggle();
+    });
+    header.addEventListener("keydown", (e) => {
+      if (e.target !== header || (e.key !== "Enter" && e.key !== " ")) return;
+      e.preventDefault();
+      toggle();
+    });
+  });
+  // Поле с ошибкой в свёрнутом блоке браузер не может показать, и форма
+  // молча не отправляется: раскрываем блок с этим полем.
+  $("server-form").addEventListener("invalid", (e) => expandPanelOf(e.target), true);
+}
+
 async function boot() {
+  initCollapsiblePanels();
   buildSignalStrip();
   window.addEventListener("resize", drawTrafficChart);
   if (token) {

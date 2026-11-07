@@ -622,6 +622,48 @@ main {
   padding: 20px;
 }
 
+/* Сворачиваемые блоки вкладки «Сервер» */
+.panel.collapsible > .panel-header {
+  cursor: pointer;
+  user-select: none;
+  gap: 12px;
+}
+
+.panel.collapsible > .panel-header h2 {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.panel.collapsible > .panel-header h2::before {
+  content: "";
+  flex: none;
+  width: 7px;
+  height: 7px;
+  border-right: 1.5px solid var(--text-dim);
+  border-bottom: 1.5px solid var(--text-dim);
+  transform: rotate(45deg) translate(-2px, -2px);
+  transition: transform 0.15s var(--ease);
+}
+
+.panel.collapsible.is-collapsed > .panel-header h2::before {
+  transform: rotate(-45deg);
+}
+
+.panel.collapsible > .panel-header:focus-visible {
+  outline: 2px solid var(--text-dim);
+  outline-offset: -2px;
+  border-radius: var(--radius-lg);
+}
+
+.panel.collapsible.is-collapsed > .panel-header {
+  border-bottom-color: transparent;
+}
+
+.panel.collapsible.is-collapsed > .panel-body {
+  display: none;
+}
+
 /* ==========================================================================
    Таблица пиров
    ========================================================================== */
