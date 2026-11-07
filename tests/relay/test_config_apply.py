@@ -111,33 +111,6 @@ class RestartOnlyOnChangeTests(Base):
         self.assertEqual(app.load_creds()["sni"], "dl.google.com")
 
 
-class GeohideTests(Base):
-    def setUp(self):
-        super().setUp()
-        self.creds = make_creds()
-        self.creds["geohide"] = dict(app.geohide_defaults(), enabled=True)
-        app.save_creds(self.creds)
-        app.GEOHIDE_DOMAINS_FILE.write_text("a.example\nb.example\n")
-        self.addCleanup(lambda: app.GEOHIDE_DOMAINS_FILE.unlink(missing_ok=True))
-        self.run_with(self.creds)
-
-    def test_same_list_keeps_process(self):
-        with mock.patch.object(app, "fetch_geohide_list", return_value=["a.example", "b.example"]):
-            app.geohide_apply(update_list=True)
-        self.restart.assert_not_called()
-
-    def test_failed_download_keeps_process(self):
-        with mock.patch.object(app, "fetch_geohide_list", side_effect=OSError("нет сети")):
-            gh = app.geohide_apply(update_list=True)
-        self.restart.assert_not_called()
-        self.assertIn("нет сети", gh["last_error"])
-
-    def test_new_list_restarts(self):
-        with mock.patch.object(app, "fetch_geohide_list", return_value=["c.example"]):
-            app.geohide_apply(update_list=True)
-        self.restart.assert_called_once()
-
-
 class RouterConfigTests(Base):
     def reality(self, creds):
         return app.build_config(creds, NOW)["inbounds"][0]["streamSettings"]["realitySettings"]

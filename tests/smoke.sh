@@ -1042,18 +1042,6 @@ PY
         docker exec "$c" tail -15 /opt/panel/data/cascade-xray.log
     fi
 
-    started="$(relay_xray_pid)"
-    relay_api -o /dev/null --data-urlencode enabled=on --data-urlencode extra=geohide.example \
-        https://127.0.0.1:8001/api/geohide || fail "релей не принял GeoHide"
-    wait_for 30 relay_xray_replaced "$started" || fail "стенд: включение GeoHide не применилось"
-    relay_pid="$(relay_xray_pid)"
-    relay_api -o /dev/null -X POST https://127.0.0.1:8001/api/geohide/refresh || fail "обновление GeoHide не прошло"
-    relay_api -o /dev/null -X POST https://127.0.0.1:8001/api/geohide/refresh || fail "обновление GeoHide не прошло"
-    # Дольше отложенного перезапуска.
-    sleep_seconds 20
-    [ "$(relay_xray_pid)" = "$relay_pid" ] \
-        && pass "повторный geohide_apply не перезапускает xray" || fail "geohide_apply перезапустил xray"
-
     # Упавший маршрутизатор поднимает сторож, иначе не пройдёт ни одно рукопожатие.
     docker exec smoke-canary-relay python -c '
 import os, signal

@@ -359,8 +359,8 @@ def check_auth(request: Request):
 
 # ------------------------------------------------------------ provision ----
 
-def run_x25519() -> dict:
-    out = subprocess.run([XRAY_BIN, "x25519"], capture_output=True, text=True, check=True).stdout
+def run_x25519(command: str = "x25519") -> dict:
+    out = subprocess.run([XRAY_BIN, command], capture_output=True, text=True, check=True).stdout
     values = {}
     for line in out.splitlines():
         if ":" in line:
@@ -370,7 +370,7 @@ def run_x25519() -> dict:
     priv = values.get("privatekey") or values.get("private")
     pub = values.get("publickey") or values.get("password") or values.get("public")
     if not priv or not pub:
-        raise RuntimeError(f"could not parse `xray x25519` output:\n{out}")
+        raise RuntimeError(f"could not parse `xray {command}` output:\n{out}")
     return {"private_key": priv, "public_key": pub}
 
 
@@ -529,11 +529,18 @@ def build_config(creds: dict, now: datetime | None = None) -> dict:
             ]
         },
     }
-    gh_dns, gh_outbounds, gh_rules = geohide_xray_parts(creds)
-    if gh_dns:
-        config["dns"] = gh_dns
-        config["outbounds"].extend(gh_outbounds)
-        config["routing"]["rules"].extend(gh_rules)
+    w_inbounds, w_outbounds, w_rules = warp_xray_parts(creds)
+    w_dns, w_dns_outbounds, w_dns_rules = warp_dns_parts(creds)
+    config["inbounds"].extend(w_inbounds)
+    config["outbounds"].extend(w_outbounds + w_dns_outbounds)
+    # DNS-правила раньше доменных: UDP 53 клиентов перехватывается первым.
+    config["routing"]["rules"].extend(w_dns_rules + w_rules)
+    if w_dns:
+        config["dns"] = w_dns
+        # Без domainStrategy freedom резолвит системным DNS (резолверы
+        # хостера); UseIP отдаёт резолв встроенному DNS xray, то есть DoH.
+        direct = next(o for o in config["outbounds"] if o["tag"] == "direct")
+        direct["settings"] = {"domainStrategy": "UseIP"}
     return config
 
 
@@ -667,38 +674,10 @@ def load_creds() -> dict:
     return json.loads(CREDS_FILE.read_text())
 
 
-# ------------------------------------------------------------ geohide ----
-#
-# GeoHide (geohide.ru) - DNS, который для сайтов с геоблоком отдаёт адреса
-# своих прокси. Включение здесь: домены из их списка (плюс свои) xray
-# резолвит через DoH GeoHide и отправляет через отдельный outbound
-# "geohide"; остальной трафик идёт как раньше. Список доменов хранится
-# отдельным файлом, чтобы не раздувать creds, и обновляется раз в сутки.
+# ------------------------------------------------------------ domains ----
 
-GEOHIDE_REGIONS = ("eu", "us")
-GEOHIDE_DOMAINS_FILE = DATA_DIR / "geohide-domains.txt"
-GEOHIDE_REFRESH_SECONDS = 24 * 3600
-GEOHIDE_FETCH_TIMEOUT = 20
 _DOMAIN_RE = re.compile(r"^(?=.{1,253}$)([a-z0-9_]([a-z0-9_-]{0,61}[a-z0-9])?\.)+[a-z][a-z0-9-]{0,62}$")
 
-
-def geohide_defaults() -> dict:
-    return {
-        "enabled": False,
-        "region": "eu",
-        "extra": [],
-        "updated_at": None,
-        "count": 0,
-        "last_error": None,
-    }
-
-
-def get_geohide(creds: dict) -> dict:
-    gh = geohide_defaults()
-    gh.update(creds.get("geohide") or {})
-    if gh["region"] not in GEOHIDE_REGIONS:
-        gh["region"] = "eu"
-    return gh
 
 
 def parse_domains(text: str) -> list[str]:
@@ -715,112 +694,342 @@ def parse_domains(text: str) -> list[str]:
     return out
 
 
-def geohide_doh_url(region: str) -> str:
-    # https+local: запрос к DoH идёт напрямую, мимо маршрутизации xray.
-    return f"https+local://{region}.geohide.ru/dns-query"
+# --------------------------------------------------------------- warp ----
+#
+# Cloudflare WARP как второй выход релея. Сайты видят ASN хостера релея, и
+# часть из них режет его независимо от страны: на Timeweb (AS210976) Google
+# отправлял Gemini на капчу /sorry, Canva отдавала 403. Через WARP те же
+# запросы уходят с адреса Cloudflare (AS13335) в той же стране.
+#
+# Через WARP идёт только список доменов: на проверке WARP давал ~65%
+# скорости прямого выхода и втрое большую задержку первого байта.
+#
+# Аккаунт бесплатный и анонимный: регистрация - один запрос к API клиента
+# 1.1.1.1 с публичным ключом WireGuard. Туннель держит сам xray (outbound
+# wireguard в userspace) - ни модуля ядра, ни wg-quick не нужно.
+#
+# Живость проверяет warp_loop через отдельный SOCKS-вход на loopback,
+# который всегда ведёт в WARP. После WARP_FAIL_LIMIT неудач подряд правила
+# по доменам снимаются и трафик идёт напрямую; вход проверки остаётся,
+# и при первой удачной проверке правила возвращаются.
+
+WARP_API = "https://api.cloudflareclient.com/v0a2158"
+WARP_API_HEADERS = {
+    "User-Agent": "okhttp/3.12.1",
+    "CF-Client-Version": "a-6.11-2223",
+    "Content-Type": "application/json",
+}
+WARP_DEFAULT_ENDPOINT = "162.159.192.1:2408"
+WARP_ENDPOINT_PORT = 2408
+WARP_MTU = 1280
+WARP_PROBE_PORT = int(os.environ.get("WARP_PROBE_PORT", "10087"))
+WARP_CHECK_SECONDS = 300
+WARP_FAIL_LIMIT = 3
+WARP_TIMEOUT = 15
+# Сервисы, которые ограничивают доступ по стране или по сети хостера.
+# Поддомены включаются: "openai.com" покрывает api.openai.com и auth.openai.com.
+WARP_DEFAULT_DOMAINS = (
+    "chatgpt.com",                        # ChatGPT
+    "openai.com",                         # API, вход и платежи OpenAI
+    "oaistatic.com",                      # статика ChatGPT, без неё не грузится интерфейс
+    "claude.ai",                          # Claude
+    "anthropic.com",                      # API и консоль Anthropic
+    "gemini.google.com",                  # Gemini: напрямую Google уводил на капчу
+    "aistudio.google.com",                # Google AI Studio
+    "generativelanguage.googleapis.com",  # Gemini API
+    "canva.com",                          # Canva: напрямую 403
+    "notion.so",                          # Notion
+)
 
 
-def geohide_domains(gh: dict) -> list[str]:
-    base: list[str] = []
-    if GEOHIDE_DOMAINS_FILE.exists():
-        base = parse_domains(GEOHIDE_DOMAINS_FILE.read_text())
-    seen = set(base)
-    return base + [d for d in gh["extra"] if d not in seen]
-
-
-def fetch_geohide_list(region: str) -> list[str]:
-    import urllib.request
-    req = urllib.request.Request(
-        f"https://geohide.ru/{region}/domains.txt",
-        headers={"User-Agent": f"{APP_NAME}/{build_info()['version']}"},
-    )
-    with urllib.request.urlopen(req, timeout=GEOHIDE_FETCH_TIMEOUT) as resp:
-        body = resp.read(2 * 1024 * 1024).decode("utf-8", "replace")
-    domains = parse_domains(body)
-    if len(domains) < 10:
-        raise ValueError(f"в списке GeoHide подозрительно мало доменов ({len(domains)})")
-    return domains
-
-
-def refresh_geohide(region: str) -> tuple[int, str | None]:
-    """Скачать список. При ошибке старый файл остаётся как был."""
-    try:
-        domains = fetch_geohide_list(region)
-    except Exception as e:
-        return 0, f"не удалось скачать список: {e}"
-    tmp = GEOHIDE_DOMAINS_FILE.with_suffix(".tmp")
-    tmp.write_text("\n".join(domains) + "\n")
-    tmp.replace(GEOHIDE_DOMAINS_FILE)
-    return len(domains), None
-
-
-def geohide_xray_parts(creds: dict) -> tuple[dict | None, list[dict], list[dict]]:
-    """dns-секция, доп. outbounds и правила маршрутизации для конфига."""
-    gh = get_geohide(creds)
-    if not gh["enabled"]:
-        return None, [], []
-    domains = geohide_domains(gh)
-    if not domains:
-        return None, [], []
-    matchers = [f"domain:{d}" for d in domains]
-    dns = {
-        "servers": [
-            {"address": geohide_doh_url(gh["region"]), "domains": matchers, "skipFallback": True},
-            "localhost",
-        ],
-        "queryStrategy": "UseIPv4",
+def warp_defaults() -> dict:
+    return {
+        "enabled": False,
+        "dns": True,
+        "domains": list(WARP_DEFAULT_DOMAINS),
+        "account": None,
+        "registered_at": None,
+        "healthy": True,
+        "fails": 0,
+        "last_check": None,
+        "last_ok": None,
+        "exit_ip": None,
+        "last_error": None,
     }
-    outbounds = [{"protocol": "freedom", "tag": "geohide", "settings": {"domainStrategy": "UseIPv4"}}]
-    rules = [{"type": "field", "inboundTag": ["vless-in"], "domain": matchers, "outboundTag": "geohide"}]
+
+
+def get_warp(creds: dict) -> dict:
+    w = warp_defaults()
+    w.update(creds.get("warp") or {})
+    return w
+
+
+def run_wg_keys() -> dict:
+    """Пара ключей WireGuard от `xray wg` (тот же разбор, что у x25519)."""
+    return run_x25519("wg")
+
+
+def _warp_request(method: str, path: str, body: dict | None = None,
+                  token: str | None = None) -> dict:
+    import urllib.request
+    headers = dict(WARP_API_HEADERS)
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    req = urllib.request.Request(
+        WARP_API + path, method=method, headers=headers,
+        data=json.dumps(body).encode() if body is not None else None,
+    )
+    with urllib.request.urlopen(req, timeout=WARP_TIMEOUT) as resp:
+        raw = resp.read(256 * 1024)
+    return json.loads(raw) if raw.strip() else {}
+
+
+def _warp_endpoint(peer: dict) -> str:
+    """Адрес Cloudflare из ответа. Порт в нём 0 - ставим стандартный."""
+    ep = peer.get("endpoint") or {}
+    v4 = ep.get("v4") or ""
+    host = v4.rsplit(":", 1)[0] if v4 else ""
+    if re.fullmatch(r"\d{1,3}(\.\d{1,3}){3}", host):
+        return f"{host}:{WARP_ENDPOINT_PORT}"
+    return ep.get("host") or WARP_DEFAULT_ENDPOINT
+
+
+def parse_warp_registration(reg: dict, private_key: str) -> dict:
+    """Ответ /reg -> всё, что нужно outbound'у. Новые версии API отдают
+    объект напрямую, старые - внутри "result"."""
+    reg = reg.get("result") or reg
+    cfg = reg["config"]
+    peer = cfg["peers"][0]
+    addrs = cfg["interface"]["addresses"]
+    reserved = list(base64.b64decode(cfg.get("client_id") or ""))
+    if len(reserved) != 3:
+        reserved = [0, 0, 0]
+    return {
+        "id": reg["id"],
+        "token": reg.get("token"),
+        "private_key": private_key,
+        "peer_public_key": peer["public_key"],
+        "endpoint": _warp_endpoint(peer),
+        "address_v4": addrs["v4"],
+        "address_v6": addrs.get("v6"),
+        "reserved": reserved,
+        "account_type": (reg.get("account") or {}).get("account_type"),
+    }
+
+
+def warp_register() -> dict:
+    keys = run_wg_keys()
+    body = {
+        "key": keys["public_key"],
+        "install_id": "",
+        "fcm_token": "",
+        "tos": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z"),
+        "type": "Android",
+        "locale": "en_US",
+    }
+    reg = _warp_request("POST", "/reg", body)
+    return parse_warp_registration(reg, keys["private_key"])
+
+
+def warp_unregister(account: dict | None) -> None:
+    """Удалить устройство в Cloudflare. Не вышло - не страшно: аккаунт
+    анонимный, ключи у нас всё равно стираются."""
+    if not account or not account.get("token"):
+        return
+    try:
+        _warp_request("DELETE", f"/reg/{account['id']}", token=account["token"])
+    except Exception:
+        pass
+
+
+def warp_route_domains(creds: dict) -> list[str]:
+    """Домены, которые сейчас действительно идут через WARP."""
+    w = get_warp(creds)
+    if not (w["enabled"] and w["account"] and w["healthy"]):
+        return []
+    return w["domains"]
+
+
+def warp_xray_parts(creds: dict) -> tuple[list[dict], list[dict], list[dict]]:
+    """Входы, выходы и правила для конфига. Вход проверки и outbound есть,
+    пока WARP включён; правила по доменам - только пока он жив."""
+    w = get_warp(creds)
+    acc = w["account"]
+    if not (w["enabled"] and acc):
+        return [], [], []
+    addresses = [f"{acc['address_v4']}/32"]
+    if acc.get("address_v6"):
+        addresses.append(f"{acc['address_v6']}/128")
+    inbounds = [{
+        "listen": "127.0.0.1",
+        "port": WARP_PROBE_PORT,
+        "protocol": "socks",
+        "tag": "warp-probe",
+        "settings": {"udp": False},
+    }]
+    outbounds = [{
+        "protocol": "wireguard",
+        "tag": "warp",
+        "settings": {
+            "secretKey": acc["private_key"],
+            "address": addresses,
+            "peers": [{
+                "publicKey": acc["peer_public_key"],
+                "endpoint": acc["endpoint"],
+                "allowedIPs": ["0.0.0.0/0", "::/0"],
+            }],
+            "reserved": acc["reserved"],
+            "mtu": WARP_MTU,
+            "domainStrategy": "ForceIP",
+        },
+    }]
+    rules = [{"type": "field", "inboundTag": ["warp-probe"], "outboundTag": "warp"}]
+    domains = warp_route_domains(creds)
+    if domains:
+        rules.append({"type": "field", "inboundTag": ["vless-in"],
+                      "domain": [f"domain:{d}" for d in domains], "outboundTag": "warp"})
+    return inbounds, outbounds, rules
+
+
+# DoH Cloudflare по IP: адрес сервера не нужно резолвить заранее.
+WARP_DOH_SERVERS = ("https://1.1.1.1/dns-query", "https://1.0.0.1/dns-query")
+WARP_DNS_TAG = "dns-warp"
+
+
+def warp_dns_parts(creds: dict) -> tuple[dict | None, list[dict], list[dict]]:
+    """DNS релея через DoH Cloudflare внутри WARP: резолвер видит адрес
+    Cloudflare, а не релея, и хостер не видит запросов. Пока WARP не
+    отвечает, тот же DoH идёт напрямую, чтобы резолв не встал. Системный
+    DNS (localhost) - последний запасной вариант, если DoH недоступен совсем.
+
+    Обычные DNS-запросы клиентов (UDP 53: так резолвят клиенты каскада)
+    перехватываются в тот же DoH; запросы не про адреса (TXT, HTTPS, MX)
+    встроенный DNS не обрабатывает, они идут к исходному серверу как раньше."""
+    w = get_warp(creds)
+    if not (w["enabled"] and w["account"] and w["dns"]):
+        return None, [], []
+    dns = {
+        "tag": WARP_DNS_TAG,
+        "servers": [*WARP_DOH_SERVERS, "localhost"],
+        "queryStrategy": "UseIP",
+    }
+    outbounds = [{"protocol": "dns", "tag": "dns-hijack", "settings": {"nonIPQuery": "skip"}}]
+    rules = [
+        {"type": "field", "inboundTag": [WARP_DNS_TAG],
+         "outboundTag": "warp" if w["healthy"] else "direct"},
+        {"type": "field", "inboundTag": ["vless-in"], "network": "udp", "port": 53,
+         "outboundTag": "dns-hijack"},
+    ]
     return dns, outbounds, rules
 
 
-def geohide_apply(update_list: bool) -> dict:
-    """Пересобрать конфиг под текущие настройки GeoHide (опционально обновив
-    список) и перезапустить xray, если конфиг изменился: раз в сутки приходит
-    обычно тот же список, а при неудачной загрузке старый файл остаётся на
-    месте. Вызывать под rotation_lock."""
-    creds = load_creds()
-    gh = get_geohide(creds)
-    if update_list:
-        count, err = refresh_geohide(gh["region"])
-        gh["last_error"] = err
-        if not err:
-            gh["count"] = count
-            gh["updated_at"] = datetime.now(timezone.utc).isoformat()
-    creds["geohide"] = gh
+def _recv_exact(sock: socket.socket, n: int) -> bytes:
+    data = b""
+    while len(data) < n:
+        chunk = sock.recv(n - len(data))
+        if not chunk:
+            raise ConnectionError("соединение закрыто")
+        data += chunk
+    return data
+
+
+def warp_probe(port: int | None = None, timeout: float = WARP_TIMEOUT) -> dict:
+    """Запрос к cdn-cgi/trace Cloudflare через вход проверки. Ответ trace
+    сам говорит, пришёл ли запрос из WARP (warp=on) и с какого адреса."""
+    host = "www.cloudflare.com"
+    with socket.create_connection(("127.0.0.1", port or WARP_PROBE_PORT), timeout=timeout) as s:
+        s.settimeout(timeout)
+        s.sendall(b"\x05\x01\x00")
+        if _recv_exact(s, 2) != b"\x05\x00":
+            raise ConnectionError("SOCKS не принял рукопожатие")
+        name = host.encode()
+        s.sendall(b"\x05\x01\x00\x03" + bytes([len(name)]) + name + (80).to_bytes(2, "big"))
+        head = _recv_exact(s, 4)
+        if head[1] != 0:
+            raise ConnectionError(f"SOCKS отказал в соединении (код {head[1]})")
+        skip = {1: 4, 4: 16}.get(head[3])
+        if skip is None:
+            skip = _recv_exact(s, 1)[0]
+        _recv_exact(s, skip + 2)
+        s.sendall(f"GET /cdn-cgi/trace HTTP/1.1\r\nHost: {host}\r\n"
+                  "User-Agent: curl/8\r\nConnection: close\r\n\r\n".encode())
+        raw = b""
+        while len(raw) < 64 * 1024:
+            chunk = s.recv(4096)
+            if not chunk:
+                break
+            raw += chunk
+    body = raw.split(b"\r\n\r\n", 1)[-1].decode("utf-8", "replace")
+    trace = dict(line.split("=", 1) for line in body.splitlines() if "=" in line)
+    if trace.get("warp") not in ("on", "plus"):
+        raise ConnectionError(f"запрос ушёл мимо WARP (warp={trace.get('warp', '?')})")
+    return {"ip": trace.get("ip"), "loc": trace.get("loc"), "warp": trace.get("warp")}
+
+
+def warp_apply(creds: dict, w: dict) -> dict:
+    """Сохранить настройки WARP и применить конфиг. Под rotation_lock."""
+    creds["warp"] = w
     save_creds(creds)
     try:
         apply_config(creds)
     except ConfigError as exc:
-        gh["last_error"] = f"xray не принял конфиг: {exc}"
-        creds["geohide"] = gh
+        w["last_error"] = f"xray не принял конфиг: {exc}"
+        creds["warp"] = w
         save_creds(creds)
-    return gh
+    return w
 
 
-def geohide_headline(gh: dict) -> str:
-    if not gh["enabled"]:
+def warp_check() -> dict:
+    """Проверить туннель и поправить маршруты, если состояние сменилось.
+    Вызывать под rotation_lock."""
+    creds = load_creds()
+    w = get_warp(creds)
+    if not (w["enabled"] and w["account"]):
+        return w
+    now = datetime.now(timezone.utc).isoformat()
+    was_healthy = w["healthy"]
+    try:
+        info = warp_probe()
+    except Exception as exc:
+        w["fails"] += 1
+        w["last_error"] = f"проверка не прошла: {exc}"
+        if w["fails"] >= WARP_FAIL_LIMIT:
+            w["healthy"] = False
+    else:
+        w.update(fails=0, healthy=True, last_ok=now, last_error=None,
+                 exit_ip=f"{info['ip']} ({info['loc']})")
+    w["last_check"] = now
+    if w["healthy"] != was_healthy:
+        return warp_apply(creds, w)
+    creds["warp"] = w
+    save_creds(creds)
+    return w
+
+
+def warp_headline(w: dict) -> str:
+    if not w["account"]:
+        return "не подключено"
+    if not w["enabled"]:
         return "выключено"
-    n = len(geohide_domains(gh))
-    when = ""
-    if gh["updated_at"]:
-        when = f', список от <span data-iso="{html.escape(gh["updated_at"], quote=True)}">{html.escape(gh["updated_at"])}</span>'
-    return f"включено, {gh['region'].upper()}, доменов: {n}{when}"
+    if not w["healthy"]:
+        return "не отвечает, трафик идёт напрямую"
+    ip = f", выход {html.escape(w['exit_ip'])}" if w["exit_ip"] else ""
+    dns = ", DNS через WARP" if w["dns"] else ""
+    return f"работает, доменов: {len(w['domains'])}{dns}{ip}"
 
 
-def geohide_loop(stop_event: threading.Event):
-    while not stop_event.wait(600):
+def warp_loop(stop_event: threading.Event):
+    # Первая проверка вскоре после старта: если туннель не встал, правила
+    # снимутся раньше, чем клиенты успеют упереться в таймауты.
+    delay = 20
+    while not stop_event.wait(delay):
+        delay = WARP_CHECK_SECONDS
         try:
-            gh = get_geohide(load_creds())
-            if not gh["enabled"]:
+            w = get_warp(load_creds())
+            if not (w["enabled"] and w["account"]):
                 continue
-            last = gh["updated_at"]
-            due = (not last or (datetime.now(timezone.utc)
-                   - datetime.fromisoformat(last)).total_seconds() >= GEOHIDE_REFRESH_SECONDS)
-            if due:
-                with rotation_lock:
-                    geohide_apply(update_list=True)
+            with rotation_lock:
+                warp_check()
         except Exception:
             continue
 
@@ -1442,7 +1651,7 @@ async def lifespan(app: FastAPI):
         threading.Thread(target=poll_stats, args=(_stop_event,), daemon=True),
         threading.Thread(target=rotate_access_log, args=(_stop_event,), daemon=True),
         threading.Thread(target=rotation_loop, args=(_stop_event,), daemon=True),
-        threading.Thread(target=geohide_loop, args=(_stop_event,), daemon=True),
+        threading.Thread(target=warp_loop, args=(_stop_event,), daemon=True),
         threading.Thread(target=self_update.run, args=(_stop_event,), daemon=True),
         threading.Thread(target=selfcheck.run, args=(_stop_event, load_creds, XRAY_BIN), daemon=True),
         threading.Thread(target=notify.run, args=(_stop_event,), daemon=True),
@@ -1716,36 +1925,66 @@ def api_rotation_now():
                          "next_sni": rot["next_sni"], "error": rot["last_error"]})
 
 
-@app.get("/api/geohide")
-def api_geohide():
-    gh = get_geohide(load_creds())
-    gh["active_domains"] = len(geohide_domains(gh)) if gh["enabled"] else 0
-    gh["doh"] = geohide_doh_url(gh["region"])
-    return JSONResponse(gh)
+@app.get("/api/warp")
+def api_warp():
+    w = get_warp(load_creds())
+    acc = w.pop("account") or {}
+    # Ключи и токен устройства наружу не отдаём.
+    w["connected"] = bool(acc)
+    w["endpoint"] = acc.get("endpoint")
+    w["account_type"] = acc.get("account_type")
+    w["active_domains"] = len(warp_route_domains(load_creds()))
+    return JSONResponse(w)
 
 
-@app.post("/api/geohide")
-def api_geohide_save(enabled: str = Form(""), region: str = Form("eu"), extra: str = Form("")):
+@app.post("/api/warp/connect")
+def api_warp_connect():
+    """Зарегистрировать устройство WARP и сразу включить выход по списку."""
+    try:
+        account = warp_register()
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"регистрация WARP не удалась: {exc}")
     with rotation_lock, xray_restart_after_response():
         creds = load_creds()
-        gh = get_geohide(creds)
-        region_changed = region in GEOHIDE_REGIONS and region != gh["region"]
-        gh["enabled"] = bool(enabled)
-        if region in GEOHIDE_REGIONS:
-            gh["region"] = region
-        gh["extra"] = parse_domains(extra)
-        creds["geohide"] = gh
-        save_creds(creds)
-        need_list = gh["enabled"] and (region_changed or not GEOHIDE_DOMAINS_FILE.exists())
-        geohide_apply(update_list=need_list)
+        w = get_warp(creds)
+        warp_unregister(w["account"])
+        w.update(enabled=True, account=account, healthy=True, fails=0, exit_ip=None,
+                 last_error=None, registered_at=datetime.now(timezone.utc).isoformat())
+        warp_apply(creds, w)
+    return JSONResponse({"ok": True, "error": w["last_error"]})
+
+
+@app.post("/api/warp")
+def api_warp_save(enabled: str = Form(""), domains: str = Form(""), dns: str = Form("")):
+    with rotation_lock, xray_restart_after_response():
+        creds = load_creds()
+        w = get_warp(creds)
+        w["enabled"] = bool(enabled) and bool(w["account"])
+        w["domains"] = parse_domains(domains)
+        w["dns"] = bool(dns)
+        warp_apply(creds, w)
     return RedirectResponse(url="/", status_code=303)
 
 
-@app.post("/api/geohide/refresh")
-def api_geohide_refresh():
+@app.post("/api/warp/check")
+def api_warp_check():
     with rotation_lock, xray_restart_after_response():
-        gh = geohide_apply(update_list=True)
-    return JSONResponse({"count": gh["count"], "updated_at": gh["updated_at"], "error": gh["last_error"]})
+        w = warp_check()
+    return JSONResponse({"healthy": w["healthy"], "exit_ip": w["exit_ip"], "error": w["last_error"]})
+
+
+@app.post("/api/warp/disconnect")
+def api_warp_disconnect():
+    with rotation_lock, xray_restart_after_response():
+        creds = load_creds()
+        w = get_warp(creds)
+        account = w["account"]
+        domains = w["domains"]
+        w = warp_defaults()
+        w["domains"] = domains
+        warp_apply(creds, w)
+    warp_unregister(account)
+    return JSONResponse({"ok": True})
 
 
 @app.post("/api/rotation/check")
@@ -2169,35 +2408,35 @@ canvas.chart-canvas { width: 100%; height: 140px; display: block; }
 
   <div class="panel">
     <div class="panel-header">
-      <h2>GeoHide</h2>
-      <span class="eyebrow">@@GH_HEADLINE@@</span>
+      <h2>WARP</h2>
+      <span class="eyebrow">@@WARP_HEADLINE@@</span>
     </div>
     <div class="panel-body">
-      <form method="post" action="/api/geohide">
-        <div class="field-row">
-          <div class="field">
-            <label class="check"><input type="checkbox" name="enabled" @@GH_ENABLED@@> Обходить геоблоки через GeoHide</label>
-            <p class="field-hint">
-              Домены из списка GeoHide (ChatGPT, Claude, Gemini, Notion, Canva и др.)
-              релей резолвит через DoH GeoHide и ходит к ним через их прокси.
-              Остальной трафик идёт напрямую, как раньше. Список обновляется раз в сутки.
-            </p>
-          </div>
-          <div class="field">
-            <label for="f-gh-region">Регион списка и DNS</label>
-            <select id="f-gh-region" name="region">@@GH_REGION_OPTIONS@@</select>
-          </div>
+      <p class="field-hint">
+        Второй выход через Cloudflare WARP. Сайты из списка видят адрес Cloudflare
+        вместо сети хостера релея: это помогает там, где режут именно сеть хостера,
+        а не страну. Остальной трафик идёт напрямую. Если WARP перестаёт отвечать,
+        домены временно идут напрямую, а при восстановлении возвращаются в WARP.
+      </p>
+      <div class="btn-row" @@WARP_CONNECT_HIDDEN@@>
+        <button type="button" class="btn btn-primary" id="warp-connect-btn" onclick="warpConnect()">Подключить</button>
+      </div>
+      <form method="post" action="/api/warp" @@WARP_FORM_HIDDEN@@>
+        <div class="field">
+          <label class="check"><input type="checkbox" name="enabled" @@WARP_ENABLED@@> Пускать домены из списка через WARP</label>
+          <label class="check"><input type="checkbox" name="dns" @@WARP_DNS@@> Резолвить DNS через WARP (DoH 1.1.1.1): резолвер не видит хостера релея</label>
         </div>
         <div class="field">
-          <label for="f-gh-extra">Свои домены - по одному в строке (поддомены включаются)</label>
-          <textarea id="f-gh-extra" name="extra" rows="4">@@GH_EXTRA@@</textarea>
+          <label for="f-warp-domains">Домены - по одному в строке (поддомены включаются)</label>
+          <textarea id="f-warp-domains" name="domains" rows="10">@@WARP_DOMAINS@@</textarea>
         </div>
         <div class="btn-row">
           <button type="submit" class="btn btn-primary">Сохранить и применить</button>
-          <button type="button" class="btn" id="gh-refresh-btn" onclick="geohideRefresh()">Обновить список</button>
+          <button type="button" class="btn" id="warp-check-btn" onclick="warpCheck()">Проверить</button>
+          <button type="button" class="btn btn-danger" onclick="warpDisconnect()">Отключить</button>
         </div>
       </form>
-      <p class="field-hint hint-error">@@GH_ERROR@@</p>
+      <p class="field-hint hint-error">@@WARP_ERROR@@</p>
     </div>
   </div>
 
@@ -2231,16 +2470,33 @@ function localizeTimes() {
   // Сервер отдаёт UTC; человеку удобнее видеть своё время.
   document.querySelectorAll("[data-iso]").forEach(el => { el.textContent = fmtWhen(el.dataset.iso); });
 }
-async function geohideRefresh() {
-  const btn = document.getElementById("gh-refresh-btn");
-  btn.disabled = true; btn.textContent = "Скачиваю…";
+async function warpConnect() {
+  const btn = document.getElementById("warp-connect-btn");
+  btn.disabled = true; btn.textContent = "Регистрирую в Cloudflare…";
   try {
-    const r = await fetch("/api/geohide/refresh", { method: "POST" });
+    const r = await fetch("/api/warp/connect", { method: "POST" });
     const j = await r.json().catch(() => ({}));
-    if (j.error) alert(j.error);
+    if (!r.ok) alert(j.detail || ("Ошибка " + r.status));
+    else if (j.error) alert(j.error);
+  } finally {
+    setTimeout(() => location.reload(), 2500);
+  }
+}
+async function warpCheck() {
+  const btn = document.getElementById("warp-check-btn");
+  btn.disabled = true; btn.textContent = "Проверяю…";
+  try {
+    const r = await fetch("/api/warp/check", { method: "POST" });
+    const j = await r.json().catch(() => ({}));
+    alert(j.error ? j.error : ("WARP работает, выход " + (j.exit_ip || "?")));
   } finally {
     location.reload();
   }
+}
+async function warpDisconnect() {
+  if (!confirm("Отключить WARP и удалить устройство в Cloudflare?")) return;
+  await fetch("/api/warp/disconnect", { method: "POST" });
+  setTimeout(() => location.reload(), 2000);
 }
 async function rotateNow() {
   const btn = document.getElementById("rot-now-btn");
@@ -2699,7 +2955,7 @@ def index(response: Response):
         s = dict(state)
     creds = json.loads(CREDS_FILE.read_text()) if CREDS_FILE.exists() else {}
     rot = get_rotation(creds)
-    gh = get_geohide(creds)
+    warp = get_warp(creds)
     # current_host() здесь больше не зовём: при пустом PUBLIC_HOST он ходил
     # к ifconfig.me при КАЖДОМ открытии страницы, а страница опрашивается
     # дашбордом каждые несколько секунд. Ссылка на странице больше не нужна: она содержит UUID, то есть
@@ -2745,13 +3001,13 @@ def index(response: Response):
         "@@DEST_MAX_MS@@": str(DEST_MAX_HANDSHAKE_MS),
         "@@ROT_ERROR@@": html.escape(rot["last_error"] or ""),
         "@@ROT_HISTORY@@": rotation_history_html(rot),
-        "@@GH_HEADLINE@@": geohide_headline(gh),
-        "@@GH_ENABLED@@": "checked" if gh["enabled"] else "",
-        "@@GH_REGION_OPTIONS@@": "".join(
-            f'<option value="{r}"{" selected" if r == gh["region"] else ""}>{r.upper()}</option>'
-            for r in GEOHIDE_REGIONS),
-        "@@GH_EXTRA@@": html.escape("\n".join(gh["extra"])),
-        "@@GH_ERROR@@": html.escape(gh["last_error"] or ""),
+        "@@WARP_HEADLINE@@": warp_headline(warp),
+        "@@WARP_CONNECT_HIDDEN@@": "hidden" if warp["account"] else "",
+        "@@WARP_FORM_HIDDEN@@": "" if warp["account"] else "hidden",
+        "@@WARP_ENABLED@@": "checked" if warp["enabled"] else "",
+        "@@WARP_DNS@@": "checked" if warp["dns"] else "",
+        "@@WARP_DOMAINS@@": html.escape("\n".join(warp["domains"])),
+        "@@WARP_ERROR@@": html.escape(warp["last_error"] or ""),
     }
     for token, value in replacements.items():
         page_html = page_html.replace(token, value)
