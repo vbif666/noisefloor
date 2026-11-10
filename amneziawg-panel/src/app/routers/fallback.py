@@ -25,7 +25,7 @@ def _read(db: Session) -> FallbackRead:
     return FallbackRead(enabled=config.enabled, port=config.port, sni=config.sni, dest=config.dest,
                         cascade_running=cascade.is_running(), listening=cascade.fallback_listening(),
                         warning=cascade.fallback_warning(),
-                        clients=[_client_read(config, c, server.endpoint_host) for c in clients])
+                        clients=[_client_read(config, c, server.client_endpoint_host) for c in clients])
 
 
 def _client_or_404(db: Session, client_id: int) -> FallbackClient:
@@ -62,7 +62,7 @@ def create_client(body: FallbackClientCreate, db: Session = Depends(get_db), _ad
     db.add(client)
     db.commit()
     config_sync.apply_current_config(db)
-    return _client_read(config, client, config_sync.get_server(db).endpoint_host)
+    return _client_read(config, client, config_sync.get_server(db).client_endpoint_host)
 
 
 @router.patch("/clients/{client_id}", response_model=FallbackClientRead)
@@ -72,7 +72,7 @@ def update_client(client_id: int, body: FallbackClientUpdate, db: Session = Depe
     client.enabled = body.enabled
     db.commit()
     config_sync.apply_current_config(db)
-    return _client_read(fallback.get_config(db), client, config_sync.get_server(db).endpoint_host)
+    return _client_read(fallback.get_config(db), client, config_sync.get_server(db).client_endpoint_host)
 
 
 @router.delete("/clients/{client_id}", status_code=status.HTTP_204_NO_CONTENT)
@@ -85,5 +85,5 @@ def delete_client(client_id: int, db: Session = Depends(get_db), _admin: str = D
 @router.get("/clients/{client_id}/qrcode")
 def client_qrcode(client_id: int, db: Session = Depends(get_db), _admin: str = Depends(get_current_admin)):
     link = fallback.client_link(fallback.get_config(db), _client_or_404(db, client_id),
-                                config_sync.get_server(db).endpoint_host)
+                                config_sync.get_server(db).client_endpoint_host)
     return Response(content=config_to_png(link), media_type="image/png")

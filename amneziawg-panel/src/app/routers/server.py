@@ -1,3 +1,4 @@
+import ipaddress
 import platform
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -27,6 +28,13 @@ RESTART_FIELDS = frozenset({
     "jc", "jmin", "jmax", "s1", "s2", "s3", "s4",
     "h1", "h2", "h3", "h4", "i1", "i2", "i3", "i4", "i5",
 })
+
+
+def _is_ipv4_literal(value: str) -> bool:
+    try:
+        return isinstance(ipaddress.ip_address(value), ipaddress.IPv4Address)
+    except ValueError:
+        return False
 
 
 @router.put("", response_model=ServerRead)
@@ -60,6 +68,21 @@ def update_server(
         except cascade.VlessParseError as exc:
             raise HTTPException(status_code=400, detail=f"Ссылка каскада: {exc}") from exc
 
+    # IPv6: адрес должен быть IPv6-литералом или именем, а переключение на
+    # IPv6 без адреса оставило бы клиентам Endpoint по IPv4 молча.
+    if "endpoint_host_v6" in updates:
+        value_v6 = (updates["endpoint_host_v6"] or "").strip().strip("[]")
+        if value_v6 and _is_ipv4_literal(value_v6):
+            raise HTTPException(status_code=400, detail="Адрес IPv6: указан адрес IPv4")
+        updates["endpoint_host_v6"] = value_v6
+    if updates.get("ip_family", server.ip_family) == "6" and not (
+        updates.get("endpoint_host_v6", server.endpoint_host_v6) or ""
+    ).strip():
+        raise HTTPException(
+            status_code=400,
+            detail="Нельзя переключиться на IPv6: не задан IPv6-адрес сервера для клиентов",
+        )
+
     changed = {f for f, v in updates.items() if getattr(server, f) != v}
     for field, value in updates.items():
         setattr(server, field, value)
@@ -84,6 +107,10 @@ def update_server(
     # MTU у дополнительных протоколов общий с основным.
     restart_tunnels = frozenset(t.protocol for t in config_sync.get_tunnels(db)) if "mtu" in changed else frozenset()
     config_sync.apply_current_config(db, restart=restart, restart_tunnels=restart_tunnels)
+    # Смена семейства меняет адрес релея в ссылке каскада: забираем её у
+    # релея сразу, не дожидаясь планового опроса.
+    if "ip_family" in changed and server.cascade_enabled:
+        cascade_sync.sync_once(db)
     db.refresh(server)
     return server
 

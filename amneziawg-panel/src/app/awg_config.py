@@ -283,6 +283,19 @@ def tunnel_config(tunnel: Tunnel, server: ServerConfig, peers: list[Peer]) -> st
     return "\n\n".join(blocks) + "\n"
 
 
+def _peer_endpoint_host(peer, server) -> str:
+    """Адрес для Endpoint клиента: его собственное семейство, иначе серверное.
+    Если для выбранного семейства адреса нет - берём серверный, а не пустое."""
+    family = getattr(peer, "endpoint_family", "") or ""
+    if family == "4":
+        host = (server.endpoint_host or "").strip()
+    elif family == "6":
+        host = (getattr(server, "endpoint_host_v6", "") or "").strip()
+    else:
+        host = ""
+    return host or server.client_endpoint_host
+
+
 def client_config(peer: Peer, server: ServerConfig, tunnel: Tunnel | None = None) -> str:
     """Конфиг, который клиент импортирует в приложение AmneziaWG / сканирует как QR.
 
@@ -316,7 +329,7 @@ def client_config(peer: Peer, server: ServerConfig, tunnel: Tunnel | None = None
     lines.append("[Peer]")
     lines.append(f"PublicKey = {(tunnel or server).public_key}")
     lines.append(f"PresharedKey = {peer.preshared_key}")
-    endpoint_host = server.endpoint_host or "YOUR_SERVER_HOST_OR_IP"
+    endpoint_host = _peer_endpoint_host(peer, server) or "YOUR_SERVER_HOST_OR_IP"
     if ":" in endpoint_host and not endpoint_host.startswith("["):
         endpoint_host = f"[{endpoint_host}]"  # IPv6 в Endpoint — только в скобках
     lines.append(f"Endpoint = {endpoint_host}:{(tunnel or server).listen_port}")

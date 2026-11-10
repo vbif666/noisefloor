@@ -502,6 +502,8 @@ async function loadServer() {
 // (routers/server.py, RESTART_FIELDS): интерфейс лишь заранее предупреждает.
 const SERVER_FIELDS = [
   ["endpoint_host", "f-endpoint-host", "Сеть", false, "text"],
+  ["endpoint_host_v6", "f-endpoint-host-v6", "Сеть", false, "text"],
+  ["ip_family", "f-ip-family", "Сеть", false, "text"],
   ["listen_port", "f-listen-port", "Сеть", true, "number"],
   ["address", "f-address", "Сеть", true, "text"],
   ["dns", "f-dns", "Сеть", false, "text"],
@@ -1151,6 +1153,7 @@ function openAddPeerDialog() {
   $("add-peer-form").reset();
   $("np-allowed").value = "0.0.0.0/0, ::/0";
   $("np-keepalive").value = 25;
+  $("np-family").value = "";
   // Выключенный протокол выбрать нельзя: сервер его не слушает.
   for (const radio of protocolRadios()) {
     const sub = radio.closest(".proto-option").querySelector(".proto-sub");
@@ -1180,6 +1183,7 @@ $("add-peer-form").addEventListener("submit", async (e) => {
     dns_override: $("np-dns").value.trim() || null,
     note: $("np-note").value.trim() || null,
     protocol: selectedProtocol(),
+    endpoint_family: $("np-family").value,
   };
   const btn = $("add-peer-submit");
   btn.disabled = true;
@@ -1209,6 +1213,7 @@ async function openPeerDialog(id) {
   const proto = PROTOCOLS[peer.protocol] || PROTOCOLS.awg2;
   $("peer-dialog-protocol").textContent = `${proto.name}. ${proto.hint}`;
   $("peer-config-text").textContent = peer.config_text;
+  $("peer-family").value = peer.endpoint_family || "";
   $("peer-toggle-btn").textContent = peer.enabled ? "Выключить" : "Включить";
 
   const img = $("peer-qr-img");
@@ -1226,6 +1231,20 @@ async function openPeerDialog(id) {
 
   $("peer-dialog").showModal();
 }
+
+$("peer-family").addEventListener("change", async (e) => {
+  const select = e.target;
+  try {
+    await api(`/peers/${activePeerId}`, { method: "PATCH", body: JSON.stringify({ endpoint_family: select.value }) });
+    const peer = await api(`/peers/${activePeerId}`);
+    $("peer-config-text").textContent = peer.config_text;
+    showToast("Адрес подключения изменён, скачайте конфиг заново");
+  } catch (err) {
+    showToast(err.message, true);
+    const peer = await api(`/peers/${activePeerId}`);
+    select.value = peer.endpoint_family || "";
+  }
+});
 
 $("peer-copy-btn").addEventListener("click", async () => {
   const text = $("peer-config-text").textContent;
