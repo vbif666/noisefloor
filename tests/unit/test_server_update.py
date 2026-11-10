@@ -18,6 +18,8 @@ class _Server:
     mtu = 1420
     dns = "1.1.1.1"
     endpoint_host = "1.2.3.4"
+    endpoint_host_v6 = ""
+    ip_family = "4"
     cascade_enabled = False
     cascade_vless_url = ""
     cascade_sync_url = ""
@@ -101,3 +103,62 @@ class HeaderProtectionPaddingTests(unittest.TestCase):
 
     def test_floor_value_accepted(self):
         self.assertTrue(_save(s2=12)["restart"])
+
+
+class IpFamilyTests(unittest.TestCase):
+    V6 = "2a03:6f00:a::432b"
+
+    def _save_with_sync(self, server=None, **changes):
+        server = server or _Server()
+        with mock.patch.object(server_router.cascade_sync, "sync_once") as sync:
+            kwargs = _save(server, **changes)
+        return server, sync, kwargs
+
+    def test_switch_to_v6_without_address_is_rejected(self):
+        from fastapi import HTTPException
+        with self.assertRaises(HTTPException) as ctx:
+            _save(ip_family="6")
+        self.assertEqual(ctx.exception.status_code, 400)
+
+    def test_switch_with_address_in_same_request(self):
+        server, _, _ = self._save_with_sync(endpoint_host_v6=self.V6, ip_family="6")
+        self.assertEqual((server.ip_family, server.endpoint_host_v6), ("6", self.V6))
+
+    def test_switch_with_stored_address(self):
+        server = _Server()
+        server.endpoint_host_v6 = self.V6
+        server, _, _ = self._save_with_sync(server, ip_family="6")
+        self.assertEqual(server.ip_family, "6")
+
+    def test_ipv4_in_v6_field_is_rejected(self):
+        from fastapi import HTTPException
+        with self.assertRaises(HTTPException):
+            _save(endpoint_host_v6="203.0.113.5")
+
+    def test_brackets_are_stripped(self):
+        server, _, _ = self._save_with_sync(endpoint_host_v6=f"[{self.V6}]")
+        self.assertEqual(server.endpoint_host_v6, self.V6)
+
+    def test_unknown_family_is_rejected_by_schema(self):
+        from pydantic import ValidationError
+        with self.assertRaises(ValidationError):
+            ServerUpdate(ip_family="5")
+
+    def test_family_change_resyncs_cascade_once(self):
+        server = _Server()
+        server.cascade_enabled = True
+        server.endpoint_host_v6 = self.V6
+        _, sync, _ = self._save_with_sync(server, ip_family="6")
+        sync.assert_called_once()
+
+    def test_family_change_without_cascade_does_not_sync(self):
+        server = _Server()
+        server.endpoint_host_v6 = self.V6
+        _, sync, _ = self._save_with_sync(server, ip_family="6")
+        sync.assert_not_called()
+
+    def test_family_change_needs_no_tunnel_restart(self):
+        server = _Server()
+        server.endpoint_host_v6 = self.V6
+        _, _, kwargs = self._save_with_sync(server, ip_family="6")
+        self.assertFalse(kwargs["restart"])

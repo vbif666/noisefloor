@@ -265,3 +265,29 @@ class RotationTimingTests(unittest.TestCase):
         # Релей объявил, но ещё не переключился: ждём, а не долбим.
         at = self.NOW - timedelta(seconds=30)
         self.assertEqual(cascade_sync.wait_seconds(at, self.NOW), cascade_sync.MIN_WAIT_SECONDS)
+
+
+class IpFamilyTests(unittest.TestCase):
+    V6 = "2a03:6f02::3127"
+
+    def test_family_6_uses_relay_ipv6_address(self):
+        url = cascade_sync.build_url(dict(RELAY_ANSWER, host_v6=self.V6), family="6")
+        self.assertIn(f"@[{self.V6}]:", url)
+        parsed = cascade.parse_vless_url(url)
+        self.assertEqual(parsed["host"], self.V6)
+        self.assertEqual(parsed["uuid"], RELAY_ANSWER["uuid"])
+
+    def test_family_4_ignores_relay_ipv6_address(self):
+        url = cascade_sync.build_url(dict(RELAY_ANSWER, host_v6=self.V6), family="4")
+        self.assertEqual(cascade.parse_vless_url(url)["host"], RELAY_ANSWER["host"])
+
+    def test_default_family_is_4(self):
+        url = cascade_sync.build_url(dict(RELAY_ANSWER, host_v6=self.V6))
+        self.assertEqual(cascade.parse_vless_url(url)["host"], RELAY_ANSWER["host"])
+
+    def test_family_6_without_relay_ipv6_is_an_error_not_a_silent_v4(self):
+        # Тихий откат на IPv4 выдал бы переключение за выполненное.
+        for answer in (RELAY_ANSWER, dict(RELAY_ANSWER, host_v6="")):
+            with self.subTest(answer=answer.get("host_v6")), \
+                    self.assertRaises(cascade_sync.SyncError):
+                cascade_sync.build_url(answer, fallback_host="198.51.100.7", family="6")

@@ -63,6 +63,18 @@ class ServerConfig(Base):
 
     # Публичный адрес/домен, на который будут подключаться клиенты
     endpoint_host = Column(String(255), default="")
+    # Тот же сервер по IPv6 и выбранное семейство адресов. "4" - клиентам и
+    # каскаду отдаются адреса IPv4 (как было всегда), "6" - IPv6. Переключение
+    # меняет Endpoint в клиентских конфигах и адрес релея в ссылке каскада.
+    endpoint_host_v6 = Column(String(255), default="")
+    ip_family = Column(String(2), default="4", nullable=False)
+
+    @property
+    def client_endpoint_host(self) -> str:
+        """Адрес для Endpoint в клиентских конфигах с учётом семейства."""
+        if self.ip_family == "6" and (self.endpoint_host_v6 or "").strip():
+            return self.endpoint_host_v6.strip()
+        return self.endpoint_host or ""
     # Интерфейс с выходом в интернет, для NAT (PostUp/PostDown MASQUERADE)
     egress_interface = Column(String(32), default="eth0")
 
@@ -267,6 +279,9 @@ class Peer(Base):
     # Через какой интерфейс подключается клиент (PROTOCOLS). Меняется только
     # пересозданием: адрес выдаётся из подсети конкретного интерфейса.
     protocol = Column(String(8), default="awg2", nullable=False)
+    # Адрес в Endpoint этого клиента: "" - как настроено на сервере, "4" или "6" -
+    # принудительно IPv4 или IPv6. Каскад от этого не зависит.
+    endpoint_family = Column(String(2), default="", nullable=False)
     # Служебный пир панели (канарейка): в списке клиентов не показывается и
     # через API клиентов недоступен.
     is_service = Column(Boolean, default=False, nullable=False)

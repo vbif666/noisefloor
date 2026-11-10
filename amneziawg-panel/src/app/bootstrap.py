@@ -4,6 +4,7 @@
 """
 from __future__ import annotations
 
+import ipaddress
 import secrets
 import socket
 
@@ -41,6 +42,22 @@ def _detect_public_ip() -> str:
         if ip and not ip.startswith(("127.", "169.254.")):
             return ip
     except OSError:
+        pass
+    return ""
+
+
+def _detect_public_ipv6() -> str:
+    """Глобальный IPv6 сервера, как _detect_public_ip: пакеты не уходят,
+    ОС лишь выбирает исходящий адрес. Адреса fe80::, ULA (fc00::/7) и
+    loopback не годятся - снаружи они недоступны."""
+    try:
+        with socket.socket(socket.AF_INET6, socket.SOCK_DGRAM) as s:
+            s.connect(("2001:4860:4860::8888", 80))
+            ip = s.getsockname()[0].split("%")[0]
+        addr = ipaddress.IPv6Address(ip)
+        if addr.is_global:
+            return str(addr)
+    except (OSError, ValueError):
         pass
     return ""
 
@@ -91,6 +108,13 @@ def ensure_server_config(db: Session) -> None:
                 existing.endpoint_host = detected
                 db.add(existing)
                 db.commit()
+        # IPv6 только запоминаем, семейство не переключаем: это решает админ.
+        if not existing.endpoint_host_v6:
+            detected_v6 = _detect_public_ipv6()
+            if detected_v6:
+                existing.endpoint_host_v6 = detected_v6
+                db.add(existing)
+                db.commit()
         # Основной интерфейс — AmneziaWG 3.1. Сервер, поднятый ещё на 2.0,
         # переводим один раз: выданные раньше конфиги после этого перестают
         # подключаться, клиентам нужны новые (и Amnezia 5.0.3+).
@@ -118,6 +142,7 @@ def ensure_server_config(db: Session) -> None:
         listen_port=settings.default_listen_port,
         dns=settings.default_dns,
         endpoint_host=_detect_public_ip(),
+        endpoint_host_v6=_detect_public_ipv6(),
         egress_interface=settings.egress_interface,
         i1="", i2="", i3="", i4="", i5="",
         **random_obfuscation_profile(),

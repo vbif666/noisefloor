@@ -43,6 +43,21 @@ def _client_config(db: Session, peer: Peer, server) -> str:
     return awg_config.client_config(peer, server, tunnel)
 
 
+def _check_family(server, family: str | None) -> None:
+    """IPv6 для клиента нельзя выбрать, пока на сервере нет IPv6-адреса:
+    иначе конфиг молча остался бы на IPv4."""
+    if family == "6" and not (server.endpoint_host_v6 or "").strip():
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Для IPv6 задайте IPv6-адрес сервера на вкладке «Сервер», блок «Сеть»",
+        )
+    if family == "4" and not (server.endpoint_host or "").strip():
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Для IPv4 задайте публичный адрес сервера на вкладке «Сервер», блок «Сеть»",
+        )
+
+
 def _get_peer_or_404(db: Session, peer_id: int) -> Peer:
     peer = db.get(Peer, peer_id)
     if peer is None or peer.is_service:
@@ -61,6 +76,7 @@ def list_peers(db: Session = Depends(get_db), _admin: str = Depends(get_current_
 @router.post("", response_model=PeerWithConfig, status_code=status.HTTP_201_CREATED)
 def create_peer(payload: PeerCreate, db: Session = Depends(get_db), _admin: str = Depends(get_current_admin)):
     server = config_sync.get_server(db)
+    _check_family(server, payload.endpoint_family)
 
     subnet = server.address
     if payload.protocol != PROTOCOL_AWG2:
@@ -99,6 +115,7 @@ def create_peer(payload: PeerCreate, db: Session = Depends(get_db), _admin: str 
             enabled=True,
             note=payload.note,
             protocol=payload.protocol,
+            endpoint_family=payload.endpoint_family,
         )
         db.add(peer)
         db.commit()
@@ -127,7 +144,12 @@ def update_peer(
     _admin: str = Depends(get_current_admin),
 ):
     peer = _get_peer_or_404(db, peer_id)
-    for field, value in payload.model_dump(exclude_unset=True).items():
+    changes = payload.model_dump(exclude_unset=True)
+    if changes.get("endpoint_family") is None:
+        changes.pop("endpoint_family", None)
+    else:
+        _check_family(config_sync.get_server(db), changes["endpoint_family"])
+    for field, value in changes.items():
         setattr(peer, field, value)
     db.add(peer)
     db.commit()

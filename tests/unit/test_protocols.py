@@ -15,6 +15,7 @@ from unittest import mock
 from fastapi import HTTPException
 
 from app import awg_config, obfuscation
+from app.models import ServerConfig
 from app.routers import tunnels as tunnels_router
 
 
@@ -27,6 +28,9 @@ class _Server:
     dns = "1.1.1.1"
     mtu = 1420
     endpoint_host = "vpn.example.com"
+    endpoint_host_v6 = ""
+    ip_family = "4"
+    client_endpoint_host = ServerConfig.client_endpoint_host
     egress_interface = "eth0"
     cascade_enabled = False
     cascade_vless_url = ""
