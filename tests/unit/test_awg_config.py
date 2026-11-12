@@ -14,7 +14,6 @@ from pathlib import Path
 from unittest import mock
 
 from app import awg_config, cascade
-from app.models import ServerConfig
 
 
 class _Server:
@@ -28,9 +27,6 @@ class _Server:
     dns = "1.1.1.1"
     mtu = 1420
     endpoint_host = "vpn.example.com"
-    endpoint_host_v6 = ""
-    ip_family = "4"
-    client_endpoint_host = ServerConfig.client_endpoint_host
     egress_interface = "eth0"
     cascade_enabled = False
     cascade_vless_url = ""
@@ -329,26 +325,6 @@ class ClientConfigTests(unittest.TestCase):
         text = awg_config.client_config(_Peer(), _Server())
         self.assertIn("Endpoint = vpn.example.com:443", text)
         self.assertIn("PresharedKey = PEER_PSK=", text)
-
-    def test_ipv6_family_puts_v6_address_in_brackets(self):
-        server = _Server()
-        server.endpoint_host_v6 = "2a03:6f00:a::432b"
-        server.ip_family = "6"
-        self.assertIn("Endpoint = [2a03:6f00:a::432b]:443",
-                      awg_config.client_config(_Peer(), server))
-
-    def test_ipv4_family_ignores_stored_v6_address(self):
-        server = _Server()
-        server.endpoint_host_v6 = "2a03:6f00:a::432b"
-        self.assertIn("Endpoint = vpn.example.com:443",
-                      awg_config.client_config(_Peer(), server))
-
-    def test_ipv6_family_without_v6_address_keeps_v4(self):
-        # Переключатель без адреса не должен оставлять клиента с пустым Endpoint.
-        server = _Server()
-        server.ip_family = "6"
-        self.assertIn("Endpoint = vpn.example.com:443",
-                      awg_config.client_config(_Peer(), server))
 
     def test_peer_dns_override_wins(self):
         peer = _Peer()

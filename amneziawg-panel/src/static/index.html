@@ -142,24 +142,6 @@
               </div>
               <div class="field-row">
                 <div class="field">
-                  <label for="f-endpoint-host-v6">Публичный адрес сервера по IPv6</label>
-                  <input id="f-endpoint-host-v6" placeholder="2001:db8::1" />
-                </div>
-                <div class="field">
-                  <label for="f-ip-family">Адреса в конфигах клиентов и каскаде</label>
-                  <select id="f-ip-family">
-                    <option value="4">IPv4</option>
-                    <option value="6">IPv6</option>
-                  </select>
-                </div>
-              </div>
-              <p class="field-hint">
-                Переключатель меняет <code>Endpoint</code> в конфигах клиентов и адрес
-                релея в ссылке каскада. Выданные раньше конфиги перескачайте. Для IPv6
-                у релея должен быть IPv6-адрес (<code>PUBLIC_HOST_V6</code>).
-              </p>
-              <div class="field-row">
-                <div class="field">
                   <label for="f-address">Подсеть туннеля</label>
                   <input id="f-address" placeholder="10.13.13.1/24" />
                 </div>
@@ -570,14 +552,6 @@
           <input id="np-dns" placeholder="по умолчанию сервера" />
         </div>
       </div>
-      <div class="field">
-        <label for="np-family">Адрес подключения</label>
-        <select id="np-family">
-          <option value="">Как на сервере</option>
-          <option value="4">IPv4</option>
-          <option value="6">IPv6</option>
-        </select>
-      </div>
       <div class="field" style="margin-bottom:0;">
         <label for="np-note">Заметка (необязательно)</label>
         <input id="np-note" placeholder="" />
@@ -597,14 +571,6 @@
   </div>
   <div class="modal-body">
     <p class="field-hint" id="peer-dialog-protocol" style="margin-top:0;"></p>
-    <div class="field">
-      <label for="peer-family">Адрес подключения</label>
-      <select id="peer-family">
-        <option value="">Как на сервере</option>
-        <option value="4">IPv4</option>
-        <option value="6">IPv6</option>
-      </select>
-    </div>
     <div class="qr-wrap"><img id="peer-qr-img" alt="QR-код конфигурации" width="220" height="220" /></div>
     <div class="config-actions">
       <button class="btn btn-sm" id="peer-copy-btn">Скопировать конфиг</button>

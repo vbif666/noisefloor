@@ -27,7 +27,6 @@ import hashlib
 import hmac
 import html
 import io
-import ipaddress
 import json
 import os
 import random
@@ -174,9 +173,6 @@ DEST_CHECK_ATTEMPTS = 3
 # проходит при новом dest, без него — нет.
 SNI_GRACE_SECONDS = 15 * 60
 PUBLIC_HOST = os.environ.get("PUBLIC_HOST", "")
-# IPv6-адрес релея для панелей, которым выбрано семейство IPv6. Пусто -
-# определится сам; на сервере без IPv6 останется пустым.
-PUBLIC_HOST_V6 = os.environ.get("PUBLIC_HOST_V6", "")
 LABEL = os.environ.get("LABEL", "vless-reality")
 # Имя переменной единое с панелью — ADMIN_USERNAME. Прежнее ADMIN_USER
 # оставлено синонимом, чтобы не сломать уже развёрнутые инсталляции:
@@ -1687,31 +1683,6 @@ def current_host() -> str:
         return "YOUR-SERVER-IP"
 
 
-_host_v6_cache: dict = {"at": 0.0, "value": ""}
-
-
-def current_host_v6() -> str:
-    """IPv6-адрес для панелей с семейством IPv6. Кэш на 5 минут: /api/sync
-    опрашивается часто, а определение ходит в интернет."""
-    if PUBLIC_HOST_V6:
-        return PUBLIC_HOST_V6
-    now = time.monotonic()
-    if now - _host_v6_cache["at"] < 300 and _host_v6_cache["at"]:
-        return _host_v6_cache["value"]
-    value = ""
-    try:
-        out = subprocess.run(
-            ["sh", "-c", "curl -6 -s --max-time 3 https://ifconfig.me || true"],
-            capture_output=True, text=True,
-        ).stdout.strip()
-        if ":" in out and ipaddress.ip_address(out).version == 6:
-            value = out
-    except Exception:
-        value = ""
-    _host_v6_cache.update(at=now, value=value)
-    return value
-
-
 def human_bytes(n: int) -> str:
     for unit in ("B", "KB", "MB", "GB", "TB"):
         if n < 1024:
@@ -1812,7 +1783,6 @@ def api_sync():
         "label": LABEL,
         "codename": APP_CODENAME,
         "host": host,
-        "host_v6": current_host_v6(),
         "port": creds["vless_port"],
         "uuid": creds["uuid"],
         "public_key": creds["public_key"],

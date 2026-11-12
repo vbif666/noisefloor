@@ -35,8 +35,6 @@ _SERVER_CONFIG_MIGRATIONS = [
     ("cascade_sync_cert_pin", "ALTER TABLE server_config ADD COLUMN cascade_sync_cert_pin VARCHAR(400)"),
     ("header_protection_key", "ALTER TABLE server_config ADD COLUMN header_protection_key VARCHAR(64) DEFAULT ''"),
     ("cascade_all_down", "ALTER TABLE server_config ADD COLUMN cascade_all_down VARCHAR(8) NOT NULL DEFAULT 'block'"),
-    ("endpoint_host_v6", "ALTER TABLE server_config ADD COLUMN endpoint_host_v6 VARCHAR(255) DEFAULT ''"),
-    ("ip_family", "ALTER TABLE server_config ADD COLUMN ip_family VARCHAR(2) NOT NULL DEFAULT '4'"),
 ]
 
 
@@ -45,7 +43,6 @@ _SERVER_CONFIG_MIGRATIONS = [
 _PEER_MIGRATIONS = [
     ("protocol", "ALTER TABLE peers ADD COLUMN protocol VARCHAR(8) NOT NULL DEFAULT 'awg2'"),
     ("is_service", "ALTER TABLE peers ADD COLUMN is_service BOOLEAN NOT NULL DEFAULT 0"),
-    ("endpoint_family", "ALTER TABLE peers ADD COLUMN endpoint_family VARCHAR(2) NOT NULL DEFAULT ''"),
 ]
 
 

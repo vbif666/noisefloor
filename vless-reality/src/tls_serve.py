@@ -11,7 +11,6 @@ HTTPS-соединения сразу получают свежий сертиф
 Этот файл одинаковый в amneziawg-panel и vless-reality - правьте оба.
 """
 import os
-import socket
 import subprocess
 import sys
 import threading
@@ -72,51 +71,11 @@ def _watch(config: uvicorn.Config, tls_dir: str, stop: threading.Event) -> None:
             _log(f"проверка сертификата не удалась: {exc}; повторю через {CHECK_SECONDS} с")
 
 
-def listen_host(host: str) -> str:
-    """0.0.0.0 -> :: (двойной стек), если на хосте есть IPv6 и ядро слушает
-    :: сразу и по IPv4. Иначе остаётся как было: панель не должна пропасть из
-    IPv4 из-за того, что на сервере IPv6 нет или bindv6only=1."""
-    if host != "0.0.0.0" or not socket.has_ipv6:
-        return host
-    try:
-        if open("/proc/sys/net/ipv6/bindv6only").read().strip() != "0":
-            return host
-        with socket.socket(socket.AF_INET6, socket.SOCK_STREAM) as probe:
-            probe.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
-            probe.bind(("::", 0))
-    except OSError:
-        return host
-    return "::"
-
-
-def bind_dual_stack(port: int) -> socket.socket:
-    """Сокет на :: с принятием и IPv4. asyncio при host="::" сам включает
-    IPV6_V6ONLY, и IPv4 пропадал бы, поэтому сокет собираем руками и отдаём
-    uvicorn готовым."""
-    sock = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
-    try:
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
-        sock.bind(("::", port))
-        sock.listen(2048)
-        sock.set_inheritable(True)
-    except OSError:
-        sock.close()
-        raise
-    return sock
-
-
 def main(argv: list[str]) -> None:
     if len(argv) != 4:
         sys.exit("использование: tls_serve МОДУЛЬ:APP ХОСТ ПОРТ КАТАЛОГ_TLS")
     app, host, port, tls_dir = argv
     ensure_cert(tls_dir)
-    sockets = None
-    if listen_host(host) == "::":
-        try:
-            sockets = [bind_dual_stack(int(port))]
-        except OSError as exc:
-            _log(f"двойной стек не вышел ({exc}) - слушаю только IPv4")
     config = uvicorn.Config(
         app, host=host, port=int(port),
         ssl_keyfile=str(Path(tls_dir) / "key.pem"),
@@ -127,7 +86,7 @@ def main(argv: list[str]) -> None:
     threading.Thread(target=_watch, args=(config, tls_dir, stop),
                      name="tls-renew", daemon=True).start()
     try:
-        server.run(sockets=sockets)
+        server.run()
     finally:
         stop.set()
 

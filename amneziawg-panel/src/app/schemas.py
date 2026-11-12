@@ -53,8 +53,6 @@ class ServerRead(BaseModel):
     mtu: int | None
     effective_mtu: int
     endpoint_host: str
-    endpoint_host_v6: str = ""
-    ip_family: str = "4"
     egress_interface: str
     cascade_enabled: bool
     cascade_vless_url: str
@@ -94,8 +92,6 @@ class ServerUpdate(BaseModel):
     dns: str | None = None
     mtu: int | None = None
     endpoint_host: str | None = None
-    endpoint_host_v6: str | None = None
-    ip_family: Literal["4", "6"] | None = None
     egress_interface: str | None = None
     cascade_enabled: bool | None = None
     cascade_vless_url: str | None = None
@@ -256,8 +252,6 @@ class PeerCreate(BaseModel):
     dns_override: str | None = None
     persistent_keepalive: int = Field(default=25, ge=0, le=3600)
     note: str | None = None
-    # "" - как на сервере, "4" или "6" - адрес в Endpoint именно этого клиента.
-    endpoint_family: Literal["", "4", "6"] = ""
     # awg2 — основной интерфейс (3.1); awg20, awg1 и wg — дополнительные, их нужно
     # сначала включить на вкладке «Сервер».
     protocol: Protocol = "awg2"
@@ -270,7 +264,6 @@ class PeerUpdate(BaseModel):
     dns_override: str | None = None
     persistent_keepalive: int | None = Field(default=None, ge=0, le=3600)
     note: str | None = None
-    endpoint_family: Literal["", "4", "6"] | None = None
 
 
 class PeerRead(BaseModel):
@@ -286,7 +279,6 @@ class PeerRead(BaseModel):
     enabled: bool
     note: str | None
     protocol: Protocol = "awg2"
-    endpoint_family: str = ""
     created_at: UtcDatetime
 
     # живой статус (заполняется отдельно, не хранится в БД)

@@ -199,26 +199,15 @@ def fetch_params(base_url: str, token: str, pin_record: str = "") -> tuple[dict,
     return payload, fingerprint
 
 
-def build_url(params: dict, fallback_host: str = "", family: str = "4") -> str:
+def build_url(params: dict, fallback_host: str = "") -> str:
     """Собирает ссылку vless:// из ответа релея.
 
     Хост берём из ответа, но релей может не знать своего публичного адреса
     (PUBLIC_HOST не задан, определение через интернет не сработало). Тогда
     используем тот адрес, по которому мы до него только что достучались, —
-    он заведомо рабочий.
-
-    family="6": берём IPv6-адрес релея (host_v6). Если релей его не знает,
-    ссылку не меняем, а возвращаем ошибку: тихий откат на IPv4 выдал бы
-    переключение за выполненное."""
+    он заведомо рабочий."""
     host = (params.get("host") or "").strip()
-    if family == "6":
-        host = (params.get("host_v6") or "").strip()
-        if not host:
-            raise SyncError(
-                "Релей не сообщил свой IPv6-адрес: на релее нет IPv6 или не задан "
-                "PUBLIC_HOST_V6. Каскад остался на прежнем адресе"
-            )
-    elif not host or host == "YOUR-SERVER-IP":
+    if not host or host == "YOUR-SERVER-IP":
         host = fallback_host
     if not host:
         raise SyncError("Релей не сообщил свой публичный адрес, и подставить нечего")
@@ -273,11 +262,11 @@ def host_of(base_url: str) -> str:
     return urllib.parse.urlparse(base).hostname or ""
 
 
-def _fetch(sync_url: str, token: str, pin: str, family: str = "4") -> tuple[dict, str, str] | SyncError:
+def _fetch(sync_url: str, token: str, pin: str) -> tuple[dict, str, str] | SyncError:
     """Ответ одного релея или ошибка. Без обращения к БД: работает в своём потоке."""
     try:
         params, fingerprint = fetch_params(sync_url, token, pin)
-        return params, fingerprint, build_url(params, fallback_host=host_of(sync_url), family=family)
+        return params, fingerprint, build_url(params, fallback_host=host_of(sync_url))
     except SyncError as exc:
         return exc
 
@@ -320,8 +309,7 @@ def sync_once(db) -> tuple[bool, str | None]:
 
     # Параллельно: сюда приходит сохранение настроек, и один лежащий релей с
     # таймаутом 10 с не должен умножаться на число релеев.
-    family = server.ip_family or "4"
-    requests = [(r.sync_url, r.sync_token or "", r.sync_cert_pin or "", family) for r in targets]
+    requests = [(r.sync_url, r.sync_token or "", r.sync_cert_pin or "") for r in targets]
     with ThreadPoolExecutor(max_workers=len(requests)) as pool:
         answers = list(pool.map(lambda args: _fetch(*args), requests))
 
