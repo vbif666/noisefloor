@@ -54,6 +54,12 @@ class Settings(BaseSettings):
     # TCP-порт VLESS для новой установки. install.sh и `noisefloor update` пишут
     # сюда 8443, если 443 на хосте занят чужой программой (fallback.py).
     vless_port: int = Field(default=443, ge=1, le=65535)
+    # Минимальная версия клиента для входа VLESS. xray 26.7 без этой настройки
+    # пускает на REALITY только Xray-core от v26.3.27, а приложения на sing-box
+    # (Hiddify, NekoBox, Karing) представляются как 1.8.0 и получают отказ:
+    # «reality verification failed», у пользователя «сбой подключения».
+    # Пустая строка - порог xray по умолчанию.
+    vless_min_client_ver: str = Field(default="1.8.0", pattern=r"^(\d+\.\d+\.\d+)?$")
 
     # Docker-шаблон: поднять интерфейс автоматически при старте контейнера,
     # без ручного нажатия "Apply" в панели. Оригинальный (не-docker) деплой

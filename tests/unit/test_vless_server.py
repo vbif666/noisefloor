@@ -45,6 +45,18 @@ class ConfigTests(unittest.TestCase):
         # Без разрешения имени ip-правило не видело бы, куда ведёт имя.
         self.assertEqual(self.config["routing"]["domainStrategy"], "IPOnDemand")
 
+    def test_sing_box_clients_are_let_in(self):
+        # xray 26.7 по умолчанию отказывает всем клиентам старше v26.3.27, а
+        # sing-box (Hiddify, NekoBox) представляется как 1.8.0. Проверено вживую:
+        # без этой строки «reality verification failed», с ней проходит.
+        reality = self.config["inbounds"][0]["streamSettings"]["realitySettings"]
+        self.assertEqual(reality["minClientVer"], "1.8.0")
+
+    def test_empty_min_version_keeps_xray_default(self):
+        with mock.patch.object(cascade.settings, "vless_min_client_ver", ""):
+            reality = vless_server.build_config(FB)["inbounds"][0]["streamSettings"]["realitySettings"]
+        self.assertNotIn("minClientVer", reality)
+
     def test_no_cascade_parts(self):
         tags = {o["tag"] for o in self.config["outbounds"]}
         self.assertNotIn(cascade.RELAY_TAG, tags)

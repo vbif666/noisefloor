@@ -336,6 +336,15 @@ def _balancing_block(all_down: str) -> dict:
 
 
 def _fallback_inbound(fallback: dict) -> dict:
+    reality = {
+        "dest": fallback["dest"],
+        "serverNames": [fallback["sni"]],
+        "privateKey": fallback["private_key"],
+        "shortIds": [fallback["short_id"]],
+    }
+    if settings.vless_min_client_ver:
+        # Без этого клиенты на sing-box получают отказ, см. config.py.
+        reality["minClientVer"] = settings.vless_min_client_ver
     return {
         "tag": FALLBACK_TAG,
         "listen": "0.0.0.0",
@@ -348,12 +357,7 @@ def _fallback_inbound(fallback: dict) -> dict:
         "streamSettings": {
             "network": "tcp",
             "security": "reality",
-            "realitySettings": {
-                "dest": fallback["dest"],
-                "serverNames": [fallback["sni"]],
-                "privateKey": fallback["private_key"],
-                "shortIds": [fallback["short_id"]],
-            },
+            "realitySettings": reality,
         },
     }
 
