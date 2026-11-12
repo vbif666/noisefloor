@@ -57,6 +57,17 @@ class ConfigTests(unittest.TestCase):
             reality = vless_server.build_config(FB)["inbounds"][0]["streamSettings"]["realitySettings"]
         self.assertNotIn("minClientVer", reality)
 
+    def test_behind_nginx_listens_locally_with_proxy_protocol(self):
+        with mock.patch.object(cascade.settings, "vless_behind_proxy", True):
+            inbound = vless_server.build_config(FB)["inbounds"][0]
+        self.assertEqual(inbound["listen"], "127.0.0.1")
+        self.assertTrue(inbound["streamSettings"]["sockopt"]["acceptProxyProtocol"])
+
+    def test_without_nginx_listens_everywhere_without_proxy_protocol(self):
+        inbound = self.config["inbounds"][0]
+        self.assertEqual(inbound["listen"], "0.0.0.0")
+        self.assertNotIn("sockopt", inbound["streamSettings"])
+
     def test_no_cascade_parts(self):
         tags = {o["tag"] for o in self.config["outbounds"]}
         self.assertNotIn(cascade.RELAY_TAG, tags)
@@ -253,6 +264,21 @@ class BusyPortTests(unittest.TestCase):
         self.assertIn("fp=ios", link)
         with mock.patch.object(fallback.settings, "vless_fingerprint", "edge"):
             self.assertIn("fp=edge", fallback.client_link(self.config, fallback.new_client("a"), "203.0.113.1"))
+
+    def test_link_behind_nginx_has_public_port(self):
+        self.config.port = 8443
+        with mock.patch.object(fallback.settings, "vless_behind_proxy", True), \
+                mock.patch.object(fallback.settings, "vless_public_port", 443):
+            link = fallback.client_link(self.config, fallback.new_client("a"), "203.0.113.1")
+            data = fallback_router.get_settings(db=self.db, _admin="admin")
+        self.assertIn("@203.0.113.1:443?", link)
+        self.assertEqual((data.port, data.public_port, data.behind_proxy), (8443, 443, True))
+
+    def test_behind_nginx_busy_443_is_not_moved(self):
+        # 443 держит сам nginx, через который вход и работает.
+        with mock.patch.object(fallback.settings, "vless_behind_proxy", True):
+            self.assertFalse(self.move(busy={443}))
+        self.assertEqual(self.config.port, 443)
 
     def test_default_port_comes_from_env(self):
         # install.sh пишет VLESS_PORT=8443, когда 443 на хосте занят.

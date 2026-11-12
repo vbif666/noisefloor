@@ -853,7 +853,8 @@ function fallbackState(data) {
   if (data.warning) return [data.warning, true];
   if (!data.enabled) return ["выключен", false];
   const route = data.mode === "cascade" ? "через каскад" : "напрямую";
-  if (data.listening) return [`работает · TCP ${data.port} · ${route}`, false];
+  const where = data.behind_proxy ? `TCP ${data.public_port} через nginx` : `TCP ${data.port}`;
+  if (data.listening) return [`работает · ${where} · ${route}`, false];
   if (data.mode === "cascade" && !data.cascade_running) return ["ждёт каскад", true];
   if (!data.clients.some((c) => c.enabled)) return ["нет включённых клиентов — добавьте на вкладке «Клиенты»", false];
   return ["не запущен", true];
@@ -1062,7 +1063,7 @@ async function loadPeers() {
     name: c.name,
     enabled: c.enabled,
     protocol: "vless",
-    address: `TCP ${currentVless.port}`,
+    address: `TCP ${currentVless.public_port || currentVless.port}`,
     created_at: c.created_at,
     online: false,
     latest_handshake: null,

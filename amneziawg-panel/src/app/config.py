@@ -65,6 +65,13 @@ class Settings(BaseSettings):
     # которым собран xray 26.7, chrome, safari и firefox несут постквантовый ключ
     # X25519MLKEM768: 1821, 1538 и 1890 байт. ios, edge и qq - 508 байт.
     vless_fingerprint: str = Field(default="ios", pattern=r"^[a-z0-9_]+$")
+    # VLESS за nginx на 443 (stream + ssl_preread): 443 занят сайтом, а на
+    # нестандартных портах мобильный DPI режет приветствия, которые не влезают в
+    # один пакет (на 147 с 8443 не проходило ни одной попытки). Тогда вход слушает
+    # только 127.0.0.1, принимает PROXY protocol от nginx (адрес клиента не
+    # теряется), а в ссылке клиента стоит vless_public_port. См. docs/OPERATIONS.md.
+    vless_behind_proxy: bool = False
+    vless_public_port: int | None = Field(default=None, ge=1, le=65535)
     vless_min_client_ver: str = Field(default="1.8.0", pattern=r"^(\d+\.\d+\.\d+)?$")
 
     # Docker-шаблон: поднять интерфейс автоматически при старте контейнера,

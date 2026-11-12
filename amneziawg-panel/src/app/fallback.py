@@ -113,6 +113,8 @@ def move_off_busy_port(db: Session, own_ports: set) -> bool:
     config = db.query(FallbackConfig).first()
     if config is None or not config.enabled or config.port != DEFAULT_PORT:
         return False
+    if settings.vless_behind_proxy:
+        return False  # 443 держит сам nginx, перед которым вход и стоит
     if DEFAULT_PORT in own_ports or port_free(DEFAULT_PORT):
         return False
     if ALT_PORT not in own_ports and not port_free(ALT_PORT):
@@ -133,4 +135,11 @@ def client_link(config: FallbackConfig, client: FallbackClient, host: str) -> st
         host = f"[{host}]"
     query = urlencode({"type": "tcp", "security": "reality", "encryption": "none", "flow": FLOW,
                        "sni": config.sni, "fp": settings.vless_fingerprint, "pbk": config.public_key, "sid": config.short_id})
-    return f"vless://{client.uuid}@{host}:{config.port}?{query}#{quote(client.name, safe='')}"
+    return f"vless://{client.uuid}@{host}:{public_port(config)}?{query}#{quote(client.name, safe='')}"
+
+
+def public_port(config: FallbackConfig) -> int:
+    """Порт, на который подключается клиент. За nginx он не тот, что слушает xray."""
+    if settings.vless_behind_proxy and settings.vless_public_port:
+        return settings.vless_public_port
+    return config.port

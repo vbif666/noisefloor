@@ -4,6 +4,7 @@ from fastapi import APIRouter, Depends, HTTPException, Response, status
 from sqlalchemy.orm import Session
 
 from .. import cascade, config_sync, fallback, vless_server
+from ..config import settings
 from ..database import get_db
 from ..models import FallbackClient
 from ..qr import config_to_png
@@ -29,6 +30,7 @@ def _read(db: Session) -> FallbackRead:
         listening, warning = vless_server.listening_port() is not None, vless_server.warning()
     return FallbackRead(enabled=config.enabled, port=config.port, sni=config.sni, dest=config.dest,
                         mode="cascade" if via_cascade else "direct", notice=config.port_notice,
+                        public_port=fallback.public_port(config), behind_proxy=bool(settings.vless_behind_proxy),
                         cascade_running=cascade.is_running(), listening=listening, warning=warning,
                         clients=[_client_read(config, c, server.endpoint_host) for c in clients])
 

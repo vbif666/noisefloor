@@ -345,20 +345,22 @@ def _fallback_inbound(fallback: dict) -> dict:
     if settings.vless_min_client_ver:
         # Без этого клиенты на sing-box получают отказ, см. config.py.
         reality["minClientVer"] = settings.vless_min_client_ver
+    stream = {"network": "tcp", "security": "reality", "realitySettings": reality}
+    behind_proxy = bool(settings.vless_behind_proxy)
+    if behind_proxy:
+        # Снаружи вход доступен только через nginx: напрямую без заголовка
+        # PROXY соединение всё равно не прошло бы.
+        stream["sockopt"] = {"acceptProxyProtocol": True}
     return {
         "tag": FALLBACK_TAG,
-        "listen": "0.0.0.0",
+        "listen": "127.0.0.1" if behind_proxy else "0.0.0.0",
         "port": fallback["port"],
         "protocol": "vless",
         "settings": {
             "clients": [{"id": uuid, "flow": "xtls-rprx-vision"} for uuid in fallback["clients"]],
             "decryption": "none",
         },
-        "streamSettings": {
-            "network": "tcp",
-            "security": "reality",
-            "realitySettings": reality,
-        },
+        "streamSettings": stream,
     }
 
 

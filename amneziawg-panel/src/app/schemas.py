@@ -361,6 +361,9 @@ class FallbackRead(BaseModel):
     # Где работает вход: "cascade" - в xray каскада, трафик через релей;
     # "direct" - в своём xray, выход с этого сервера.
     mode: str
+    # Порт в ссылках клиентов: за nginx (VLESS_BEHIND_PROXY) это 443, а не port.
+    public_port: int | None = None
+    behind_proxy: bool = False
     # Текст, если порт сменился без участия админа (443 был занят).
     notice: str | None = None
     cascade_running: bool
