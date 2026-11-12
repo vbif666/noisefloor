@@ -104,6 +104,7 @@ def delete_client(client_id: int, db: Session = Depends(get_db), _admin: str = D
     db.delete(_client_or_404(db, client_id))
     db.commit()
     config_sync.apply_current_config(db)
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
 @router.get("/clients/{client_id}/qrcode")

@@ -135,6 +135,8 @@ async function api(path, opts = {}) {
     throw new Error(message);
   }
 
+  // 204: тела нет, даже если сервер прислал Content-Type: application/json.
+  if (res.status === 204) return null;
   const contentType = res.headers.get("content-type") || "";
   if (contentType.includes("application/json")) return res.json();
   return res;
@@ -857,7 +859,29 @@ function fallbackState(data) {
   return ["не запущен", true];
 }
 
+// Карточка VLESS сохраняется своей кнопкой, а не общей полосой вкладки «Сервер»:
+// изменения, сделанные и не сохранённые, она показывает сама.
+let fallbackDirty = false;
+
+function fallbackFormChanged() {
+  if (!currentVless) return false;
+  return $("fallback-enabled").checked !== currentVless.enabled ||
+    Number($("fallback-port").value) !== currentVless.port ||
+    $("fallback-sni").value.trim() !== currentVless.sni ||
+    $("fallback-dest").value.trim() !== currentVless.dest;
+}
+
+["fallback-enabled", "fallback-port", "fallback-sni", "fallback-dest"].forEach((id) => {
+  $(id).addEventListener("input", () => {
+    fallbackDirty = fallbackFormChanged();
+    if (fallbackDirty) fallbackStatus("не сохранено — нажмите «Сохранить и применить» в этой карточке", true);
+    else fallbackStatus(...fallbackState(currentVless));
+  });
+});
+
 function showFallback(data) {
+  // Опрос списка клиентов не должен затирать то, что админ сейчас вводит.
+  if (fallbackDirty) return;
   $("fallback-enabled").checked = data.enabled;
   $("fallback-port").value = data.port;
   $("fallback-sni").value = data.sni;
@@ -882,6 +906,7 @@ $("fallback-save-btn").addEventListener("click", async () => {
   const btn = $("fallback-save-btn");
   btn.disabled = true;
   try {
+    fallbackDirty = false;
     await api("/fallback", {
       method: "PUT",
       body: JSON.stringify({
@@ -896,6 +921,7 @@ $("fallback-save-btn").addEventListener("click", async () => {
     else if (currentVless.notice) showToast(`VLESS на порту ${currentVless.port}: 443 занят`);
     else showToast("VLESS сохранён");
   } catch (err) {
+    fallbackDirty = fallbackFormChanged();
     fallbackStatus(err.message, true);
   } finally {
     btn.disabled = false;
