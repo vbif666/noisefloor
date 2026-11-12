@@ -5,6 +5,7 @@
 from pathlib import Path
 import secrets
 
+from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -50,6 +51,9 @@ class Settings(BaseSettings):
     # на нём не выделяются на фоне обычного "как будто HTTPS" трафика.
     default_listen_port: int = 443
     default_dns: str = "1.1.1.1"
+    # TCP-порт VLESS для новой установки. install.sh и `noisefloor update` пишут
+    # сюда 8443, если 443 на хосте занят чужой программой (fallback.py).
+    vless_port: int = Field(default=443, ge=1, le=65535)
 
     # Docker-шаблон: поднять интерфейс автоматически при старте контейнера,
     # без ручного нажатия "Apply" в панели. Оригинальный (не-docker) деплой

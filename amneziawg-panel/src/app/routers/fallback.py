@@ -28,7 +28,7 @@ def _read(db: Session) -> FallbackRead:
     else:
         listening, warning = vless_server.listening_port() is not None, vless_server.warning()
     return FallbackRead(enabled=config.enabled, port=config.port, sni=config.sni, dest=config.dest,
-                        mode="cascade" if via_cascade else "direct",
+                        mode="cascade" if via_cascade else "direct", notice=config.port_notice,
                         cascade_running=cascade.is_running(), listening=listening, warning=warning,
                         clients=[_client_read(config, c, server.endpoint_host) for c in clients])
 
@@ -55,6 +55,9 @@ def put_settings(body: FallbackUpdate, db: Session = Depends(get_db), _admin: st
         raise HTTPException(status_code=422, detail="Камуфляжный сайт указывается как имя:порт")
     config = fallback.get_config(db)
     config.enabled, config.port, config.sni, config.dest = body.enabled, body.port, body.sni, body.dest
+    # Порт выбран заново самим админом. Если это снова занятый 443, применение
+    # переведёт его на 8443 и напишет уведомление ещё раз.
+    config.port_notice = None
     db.commit()
     config_sync.apply_current_config(db)
     return _read(db)

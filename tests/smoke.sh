@@ -1607,6 +1607,12 @@ fallback_client_enabled() {
         || fail "клиент $1 не переключён"
 }
 
+# pgrep в образе нет: ищем по командным строкам. Скобки в шаблоне, чтобы не найти
+# командную строку самого sh -c, в которой этот шаблон записан.
+vless_xray_alive() {
+    docker exec smoke-canary-panel sh -c 'grep -qs "vless-xray-confi[g]" /proc/[0-9]*/cmdline'
+}
+
 fb_curl() {
     docker exec smoke-canary-fb curl -sS -o /dev/null --max-time 8 --proxy socks5h://127.0.0.1:1080 "$@"
 }
@@ -1718,6 +1724,91 @@ PY
     else
         fail "ссылка перестала работать после перезапуска"
     fi
+
+    # --- без каскада: свой xray, выход с адреса сервера ---
+    curl -kfsS -o /dev/null -X PUT "https://127.0.0.1:$CANARY_PANEL_PORT/api/server" \
+        -H "Authorization: Bearer $CANARY_TOKEN" -H 'Content-Type: application/json' \
+        -d '{"cascade_enabled": false}' || fail "каскад не выключился"
+    if wait_for 20 fallback_has '"mode":"direct"*"listening":true'; then
+        pass "без каскада вход поднят в своём xray"
+    else
+        fail "без каскада входа нет: $(fallback_get)"
+    fi
+    vless_xray_alive && pass "контроль: отдельный xray виден среди процессов" \
+        || fail "контроль: отдельного xray среди процессов нет"
+    canary_status_has '"running":false' && pass "xray для VLESS не выдаёт себя за каскад" \
+        || fail "каскад числится запущенным: $(canary_field running 2>/dev/null)"
+    web_forget
+    if wait_for 20 fb_curl http://5.5.77.10/generate_204 && web_saw 5.5.77.30; then
+        pass "та же ссылка без каскада выходит с адреса сервера"
+    else
+        fail "без каскада клиент VLESS не прошёл"
+        docker exec smoke-canary-panel tail -5 /opt/panel/data/vless-xray.log 2>/dev/null || true
+    fi
+    web_saw 5.5.77.20 && fail "без каскада трафик ушёл на релей" || true
+    docker network connect --ip 10.77.0.30 smoke-canary-priv smoke-canary-panel
+    web_forget
+    docker exec smoke-canary-panel curl -sS -o /dev/null --max-time 5 http://10.77.0.10/generate_204 \
+        || fail "контроль: панель не видит частную сеть"
+    web_saw 10.77.0.30 || fail "контроль: запрос панели в частную сеть не дошёл"
+    web_forget
+    fb_curl http://10.77.0.10/generate_204 2>/dev/null || true
+    web_saw 10.77.0.30 && fail "клиент без каскада дотянулся до частной сети сервера" \
+        || pass "частная сеть сервера без каскада закрыта"
+    docker network disconnect smoke-canary-priv smoke-canary-panel
+
+    # --- и обратно: вход переезжает в xray каскада на тот же порт ---
+    curl -kfsS -o /dev/null -X PUT "https://127.0.0.1:$CANARY_PANEL_PORT/api/server" \
+        -H "Authorization: Bearer $CANARY_TOKEN" -H 'Content-Type: application/json' \
+        -d '{"cascade_enabled": true}' || fail "каскад не включился"
+    if wait_for 30 canary_status_has '"running":true' \
+        && wait_for 20 fallback_has '"mode":"cascade"*"listening":true'; then
+        pass "с каскадом вход снова в его xray"
+    else
+        fail "после включения каскада: $(fallback_get)"
+    fi
+    vless_xray_alive && fail "отдельный xray остался работать" || pass "отдельный xray остановлен"
+    web_forget
+    if wait_for 20 fb_curl http://5.5.77.10/generate_204 && web_saw 5.5.77.20; then
+        pass "с каскадом клиент снова выходит с адреса релея"
+    else
+        fail "после возврата каскада клиент не прошёл"
+    fi
+
+    # --- 443 занят чужой программой: вход сам уходит на 8443 ---
+    docker exec -d smoke-canary-panel python -m http.server 443 >/dev/null
+    sleep_seconds 2
+    fallback_put "${settings/18443/443}" || fail "порт 443 не сохранился"
+    if wait_for 20 fallback_has '"port":8443'; then
+        pass "занятый 443: вход переведён на 8443"
+    else
+        fail "занятый 443: $(fallback_get)"
+    fi
+    fallback_has '"notice":"Порт 443/tcp занят' && pass "занятый 443: в панели уведомление" \
+        || fail "нет уведомления о смене порта: $(fallback_get)"
+    fallback_has '"listening":true' && pass "на 8443 вход слушает" || fail "на 8443 не слушает: $(fallback_get)"
+    link="$(fallback_get | python3 -c 'import json,sys; print(json.load(sys.stdin)["clients"][0]["link"])')"
+    [[ "$link" == vless://*@100.64.78.30:8443\?* ]] && pass "ссылка выдаётся уже с 8443" \
+        || fail "ссылка: ${link%%\?*}"
+    docker rm -f smoke-canary-fb >/dev/null
+    sed -i 's/"port": 18443/"port": 8443/' "$dir/fb-client.json"
+    docker run -d --name smoke-canary-fb --network smoke-canary-net --ip 5.5.77.40 \
+        -v "$dir/fb-client.json:/c.json:ro" --entrypoint xray "$PANEL_IMAGE" run -config /c.json >/dev/null
+    sleep_seconds 2
+    web_forget
+    if wait_for 20 fb_curl http://5.5.77.10/generate_204 && web_saw 5.5.77.20; then
+        pass "клиент проходит через 8443"
+    else
+        fail "клиент на 8443 не прошёл"
+    fi
+    fallback_put "$settings" || fail "возврат на 18443 не сохранился"
+    fallback_has '"notice":null' && pass "своё сохранение снимает уведомление" \
+        || fail "уведомление осталось: $(fallback_get)"
+    docker rm -f smoke-canary-fb >/dev/null
+    sed -i 's/"port": 8443/"port": 18443/' "$dir/fb-client.json"
+    docker run -d --name smoke-canary-fb --network smoke-canary-net --ip 5.5.77.40 \
+        -v "$dir/fb-client.json:/c.json:ro" --entrypoint xray "$PANEL_IMAGE" run -config /c.json >/dev/null
+    sleep_seconds 2
 
     # --- выключенный клиент не проходит, хотя порт открыт вторым клиентом ---
     curl -kfsS -o /dev/null -X POST "https://127.0.0.1:$CANARY_PANEL_PORT/api/fallback/clients" \

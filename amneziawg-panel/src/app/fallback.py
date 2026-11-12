@@ -21,6 +21,7 @@ from sqlalchemy.orm import Session, object_session
 from sqlalchemy.orm.exc import UnmappedInstanceError
 
 from . import crypto
+from .config import settings
 from .models import FallbackClient, FallbackConfig
 
 FLOW = "xtls-rprx-vision"
@@ -44,7 +45,7 @@ def get_config(db: Session) -> FallbackConfig:
     config = db.query(FallbackConfig).first()
     if config is None:
         private, public = generate_reality_keys()
-        config = FallbackConfig(enabled=False, port=443, sni=DEFAULT_SNI, dest=DEFAULT_DEST,
+        config = FallbackConfig(enabled=False, port=settings.vless_port, sni=DEFAULT_SNI, dest=DEFAULT_DEST,
                                 private_key=private, public_key=public, short_id=secrets.token_hex(8))
         db.add(config)
         db.commit()
@@ -87,6 +88,42 @@ def port_free(port: int) -> bool:
             sock.bind(("0.0.0.0", port))
         except OSError:
             return False
+    return True
+
+
+# 443 часто держит веб-сервер хоста (nginx на 147). Тогда вход переезжает сюда:
+# тоже привычный для HTTPS порт, и REALITY на нём выглядит естественно.
+DEFAULT_PORT = 443
+ALT_PORT = 8443
+
+
+def busy_message(port: int) -> str:
+    if port == DEFAULT_PORT:
+        return (f"VLESS не запущен: порты {DEFAULT_PORT} и {ALT_PORT}/tcp заняты другими программами — "
+                "укажите свободный порт")
+    return f"VLESS не запущен: порт {port}/tcp занят"
+
+
+def move_off_busy_port(db: Session, own_ports: set) -> bool:
+    """443 занят чужой программой, а 8443 свободен: перевести вход на 8443.
+
+    Сохраняется в базе, а не подменяется на лету: порт стоит в ссылке клиента,
+    и ссылки должны сразу выдаваться с тем портом, который реально слушается.
+    Порт, который держит наш же xray, занятым не считается."""
+    config = db.query(FallbackConfig).first()
+    if config is None or not config.enabled or config.port != DEFAULT_PORT:
+        return False
+    if DEFAULT_PORT in own_ports or port_free(DEFAULT_PORT):
+        return False
+    if ALT_PORT not in own_ports and not port_free(ALT_PORT):
+        return False
+    config.port = ALT_PORT
+    config.port_notice = (
+        f"Порт {DEFAULT_PORT}/tcp занят другой программой (например, веб-сервером), поэтому VLESS "
+        f"автоматически переведён на {ALT_PORT}/tcp. Откройте {ALT_PORT}/tcp в фаерволе хостинга. "
+        f"Ссылки, выданные раньше с портом {DEFAULT_PORT}, нужно выдать заново."
+    )
+    db.commit()
     return True
 
 

@@ -53,6 +53,12 @@ _TUNNEL_MIGRATIONS = [
 ]
 
 
+# Запасной вход / VLESS: уведомление об автоматической смене порта.
+_FALLBACK_CONFIG_MIGRATIONS = [
+    ("port_notice", "ALTER TABLE fallback_config ADD COLUMN port_notice TEXT"),
+]
+
+
 def run_migrations() -> None:
     inspector = inspect(engine)
     tables = inspector.get_table_names()
@@ -60,6 +66,7 @@ def run_migrations() -> None:
         ("server_config", _SERVER_CONFIG_MIGRATIONS),
         ("peers", _PEER_MIGRATIONS),
         ("tunnels", _TUNNEL_MIGRATIONS),
+        ("fallback_config", _FALLBACK_CONFIG_MIGRATIONS),
     ):
         if table not in tables:
             continue  # свежая БД — create_all() уже создал таблицу с полным набором столбцов

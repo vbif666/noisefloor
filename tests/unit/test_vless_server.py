@@ -143,6 +143,7 @@ class ApplyOrderTests(unittest.TestCase):
                 mock.patch.object(vless_server, "sync", side_effect=lambda s: calls.append("vless.sync")), \
                 mock.patch.object(cascade, "sync", side_effect=lambda s: calls.append("cascade.sync")), \
                 mock.patch.object(config_sync, "get_server", return_value=server), \
+                mock.patch.object(fallback, "move_off_busy_port", side_effect=lambda db, own: calls.append("port")), \
                 mock.patch.object(config_sync, "interface_names", side_effect=RuntimeError("стоп")):
             db = mock.MagicMock()
             db.query.return_value.all.return_value = []
@@ -151,10 +152,105 @@ class ApplyOrderTests(unittest.TestCase):
         return calls
 
     def test_cascade_on(self):
-        self.assertEqual(self.order(WITH_CASCADE), ["vless.stop", "cascade.sync", "vless.sync"])
+        self.assertEqual(self.order(WITH_CASCADE), ["port", "vless.stop", "cascade.sync", "vless.sync"])
 
     def test_cascade_off(self):
-        self.assertEqual(self.order(NO_CASCADE), ["cascade.sync", "vless.sync"])
+        self.assertEqual(self.order(NO_CASCADE), ["port", "cascade.sync", "vless.sync"])
+
+
+class BusyPortTests(unittest.TestCase):
+    """443 занят чужой программой (nginx на хосте) - вход сам переезжает на 8443."""
+
+    def setUp(self):
+        engine = create_engine("sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool)
+        Base.metadata.create_all(engine)
+        self.db = sessionmaker(bind=engine)()
+        self.addCleanup(self.db.close)
+        self.db.add(ServerConfig(private_key="a", public_key="b", endpoint_host="203.0.113.1"))
+        self.config = fallback.get_config(self.db)
+        self.config.enabled = True
+        self.db.commit()
+
+    def move(self, busy=(), own=()):
+        with mock.patch.object(fallback, "port_free", side_effect=lambda p: p not in busy):
+            return fallback.move_off_busy_port(self.db, set(own))
+
+    def test_busy_443_moves_to_8443_with_notice(self):
+        self.assertTrue(self.move(busy={443}))
+        self.db.refresh(self.config)
+        self.assertEqual(self.config.port, 8443)
+        self.assertIn("443", self.config.port_notice)
+        self.assertIn("8443", self.config.port_notice)
+
+    def test_link_follows_the_new_port(self):
+        self.move(busy={443})
+        link = fallback.client_link(self.config, fallback.new_client("a"), "203.0.113.1")
+        self.assertIn("@203.0.113.1:8443?", link)
+
+    def test_free_443_stays(self):
+        self.assertFalse(self.move())
+        self.assertEqual(self.config.port, 443)
+        self.assertIsNone(self.config.port_notice)
+
+    def test_own_xray_on_443_is_not_busy(self):
+        # Иначе каждое применение уводило бы работающий вход с 443.
+        self.assertFalse(self.move(busy={443}, own={443}))
+        self.assertEqual(self.config.port, 443)
+
+    def test_both_busy_stays_and_says_so(self):
+        self.assertFalse(self.move(busy={443, 8443}))
+        self.assertEqual(self.config.port, 443)
+        self.assertIn("8443", fallback.busy_message(443))
+        self.assertIn("свободный порт", fallback.busy_message(443))
+
+    def test_8443_held_by_own_xray_counts_as_free(self):
+        self.assertTrue(self.move(busy={443, 8443}, own={8443}))
+
+    def test_other_ports_are_never_moved(self):
+        # Свой порт админ выбрал сам: молча менять его нельзя.
+        self.config.port = 9443
+        self.db.commit()
+        self.assertFalse(self.move(busy={9443}))
+        self.assertEqual(self.config.port, 9443)
+        self.assertEqual(fallback.busy_message(9443), "VLESS не запущен: порт 9443/tcp занят")
+
+    def test_disabled_is_not_moved(self):
+        self.config.enabled = False
+        self.db.commit()
+        self.assertFalse(self.move(busy={443}))
+
+    def test_admin_save_clears_notice(self):
+        self.move(busy={443})
+        with mock.patch.object(config_sync, "apply_current_config"):
+            data = fallback_router.put_settings(
+                fallback_router.FallbackUpdate(enabled=True, port=9443, sni="dl.google.com", dest="dl.google.com:443"),
+                db=self.db, _admin="admin")
+        self.assertIsNone(data.notice)
+        self.assertIsNone(self.config.port_notice)
+
+    def test_notice_reaches_api(self):
+        self.move(busy={443})
+        with mock.patch.object(vless_server, "listening_port", return_value=8443):
+            data = fallback_router.get_settings(db=self.db, _admin="admin")
+        self.assertEqual(data.port, 8443)
+        self.assertIn("8443", data.notice)
+
+    def test_default_port_comes_from_env(self):
+        # install.sh пишет VLESS_PORT=8443, когда 443 на хосте занят.
+        self.db.delete(self.config)
+        self.db.commit()
+        with mock.patch.object(fallback.settings, "vless_port", 8443):
+            self.assertEqual(fallback.get_config(self.db).port, 8443)
+
+    def test_migration_adds_column_to_old_table(self):
+        from sqlalchemy import inspect, text
+        from app import database
+        engine = create_engine("sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool)
+        with engine.begin() as conn:
+            conn.execute(text("CREATE TABLE fallback_config (id INTEGER PRIMARY KEY, enabled BOOLEAN)"))
+        with mock.patch.object(database, "engine", engine):
+            database.run_migrations()
+        self.assertIn("port_notice", {c["name"] for c in inspect(engine).get_columns("fallback_config")})
 
 
 class RouterTests(unittest.TestCase):

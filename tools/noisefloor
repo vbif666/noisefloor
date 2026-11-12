@@ -186,6 +186,60 @@ PY
 
 # --------------------------------------------------------------- update ---
 
+# --- Порт VLESS: 443/tcp или, если он занят, 8443/tcp ---
+#
+# 443 часто держит веб-сервер хоста (nginx, caddy). Тогда VLESS по умолчанию
+# встаёт на 8443: панель берёт порт из VLESS_PORT в .env. Порт, который держит
+# xray самой панели, занятым не считается: иначе повторный запуск уводил бы
+# работающий вход с 443. Панель при каждом применении настроек проверяет то же
+# самое и сама переводит вход на 8443, скрипт лишь сообщает об этом заранее.
+
+# Печатает имя чужой программы на TCP-порту; код 1, если порт свободен или наш.
+tcp_port_foreign_owner() { # порт id-контейнера-панели
+    local out pid name cid="${2:-}"
+    out="$(ss -ltnpH "sport = :$1" 2>/dev/null)" || return 1
+    [ -n "$out" ] || return 1
+    # ss без сведений о процессе (нет прав, чужое пространство имён): считаем чужим.
+    if ! grep -q 'pid=' <<<"$out"; then
+        echo "неизвестная программа"
+        return 0
+    fi
+    for pid in $(grep -o 'pid=[0-9]*' <<<"$out" | cut -d= -f2 | sort -u); do
+        if [ -n "$cid" ] && grep -qs "$cid" "/proc/$pid/cgroup"; then
+            continue
+        fi
+        name="$(grep -o '(("[^"]*"' <<<"$out" | head -1 | cut -d'"' -f2)"
+        echo "${name:-pid $pid}"
+        return 0
+    done
+    return 1
+}
+
+# Пишет VLESS_PORT=8443 в .env текущего каталога, если 443 занят чужой программой.
+vless_port_check() { # id-контейнера-панели (может быть пустым)
+    local cid="${1:-}" owner alt_owner current tmp
+    current="$(sed -n 's/^VLESS_PORT=//p' .env 2>/dev/null | tail -1)"
+    if ! owner="$(tcp_port_foreign_owner 443 "$cid")"; then
+        VLESS_PORT="${current:-443}"
+        return 0
+    fi
+    if alt_owner="$(tcp_port_foreign_owner 8443 "$cid")"; then
+        warn "TCP 443 занят ($owner), и 8443 тоже ($alt_owner): VLESS по умолчанию не запустится."
+        warn "Укажите свободный TCP-порт в панели: вкладка «Сервер» → «Протоколы» → VLESS Reality."
+        VLESS_PORT="${current:-443}"
+        return 0
+    fi
+    VLESS_PORT=8443
+    if [ "$current" != 8443 ]; then
+        tmp="$(mktemp .env.XXXXXX)"
+        grep -v '^VLESS_PORT=' .env > "$tmp" 2>/dev/null || true
+        printf '\n# 443/tcp занят (%s) — VLESS по умолчанию на 8443.\nVLESS_PORT=8443\n' "$owner" >> "$tmp"
+        chmod 600 "$tmp"
+        mv "$tmp" .env
+    fi
+    warn "TCP 443 занят ($owner) — VLESS будет работать на 8443/tcp. Откройте 8443/tcp в фаерволе хостинга."
+}
+
 update_one() { # имя каталог образ
     local name="$1" dir="$2" image="$3"
     local before after version_before version_after
@@ -194,6 +248,10 @@ update_one() { # имя каталог образ
     version_before=$(container_env "$dir" NOISEFLOOR_VERSION 2>/dev/null || echo "?")
 
     local ref; ref=$(cd "$dir" && docker compose config --images | head -1)
+
+    if [ "$name" = panel ]; then
+        (cd "$dir" && vless_port_check "$(container_id "$dir")")
+    fi
 
     # Прежний образ закрепляем тегом :previous ДО pull — пока рабочий тег
     # ещё указывает на него. Именно тегом по ссылке, а не по ID: в

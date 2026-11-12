@@ -629,6 +629,10 @@ def _fallback_port() -> int | None:
     return next((i["port"] for i in _last_config["inbounds"] if i["tag"] == FALLBACK_TAG), None)
 
 
+def fallback_port() -> int | None:
+    return _fallback_port()
+
+
 def fallback_listening() -> bool:
     return _fallback_port() is not None
 
@@ -646,7 +650,7 @@ def _resolve_fallback(server) -> dict | None:
     _fallback_warning = None
     wanted = fallback.params(server)
     if wanted and wanted["port"] != _fallback_port() and not fallback.port_free(wanted["port"]):
-        _fallback_warning = f"Запасной вход не запущен: порт {wanted['port']}/tcp занят"
+        _fallback_warning = fallback.busy_message(wanted["port"])
         return None
     return wanted
 

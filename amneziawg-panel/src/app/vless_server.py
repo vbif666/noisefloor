@@ -142,7 +142,7 @@ def sync(server) -> str | None:
         if params["port"] != listening_port() and not fallback.port_free(params["port"]):
             _wanted = False
             _stop_locked()
-            _warning = f"VLESS не запущен: порт {params['port']}/tcp занят"
+            _warning = fallback.busy_message(params["port"])
             return _warning
 
         _stop_locked()

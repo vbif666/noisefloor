@@ -863,6 +863,8 @@ function showFallback(data) {
   $("fallback-sni").value = data.sni;
   $("fallback-dest").value = data.dest;
   fallbackStatus(...fallbackState(data));
+  $("fallback-notice").hidden = !data.notice;
+  $("fallback-notice").textContent = data.notice || "";
   const on = data.clients.filter((c) => c.enabled).length;
   $("fallback-summary").textContent = `Клиентов: ${data.clients.length}` +
     (on !== data.clients.length ? ` (включено ${on})` : "") +
@@ -890,7 +892,9 @@ $("fallback-save-btn").addEventListener("click", async () => {
       }),
     });
     await loadPeers();
-    showToast(currentVless.warning ? `Сохранено, но: ${currentVless.warning}` : "VLESS сохранён", !!currentVless.warning);
+    if (currentVless.warning) showToast(`Сохранено, но: ${currentVless.warning}`, true);
+    else if (currentVless.notice) showToast(`VLESS на порту ${currentVless.port}: 443 занят`);
+    else showToast("VLESS сохранён");
   } catch (err) {
     fallbackStatus(err.message, true);
   } finally {
@@ -1214,6 +1218,7 @@ async function openPeerDialog(id) {
   $("peer-dialog-title").textContent = peer.name;
   const proto = vless ? PROTOCOLS.vless : (PROTOCOLS[peer.protocol] || PROTOCOLS.awg2);
   let about = `${proto.name}. ${proto.hint}`;
+  if (vless && currentVless && currentVless.notice) about += ` ${currentVless.notice}`;
   if (vless && currentVless && !currentVless.listening) {
     about += ` Сейчас вход не работает: ${fallbackState(currentVless)[0]}.`;
   }

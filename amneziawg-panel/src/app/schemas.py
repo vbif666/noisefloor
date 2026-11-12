@@ -361,6 +361,8 @@ class FallbackRead(BaseModel):
     # Где работает вход: "cascade" - в xray каскада, трафик через релей;
     # "direct" - в своём xray, выход с этого сервера.
     mode: str
+    # Текст, если порт сменился без участия админа (443 был занят).
+    notice: str | None = None
     cascade_running: bool
     listening: bool
     warning: str | None

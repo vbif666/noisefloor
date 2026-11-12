@@ -232,6 +232,10 @@ class FallbackConfig(Base):
     private_key = Column(String(64), nullable=False)
     public_key = Column(String(64), nullable=False)
     short_id = Column(String(16), nullable=False)
+    # Почему порт не тот, что выбирали: 443 оказался занят, и панель сама
+    # перевела вход на 8443 (fallback.move_off_busy_port). Сбрасывается, когда
+    # админ сохраняет настройки сам.
+    port_notice = Column(Text, nullable=True)
     updated_at = Column(DateTime, default=_utcnow, onupdate=_utcnow)
 
 

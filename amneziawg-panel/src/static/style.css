@@ -1284,3 +1284,15 @@ canvas.chart-canvas {
   .save-bar-actions { width: 100%; }
   .save-bar-actions .btn { flex: 1; }
 }
+
+/* Уведомление об автоматической смене порта VLESS (443 занят -> 8443). */
+.port-notice {
+  margin: 10px 0;
+  padding: 10px 12px;
+  border: 1px solid var(--signal-line);
+  border-radius: var(--radius-sm);
+  background: var(--signal-dim);
+  color: var(--text);
+  font-size: 13px;
+  line-height: 1.45;
+}

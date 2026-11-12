@@ -5,7 +5,7 @@ from datetime import datetime, timezone
 
 from sqlalchemy.orm import Session, object_session
 
-from . import awg_config, awg_manager, cascade, vless_server, wg_status
+from . import awg_config, awg_manager, cascade, fallback, vless_server, wg_status
 from .models import Peer, ServerConfig, Tunnel
 
 # Код `noisefloor-rules check`: правила снесли снаружи (ufw reset, iptables -F).
@@ -145,6 +145,8 @@ def _apply_locked(db: Session, *, restart: bool,
     # заворачивает трафик, реально поднят.
     # Вход VLESS переезжает между отдельным xray и xray каскада, порт один:
     # сначала отпустить его, потом занимать (см. vless_server).
+    own_ports = {cascade.fallback_port(), vless_server.listening_port()} - {None}
+    fallback.move_off_busy_port(db, own_ports)
     if vless_server.cascade_wanted(server):
         vless_server.stop()
     server.cascade_last_error = cascade.sync(server)

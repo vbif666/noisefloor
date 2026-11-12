@@ -227,6 +227,60 @@ docker compose version >/dev/null 2>&1 || die "нет плагина docker comp
 
 port_busy() { ss -lnH "$1" "sport = :$2" 2>/dev/null | grep -q .; }
 
+# --- Порт VLESS: 443/tcp или, если он занят, 8443/tcp ---
+#
+# 443 часто держит веб-сервер хоста (nginx, caddy). Тогда VLESS по умолчанию
+# встаёт на 8443: панель берёт порт из VLESS_PORT в .env. Порт, который держит
+# xray самой панели, занятым не считается: иначе повторный запуск уводил бы
+# работающий вход с 443. Панель при каждом применении настроек проверяет то же
+# самое и сама переводит вход на 8443, скрипт лишь сообщает об этом заранее.
+
+# Печатает имя чужой программы на TCP-порту; код 1, если порт свободен или наш.
+tcp_port_foreign_owner() { # порт id-контейнера-панели
+    local out pid name cid="${2:-}"
+    out="$(ss -ltnpH "sport = :$1" 2>/dev/null)" || return 1
+    [ -n "$out" ] || return 1
+    # ss без сведений о процессе (нет прав, чужое пространство имён): считаем чужим.
+    if ! grep -q 'pid=' <<<"$out"; then
+        echo "неизвестная программа"
+        return 0
+    fi
+    for pid in $(grep -o 'pid=[0-9]*' <<<"$out" | cut -d= -f2 | sort -u); do
+        if [ -n "$cid" ] && grep -qs "$cid" "/proc/$pid/cgroup"; then
+            continue
+        fi
+        name="$(grep -o '(("[^"]*"' <<<"$out" | head -1 | cut -d'"' -f2)"
+        echo "${name:-pid $pid}"
+        return 0
+    done
+    return 1
+}
+
+# Пишет VLESS_PORT=8443 в .env текущего каталога, если 443 занят чужой программой.
+vless_port_check() { # id-контейнера-панели (может быть пустым)
+    local cid="${1:-}" owner alt_owner current tmp
+    current="$(sed -n 's/^VLESS_PORT=//p' .env 2>/dev/null | tail -1)"
+    if ! owner="$(tcp_port_foreign_owner 443 "$cid")"; then
+        VLESS_PORT="${current:-443}"
+        return 0
+    fi
+    if alt_owner="$(tcp_port_foreign_owner 8443 "$cid")"; then
+        warn "TCP 443 занят ($owner), и 8443 тоже ($alt_owner): VLESS по умолчанию не запустится."
+        warn "Укажите свободный TCP-порт в панели: вкладка «Сервер» → «Протоколы» → VLESS Reality."
+        VLESS_PORT="${current:-443}"
+        return 0
+    fi
+    VLESS_PORT=8443
+    if [ "$current" != 8443 ]; then
+        tmp="$(mktemp .env.XXXXXX)"
+        grep -v '^VLESS_PORT=' .env > "$tmp" 2>/dev/null || true
+        printf '\n# 443/tcp занят (%s) — VLESS по умолчанию на 8443.\nVLESS_PORT=8443\n' "$owner" >> "$tmp"
+        chmod 600 "$tmp"
+        mv "$tmp" .env
+    fi
+    warn "TCP 443 занят ($owner) — VLESS будет работать на 8443/tcp. Откройте 8443/tcp в фаерволе хостинга."
+}
+
 # Порты и интерфейс занимает в том числе уже установленная панель — для неё
 # это не конфликт, а повторный запуск: скрипт тогда работает как обновление.
 if docker ps --format '{{.Names}}' 2>/dev/null | grep -qx "$CONTAINER"; then
@@ -532,6 +586,7 @@ EOF
     umask 022
 fi
 write_telegram
+vless_port_check "$(docker inspect -f '{{.Id}}' "$CONTAINER" 2>/dev/null || true)"
 
 # --- Запуск -----------------------------------------------------------------
 
@@ -624,6 +679,11 @@ printf '  Пароль:    %s\n' "${ADMIN_PASSWORD:-см. docker exec $CONTAINER
 printf '  Каталог:   %s\n' "$INSTALL_DIR"
 printf '  Интерфейс: %s (%s, UDP %s)\n' "$AWG_INTERFACE" "$SERVER_ADDRESS" "$LISTEN_PORT"
 printf '  Каскад:    режим перехвата %s\n' "$INTERCEPT_MODE"
+if [ "$VLESS_PORT" = 8443 ]; then
+    printf '  VLESS:     TCP 8443 — порт 443 занят другой программой (откройте 8443/tcp)\n'
+else
+    printf '  VLESS:     TCP %s, выключен — включается в блоке «Протоколы»\n' "$VLESS_PORT"
+fi
 if [ "${GENERATED_PASSPHRASE:-0}" -eq 1 ]; then
     printf '\n  Пароль шифрования резервных копий (сохраните, второй раз не покажу):\n    %s\n' "$BACKUP_PASSPHRASE"
 fi
