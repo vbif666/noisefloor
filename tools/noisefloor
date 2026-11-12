@@ -218,7 +218,7 @@ tcp_port_foreign_owner() { # порт id-контейнера-панели
 # Пишет VLESS_PORT=8443 в .env текущего каталога, если 443 занят чужой программой.
 vless_port_check() { # id-контейнера-панели (может быть пустым)
     local cid="${1:-}" owner alt_owner current tmp
-    current="$(sed -n 's/^VLESS_PORT=//p' .env 2>/dev/null | tail -1)"
+    current="$( { sed -n 's/^VLESS_PORT=//p' .env 2>/dev/null || true; } | tail -1)"
     if ! owner="$(tcp_port_foreign_owner 443 "$cid")"; then
         VLESS_PORT="${current:-443}"
         return 0
