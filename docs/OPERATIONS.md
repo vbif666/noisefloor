@@ -468,6 +468,32 @@ Reality»: панель выдаёт ссылку `vless://` и QR-код. В о
   и `noisefloor update` проверяют то же заранее и пишут `VLESS_PORT=8443` в `.env`.
   Порт, который держит xray самой панели, занятым не считается. Другие порты, выбранные
   вручную, панель не меняет.
+- **Сайт и VLESS на одном 443** — через nginx stream. nginx принимает 443, по SNI отдаёт
+  VLESS в xray, остальное своему сайту; xray и сайт получают PROXY protocol и видят
+  настоящие адреса клиентов. В `.env` панели: `VLESS_BEHIND_PROXY=true` (xray слушает
+  `127.0.0.1:VLESS_PORT`, проверка «443 занят» отключается) и `VLESS_PUBLIC_PORT=443`
+  (порт в ссылках). Нужен модуль `ngx_stream_module`, блок `stream {}` в `nginx.conf`
+  подключает файл вида:
+
+  ```nginx
+  map $ssl_preread_server_name $nf_443_backend {
+      gogarin-travel.ru 127.0.0.1:8443;   # SNI из карточки VLESS
+      default           127.0.0.1:4443;   # свой сайт
+  }
+  server {
+      listen 443;
+      listen [::]:443 ipv6only=on;
+      ssl_preread on;
+      proxy_pass $nf_443_backend;
+      proxy_protocol on;
+      proxy_connect_timeout 5s;
+  }
+  ```
+
+  Сайт переезжает с `listen 443 ssl` на `listen 127.0.0.1:4443 ssl proxy_protocol;` с
+  `set_real_ip_from 127.0.0.1; real_ip_header proxy_protocol;`. SNI в `map` должен
+  совпадать с SNI в панели: при смене SNI правьте оба места, иначе клиенты VLESS попадут
+  на сайт. Так VLESS не уходит на 8443, где мобильные сети чаще режут соединения.
 - **Занятый порт** каскад не роняет: xray запускается без входа,
   а в карточке VLESS появляется предупреждение. Без каскада отдельный xray просто не
   запускается, с тем же предупреждением. Ту же проверку проходит каждый запуск.

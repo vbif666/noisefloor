@@ -5,7 +5,7 @@
 from pathlib import Path
 import secrets
 
-from pydantic import Field
+from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -72,6 +72,12 @@ class Settings(BaseSettings):
     # теряется), а в ссылке клиента стоит vless_public_port. См. docs/OPERATIONS.md.
     vless_behind_proxy: bool = False
     vless_public_port: int | None = Field(default=None, ge=1, le=65535)
+
+    @field_validator("vless_public_port", mode="before")
+    @classmethod
+    def _empty_port_is_unset(cls, value):
+        # «VLESS_PUBLIC_PORT=» в .env значит «не задано», а не ошибка запуска.
+        return None if isinstance(value, str) and not value.strip() else value
     vless_min_client_ver: str = Field(default="1.8.0", pattern=r"^(\d+\.\d+\.\d+)?$")
 
     # Docker-шаблон: поднять интерфейс автоматически при старте контейнера,

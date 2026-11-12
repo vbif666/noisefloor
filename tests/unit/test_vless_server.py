@@ -280,6 +280,14 @@ class BusyPortTests(unittest.TestCase):
             self.assertFalse(self.move(busy={443}))
         self.assertEqual(self.config.port, 443)
 
+    def test_empty_public_port_in_env_is_unset(self):
+        # «VLESS_PUBLIC_PORT=» из .env.example не должно ронять запуск панели.
+        from app.config import Settings
+        with mock.patch.dict(os.environ, {"VLESS_PUBLIC_PORT": ""}):
+            self.assertIsNone(Settings().vless_public_port)
+        with mock.patch.dict(os.environ, {"VLESS_PUBLIC_PORT": "443"}):
+            self.assertEqual(Settings().vless_public_port, 443)
+
     def test_default_port_comes_from_env(self):
         # install.sh пишет VLESS_PORT=8443, когда 443 на хосте занят.
         self.db.delete(self.config)
