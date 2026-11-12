@@ -8,6 +8,7 @@ let token = localStorage.getItem("noisefloor_token") || null;
 let currentPeers = [];
 let currentServer = null;
 let currentTunnels = [];
+let currentVless = null;  // последний ответ /fallback: настройки VLESS и его клиенты
 let lastCascadeStatus = null;  // последний ответ /server/cascade/status
 
 // Протоколы клиентов. У каждого свой интерфейс и свой UDP-порт: маскировка
@@ -33,7 +34,18 @@ const PROTOCOLS = {
     badge: "WG",
     hint: "Обычный WireGuard без маскировки: подойдёт стандартное приложение WireGuard и почти любой роутер. DPI опознаёт его легко, в РФ часто блокируется.",
   },
+  vless: {
+    name: "VLESS Reality",
+    badge: "VLESS",
+    hint: "VLESS + REALITY по TCP — для сетей, где режут UDP и AmneziaWG не поднимается. Импорт ссылкой или QR в v2rayNG, Hiddify, Streisand, NekoBox, Happ.",
+  },
 };
+
+// Клиенты VLESS живут в своей таблице (/fallback/clients) со своими id. В общем
+// списке у них строковый id с префиксом, чтобы не пересечься с пирами.
+const VLESS_PREFIX = "v";
+const isVlessId = (id) => typeof id === "string" && id.startsWith(VLESS_PREFIX);
+const vlessClientId = (id) => Number(id.slice(VLESS_PREFIX.length));
 let activePeerId = null;
 let confirmCallback = null;
 let statusPollTimer = null;
@@ -373,7 +385,8 @@ document.querySelectorAll(".tab-btn").forEach((btn) => {
    ========================================================================== */
 
 async function loadEverything() {
-  await Promise.all([loadServer(), loadPeers(), loadBackups(), loadTunnels(), loadNotify(), loadFallback()]);
+  // loadPeers загружает и VLESS: его клиенты в том же списке.
+  await Promise.all([loadServer(), loadPeers(), loadBackups(), loadTunnels(), loadNotify()]);
 }
 
 /* ==========================================================================
@@ -831,15 +844,16 @@ function renderCascadeSummary(c) {
 }
 
 /* ==========================================================================
-   Запасной вход VLESS
+   VLESS Reality: настройки на вкладке «Сервер», клиенты в общем списке
    ========================================================================== */
 
 function fallbackState(data) {
   if (data.warning) return [data.warning, true];
   if (!data.enabled) return ["выключен", false];
-  if (data.listening) return ["работает", false];
-  if (!data.cascade_running) return ["ждёт каскад", true];
-  if (!data.clients.some((c) => c.enabled)) return ["нет включённых клиентов", true];
+  const route = data.mode === "cascade" ? "через каскад" : "напрямую";
+  if (data.listening) return [`работает · TCP ${data.port} · ${route}`, false];
+  if (data.mode === "cascade" && !data.cascade_running) return ["ждёт каскад", true];
+  if (!data.clients.some((c) => c.enabled)) return ["нет включённых клиентов — добавьте на вкладке «Клиенты»", false];
   return ["не запущен", true];
 }
 
@@ -849,17 +863,10 @@ function showFallback(data) {
   $("fallback-sni").value = data.sni;
   $("fallback-dest").value = data.dest;
   fallbackStatus(...fallbackState(data));
-  $("fallback-clients").innerHTML = data.clients.map((c) => `
-    <div class="field">
-      <label>${escapeHtml(c.name)}${c.enabled ? "" : " (выключен)"}</label>
-      <input readonly value="${escapeHtml(c.link)}" />
-      <div class="server-actions" style="margin-top:6px;">
-        <button type="button" class="btn btn-sm" data-fb-copy="${escapeHtml(c.link)}">Скопировать ссылку</button>
-        <button type="button" class="btn btn-sm" data-fb-qr="${c.id}">QR</button>
-        <button type="button" class="btn btn-sm" data-fb-toggle="${c.id}" data-fb-enabled="${c.enabled ? "1" : ""}">${c.enabled ? "Выключить" : "Включить"}</button>
-        <button type="button" class="btn btn-danger btn-sm" data-fb-delete="${c.id}">Удалить</button>
-      </div>
-    </div>`).join("");
+  const on = data.clients.filter((c) => c.enabled).length;
+  $("fallback-summary").textContent = `Клиентов: ${data.clients.length}` +
+    (on !== data.clients.length ? ` (включено ${on})` : "") +
+    ". Создаются кнопкой «Добавить пира» с протоколом VLESS Reality.";
 }
 
 function fallbackStatus(text, isError) {
@@ -869,64 +876,25 @@ function fallbackStatus(text, isError) {
   status.textContent = text;
 }
 
-async function loadFallback() {
+$("fallback-save-btn").addEventListener("click", async () => {
+  const btn = $("fallback-save-btn");
+  btn.disabled = true;
   try {
-    showFallback(await api("/fallback"));
+    await api("/fallback", {
+      method: "PUT",
+      body: JSON.stringify({
+        enabled: $("fallback-enabled").checked,
+        port: Number($("fallback-port").value),
+        sni: $("fallback-sni").value.trim(),
+        dest: $("fallback-dest").value.trim(),
+      }),
+    });
+    await loadPeers();
+    showToast(currentVless.warning ? `Сохранено, но: ${currentVless.warning}` : "VLESS сохранён", !!currentVless.warning);
   } catch (err) {
     fallbackStatus(err.message, true);
-  }
-}
-
-async function fallbackAction(action) {
-  try {
-    await action();
-    await loadFallback();
-  } catch (err) {
-    fallbackStatus(err.message, true);
-  }
-}
-
-$("fallback-save-btn").addEventListener("click", () => fallbackAction(() => api("/fallback", {
-  method: "PUT",
-  body: JSON.stringify({
-    enabled: $("fallback-enabled").checked,
-    port: Number($("fallback-port").value),
-    sni: $("fallback-sni").value.trim(),
-    dest: $("fallback-dest").value.trim(),
-  }),
-})));
-
-$("fallback-add-btn").addEventListener("click", () => fallbackAction(async () => {
-  const name = $("fallback-client-name").value.trim();
-  if (!name) throw new Error("Укажите имя клиента");
-  await api("/fallback/clients", { method: "POST", body: JSON.stringify({ name }) });
-  $("fallback-client-name").value = "";
-}));
-
-$("fallback-clients").addEventListener("click", async (event) => {
-  const btn = event.target.closest("button");
-  if (!btn) return;
-  if (btn.dataset.fbCopy) {
-    try {
-      await navigator.clipboard.writeText(btn.dataset.fbCopy);
-      showToast("Ссылка скопирована в буфер обмена");
-    } catch (_) {
-      showToast("Не удалось скопировать - выделите текст вручную", true);
-    }
-  } else if (btn.dataset.fbQr) {
-    const res = await apiBlob(`/fallback/clients/${btn.dataset.fbQr}/qrcode`);
-    const img = $("fallback-qr-img");
-    if (img.dataset.objectUrl) URL.revokeObjectURL(img.dataset.objectUrl);
-    img.dataset.objectUrl = URL.createObjectURL(await res.blob());
-    img.src = img.dataset.objectUrl;
-    $("fallback-qr-wrap").hidden = false;
-  } else if (btn.dataset.fbToggle) {
-    await fallbackAction(() => api(`/fallback/clients/${btn.dataset.fbToggle}`, {
-      method: "PATCH",
-      body: JSON.stringify({ enabled: !btn.dataset.fbEnabled }),
-    }));
-  } else if (btn.dataset.fbDelete && confirm("Удалить клиента? Его ссылка перестанет работать.")) {
-    await fallbackAction(() => api(`/fallback/clients/${btn.dataset.fbDelete}`, { method: "DELETE" }));
+  } finally {
+    btn.disabled = false;
   }
 });
 
@@ -1050,7 +1018,28 @@ async function loadBackups() {
    ========================================================================== */
 
 async function loadPeers() {
-  currentPeers = await api("/peers");
+  // Без VLESS список пиров всё равно нужен: его ошибку показываем в его блоке.
+  const [peers, vless] = await Promise.all([
+    api("/peers"),
+    api("/fallback").catch((err) => { fallbackStatus(err.message, true); return null; }),
+  ]);
+  if (vless) {
+    currentVless = vless;
+    showFallback(vless);
+  }
+  const vlessRows = (currentVless ? currentVless.clients : []).map((c) => ({
+    id: VLESS_PREFIX + c.id,
+    name: c.name,
+    enabled: c.enabled,
+    protocol: "vless",
+    address: `TCP ${currentVless.port}`,
+    created_at: c.created_at,
+    online: false,
+    latest_handshake: null,
+    transfer_rx: null,
+    transfer_tx: null,
+  }));
+  currentPeers = [...peers, ...vlessRows].sort((a, b) => String(a.created_at).localeCompare(String(b.created_at)));
   renderPeersTable();
 }
 
@@ -1072,13 +1061,14 @@ function renderPeersTable() {
   tbody.querySelectorAll("tr[data-peer-id]").forEach((tr) => {
     tr.addEventListener("click", (e) => {
       if (e.target.closest("button")) return;
-      openPeerDialog(Number(tr.dataset.peerId));
+      const id = tr.dataset.peerId;
+      openPeerDialog(isVlessId(id) ? id : Number(id));
     });
   });
   tbody.querySelectorAll("[data-quick-toggle]").forEach((btn) => {
     btn.addEventListener("click", async (e) => {
       e.stopPropagation();
-      const id = Number(btn.dataset.quickToggle);
+      const id = isVlessId(btn.dataset.quickToggle) ? btn.dataset.quickToggle : Number(btn.dataset.quickToggle);
       const peer = currentPeers.find((p) => p.id === id);
       if (peer) await togglePeerEnabled(peer, false);
     });
@@ -1089,7 +1079,8 @@ function peerRowHtml(p) {
   const dotClass = !p.enabled ? "is-disabled" : p.online ? "is-online" : "";
   const nameClass = !p.enabled ? "is-disabled" : "";
   const handshake = p.latest_handshake ? timeAgo(new Date(p.latest_handshake)) : "—";
-  const transfer = `${formatBytes(p.transfer_rx)} / ${formatBytes(p.transfer_tx)}`;
+  // Счётчиков по клиентам VLESS панель пока не ведёт.
+  const transfer = p.transfer_rx === null ? "—" : `${formatBytes(p.transfer_rx)} / ${formatBytes(p.transfer_tx)}`;
   return `
     <tr data-peer-id="${p.id}">
       <td>
@@ -1112,8 +1103,9 @@ function peerRowHtml(p) {
 
 async function togglePeerEnabled(peer, refreshDialog) {
   const newEnabled = !peer.enabled;
+  const path = isVlessId(peer.id) ? `/fallback/clients/${vlessClientId(peer.id)}` : `/peers/${peer.id}`;
   try {
-    await api(`/peers/${peer.id}`, { method: "PATCH", body: JSON.stringify({ enabled: newEnabled }) });
+    await api(path, { method: "PATCH", body: JSON.stringify({ enabled: newEnabled }) });
     await loadPeers();
     if (refreshDialog) await openPeerDialog(peer.id);
     showToast(newEnabled ? "Пир включён" : "Пир выключен");
@@ -1144,6 +1136,8 @@ function updateProtocolHint() {
     card.classList.toggle("is-disabled", r.disabled);
   }
   $("np-protocol-hint").textContent = PROTOCOLS[selectedProtocol()].hint;
+  // У клиента VLESS нет ни AllowedIPs, ни keepalive, ни DNS: только имя.
+  $("np-wg-fields").hidden = selectedProtocol() === "vless";
 }
 
 protocolRadios().forEach((r) => r.addEventListener("change", updateProtocolHint));
@@ -1156,7 +1150,8 @@ function openAddPeerDialog() {
   for (const radio of protocolRadios()) {
     const sub = radio.closest(".proto-option").querySelector(".proto-sub");
     const t = currentTunnels.find((x) => x.protocol === radio.value);
-    const on = radio.value === "awg2" || !!(t && t.enabled);
+    const on = radio.value === "awg2" || !!(t && t.enabled) ||
+      (radio.value === "vless" && !!(currentVless && currentVless.enabled));
     radio.disabled = !on;
     sub.textContent = on ? sub.dataset.default : "выключен - включите на вкладке «Сервер»";
     radio.checked = radio.value === "awg2";
@@ -1185,6 +1180,14 @@ $("add-peer-form").addEventListener("submit", async (e) => {
   const btn = $("add-peer-submit");
   btn.disabled = true;
   try {
+    if (payload.protocol === "vless") {
+      const client = await api("/fallback/clients", { method: "POST", body: JSON.stringify({ name: payload.name }) });
+      $("add-peer-dialog").close();
+      await loadPeers();
+      showToast(`Клиент VLESS «${client.name}» создан`);
+      openPeerDialog(VLESS_PREFIX + client.id);
+      return;
+    }
     const peer = await api("/peers", { method: "POST", body: JSON.stringify(payload) });
     $("add-peer-dialog").close();
     await loadPeers();
@@ -1204,18 +1207,27 @@ $("add-peer-form").addEventListener("submit", async (e) => {
 
 async function openPeerDialog(id) {
   activePeerId = id;
-  const peer = await api(`/peers/${id}`);
+  const vless = isVlessId(id);
+  const base = vless ? `/fallback/clients/${vlessClientId(id)}` : `/peers/${id}`;
+  const peer = await api(base);
 
   $("peer-dialog-title").textContent = peer.name;
-  const proto = PROTOCOLS[peer.protocol] || PROTOCOLS.awg2;
-  $("peer-dialog-protocol").textContent = `${proto.name}. ${proto.hint}`;
-  $("peer-config-text").textContent = peer.config_text;
+  const proto = vless ? PROTOCOLS.vless : (PROTOCOLS[peer.protocol] || PROTOCOLS.awg2);
+  let about = `${proto.name}. ${proto.hint}`;
+  if (vless && currentVless && !currentVless.listening) {
+    about += ` Сейчас вход не работает: ${fallbackState(currentVless)[0]}.`;
+  }
+  $("peer-dialog-protocol").textContent = about;
+  $("peer-config-text").textContent = vless ? peer.link : peer.config_text;
   $("peer-toggle-btn").textContent = peer.enabled ? "Выключить" : "Включить";
+  $("peer-copy-btn").textContent = vless ? "Скопировать ссылку" : "Скопировать конфиг";
+  $("peer-download-btn").hidden = vless;
+  $("peer-regen-btn").textContent = vless ? "Новый UUID" : "Пересоздать ключи";
 
   const img = $("peer-qr-img");
   img.removeAttribute("src");
   try {
-    const res = await apiBlob(`/peers/${id}/qrcode`);
+    const res = await apiBlob(`${base}/qrcode`);
     const blob = await res.blob();
     if (img.dataset.objectUrl) URL.revokeObjectURL(img.dataset.objectUrl);
     const url = URL.createObjectURL(blob);
@@ -1232,7 +1244,7 @@ $("peer-copy-btn").addEventListener("click", async () => {
   const text = $("peer-config-text").textContent;
   try {
     await navigator.clipboard.writeText(text);
-    showToast("Конфиг скопирован в буфер обмена");
+    showToast(isVlessId(activePeerId) ? "Ссылка скопирована в буфер обмена" : "Конфиг скопирован в буфер обмена");
   } catch (_) {
     showToast("Не удалось скопировать — выделите текст вручную", true);
   }
@@ -1277,15 +1289,20 @@ $("peer-toggle-btn").addEventListener("click", () => {
 });
 
 $("peer-regen-btn").addEventListener("click", () => {
+  const vless = isVlessId(activePeerId);
   openConfirm(
-    "Пересоздать ключи?",
-    "Текущий конфиг на устройстве клиента перестанет подключаться — потребуется заново отсканировать новый QR-код или импортировать файл.",
+    vless ? "Выдать новый UUID?" : "Пересоздать ключи?",
+    vless
+      ? "Текущая ссылка на устройстве клиента перестанет подключаться — потребуется заново отсканировать QR-код или импортировать ссылку."
+      : "Текущий конфиг на устройстве клиента перестанет подключаться — потребуется заново отсканировать новый QR-код или импортировать файл.",
     async () => {
       try {
-        await api(`/peers/${activePeerId}/regenerate-keys`, { method: "POST" });
+        await api(isVlessId(activePeerId)
+          ? `/fallback/clients/${vlessClientId(activePeerId)}/regenerate`
+          : `/peers/${activePeerId}/regenerate-keys`, { method: "POST" });
         await loadPeers();
         await openPeerDialog(activePeerId);
-        showToast("Ключи пересозданы");
+        showToast(vless ? "UUID обновлён" : "Ключи пересозданы");
       } catch (err) {
         showToast(err.message, true);
       }
@@ -1298,7 +1315,8 @@ $("peer-delete-btn").addEventListener("click", () => {
   const label = peer ? peer.name : "этот пир";
   openConfirm("Удалить пира?", `«${label}» будет удалён без возможности восстановления.`, async () => {
     try {
-      await api(`/peers/${activePeerId}`, { method: "DELETE" });
+      await api(isVlessId(activePeerId) ? `/fallback/clients/${vlessClientId(activePeerId)}` : `/peers/${activePeerId}`,
+        { method: "DELETE" });
       $("peer-dialog").close();
       await loadPeers();
       showToast("Пир удалён");

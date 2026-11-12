@@ -5,7 +5,7 @@ from datetime import datetime, timezone
 
 from sqlalchemy.orm import Session, object_session
 
-from . import awg_config, awg_manager, cascade, wg_status
+from . import awg_config, awg_manager, cascade, vless_server, wg_status
 from .models import Peer, ServerConfig, Tunnel
 
 # Код `noisefloor-rules check`: правила снесли снаружи (ufw reset, iptables -F).
@@ -143,7 +143,12 @@ def _apply_locked(db: Session, *, restart: bool,
     # Каскад (xray -> VLESS) применяется ДО рендера awg-конфига: REDIRECT-
     # правило в PostUp имеет смысл только если процесс, на который оно
     # заворачивает трафик, реально поднят.
+    # Вход VLESS переезжает между отдельным xray и xray каскада, порт один:
+    # сначала отпустить его, потом занимать (см. vless_server).
+    if vless_server.cascade_wanted(server):
+        vless_server.stop()
     server.cascade_last_error = cascade.sync(server)
+    vless_server.sync(server)
 
     peers = db.query(Peer).all()
     interfaces = interface_names(db, server)

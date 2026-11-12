@@ -3,7 +3,7 @@ from __future__ import annotations
 from fastapi import APIRouter, Depends, HTTPException, Response, status
 from sqlalchemy.orm import Session
 
-from .. import cascade, config_sync, fallback
+from .. import cascade, config_sync, fallback, vless_server
 from ..database import get_db
 from ..models import FallbackClient
 from ..qr import config_to_png
@@ -15,16 +15,21 @@ router = APIRouter()
 
 def _client_read(config, client: FallbackClient, host: str) -> FallbackClientRead:
     return FallbackClientRead(id=client.id, name=client.name, enabled=client.enabled,
-                              link=fallback.client_link(config, client, host))
+                              link=fallback.client_link(config, client, host), created_at=client.created_at)
 
 
 def _read(db: Session) -> FallbackRead:
     config = fallback.get_config(db)
     server = config_sync.get_server(db)
     clients = db.query(FallbackClient).order_by(FallbackClient.id).all()
+    via_cascade = vless_server.cascade_wanted(server)
+    if via_cascade:
+        listening, warning = cascade.fallback_listening(), cascade.fallback_warning()
+    else:
+        listening, warning = vless_server.listening_port() is not None, vless_server.warning()
     return FallbackRead(enabled=config.enabled, port=config.port, sni=config.sni, dest=config.dest,
-                        cascade_running=cascade.is_running(), listening=cascade.fallback_listening(),
-                        warning=cascade.fallback_warning(),
+                        mode="cascade" if via_cascade else "direct",
+                        cascade_running=cascade.is_running(), listening=listening, warning=warning,
                         clients=[_client_read(config, c, server.endpoint_host) for c in clients])
 
 
@@ -63,6 +68,22 @@ def create_client(body: FallbackClientCreate, db: Session = Depends(get_db), _ad
     db.commit()
     config_sync.apply_current_config(db)
     return _client_read(config, client, config_sync.get_server(db).endpoint_host)
+
+
+@router.get("/clients/{client_id}", response_model=FallbackClientRead)
+def read_client(client_id: int, db: Session = Depends(get_db), _admin: str = Depends(get_current_admin)):
+    return _client_read(fallback.get_config(db), _client_or_404(db, client_id),
+                        config_sync.get_server(db).endpoint_host)
+
+
+@router.post("/clients/{client_id}/regenerate", response_model=FallbackClientRead)
+def regenerate_client(client_id: int, db: Session = Depends(get_db), _admin: str = Depends(get_current_admin)):
+    """Новый UUID: выданная ссылка перестаёт работать, как после смены ключей пира."""
+    client = _client_or_404(db, client_id)
+    client.uuid = fallback.new_client(client.name).uuid
+    db.commit()
+    config_sync.apply_current_config(db)
+    return _client_read(fallback.get_config(db), client, config_sync.get_server(db).endpoint_host)
 
 
 @router.patch("/clients/{client_id}", response_model=FallbackClientRead)

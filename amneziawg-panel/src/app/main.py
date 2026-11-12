@@ -6,7 +6,7 @@ from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 
-from . import awg_supervisor, backup, bootstrap, canary, cascade, cascade_sync, config_sync, notify, relays, self_update, traffic_history
+from . import awg_supervisor, backup, bootstrap, canary, cascade, cascade_sync, config_sync, notify, relays, self_update, traffic_history, vless_server
 from .config import settings
 from .database import Base, SessionLocal, engine, run_migrations
 from .models import ServerConfig, Tunnel
@@ -71,6 +71,8 @@ async def lifespan(app: FastAPI):
     # Сторож процесса xray: упавший поднимается за секунды, а не к следующей
     # проверке.
     threading.Thread(target=cascade.watch, args=(_cascade_supervisor_stop,), daemon=True).start()
+    # Сторож отдельного xray для VLESS без каскада.
+    threading.Thread(target=vless_server.watch, args=(_cascade_supervisor_stop,), daemon=True).start()
     # Надзор за самим туннелем: если amneziawg-go убит (OOM, 2026-09-20) и
     # awg0 исчез — поднимает его заново. Без этого панель жива, VPN мёртв,
     # и HEALTHCHECK этого не видит.

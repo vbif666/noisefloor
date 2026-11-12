@@ -342,6 +342,7 @@ class FallbackClientRead(BaseModel):
     name: str
     enabled: bool
     link: str
+    created_at: UtcDatetime | None = None
 
 
 class FallbackClientCreate(BaseModel):
@@ -357,6 +358,9 @@ class FallbackRead(BaseModel):
     port: int
     sni: str
     dest: str
+    # Где работает вход: "cascade" - в xray каскада, трафик через релей;
+    # "direct" - в своём xray, выход с этого сервера.
+    mode: str
     cascade_running: bool
     listening: bool
     warning: str | None

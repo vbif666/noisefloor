@@ -315,30 +315,28 @@
               Основной протокол — AmneziaWG 3.1 (настройки выше). Для устройств, которые
               его не понимают, есть ещё три: AmneziaWG 2.0, 1.x и WireGuard. Маскировка задаётся на весь
               интерфейс, поэтому у каждого протокола свой UDP-порт, свои ключи и своя
-              подсеть. Трафик всех протоколов идёт через каскад так же, как основной.
+              подсеть. Для сетей, где режут UDP, — VLESS Reality по TCP. Трафик всех протоколов
+              идёт через каскад так же, как основной.
               Каждый включённый протокол — отдельный процесс на сервере, примерно
               10–20 МБ памяти.
             </p>
             <div id="tunnels-list"></div>
-          </div>
-        </div>
-
-        <div class="panel" style="margin-bottom:16px;">
-          <div class="panel-header">
-            <h2>Запасной вход VLESS</h2>
-            <span class="apply-status" id="fallback-status"></span>
-          </div>
-          <div class="panel-body">
-            <p class="field-hint" style="margin-top:0;">
-              Для сетей, где режут UDP и AmneziaWG не поднимается. Подключение по TCP,
-              дальше через тот же каскад. Работает, только когда каскад запущен. Порт
-              нужно открыть по TCP в фаерволе хостинга. Любое изменение здесь
-              перезапускает xray и рвёт текущие соединения клиентов каскада.
-            </p>
-            <div class="field-group">
-              <label style="display:flex;gap:8px;align-items:center;">
-                <input id="fallback-enabled" type="checkbox" style="width:auto;" /> Включить запасной вход
-              </label>
+            <div class="field-group tunnel-card" style="border-top:1px solid var(--line); padding-top:14px;">
+              <div style="display:flex; justify-content:space-between; align-items:center; gap:12px; flex-wrap:wrap;">
+                <label style="display:flex; align-items:center; gap:8px; font-weight:600;">
+                  <input id="fallback-enabled" type="checkbox" style="width:auto;" />
+                  VLESS Reality
+                </label>
+                <span class="apply-status" id="fallback-status"></span>
+              </div>
+              <p class="field-hint">
+                VLESS + REALITY по TCP: для сетей, где режут UDP и AmneziaWG не поднимается.
+                Клиенты — v2rayNG, Hiddify, Streisand, NekoBox, Happ: импорт по ссылке или QR.
+                При включённом каскаде трафик идёт только через релей, без каскада — напрямую
+                с этого сервера. Порт нужно открыть по TCP в фаерволе хостинга, и он не должен
+                быть занят (например, nginx на 443). При включённом каскаде любое изменение
+                здесь перезапускает xray и рвёт текущие соединения клиентов каскада.
+              </p>
               <div class="field-row">
                 <div class="field">
                   <label for="fallback-port">Порт TCP</label>
@@ -353,16 +351,11 @@
                   <input id="fallback-dest" autocomplete="off" />
                 </div>
               </div>
+              <p class="field-hint" id="fallback-summary"></p>
+              <div class="server-actions">
+                <button type="button" id="fallback-save-btn" class="btn btn-primary btn-sm">Сохранить и применить</button>
+              </div>
             </div>
-            <div class="server-actions" style="margin-top:14px;">
-              <button type="button" id="fallback-save-btn" class="btn btn-primary btn-sm">Сохранить</button>
-            </div>
-            <div id="fallback-clients" style="margin-top:14px;"></div>
-            <div class="server-actions" style="margin-top:14px;">
-              <input id="fallback-client-name" placeholder="Имя клиента" autocomplete="off" style="max-width:220px;" />
-              <button type="button" id="fallback-add-btn" class="btn btn-ghost btn-sm">Добавить клиента</button>
-            </div>
-            <div class="qr-wrap" id="fallback-qr-wrap" hidden><img id="fallback-qr-img" alt="QR-код ссылки" width="220" height="220" /></div>
           </div>
         </div>
 
@@ -534,9 +527,15 @@
             <span class="proto-name">WireGuard</span>
             <span class="proto-sub" data-default="без маскировки">без маскировки</span>
           </label>
+          <label class="proto-option">
+            <input type="radio" name="np-protocol" value="vless" />
+            <span class="proto-name">VLESS Reality</span>
+            <span class="proto-sub" data-default="по TCP, где режут UDP">по TCP, где режут UDP</span>
+          </label>
         </div>
         <p class="field-hint" id="np-protocol-hint"></p>
       </div>
+      <div id="np-wg-fields">
       <div class="field">
         <label for="np-allowed">Маршруты через туннель (AllowedIPs у клиента)</label>
         <input id="np-allowed" value="0.0.0.0/0, ::/0" />
@@ -551,6 +550,7 @@
           <label for="np-dns">DNS (переопределить)</label>
           <input id="np-dns" placeholder="по умолчанию сервера" />
         </div>
+      </div>
       </div>
       <div class="field" style="margin-bottom:0;">
         <label for="np-note">Заметка (необязательно)</label>
