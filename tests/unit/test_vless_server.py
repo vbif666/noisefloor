@@ -247,6 +247,13 @@ class BusyPortTests(unittest.TestCase):
         self.assertEqual(data.port, 8443)
         self.assertIn("8443", data.notice)
 
+    def test_link_uses_compact_fingerprint(self):
+        # fp=chrome на 147 не проходил мобильную сеть: приветствие в два пакета.
+        link = fallback.client_link(self.config, fallback.new_client("a"), "203.0.113.1")
+        self.assertIn("fp=safari", link)
+        with mock.patch.object(fallback.settings, "vless_fingerprint", "ios"):
+            self.assertIn("fp=ios", fallback.client_link(self.config, fallback.new_client("a"), "203.0.113.1"))
+
     def test_default_port_comes_from_env(self):
         # install.sh пишет VLESS_PORT=8443, когда 443 на хосте занят.
         self.db.delete(self.config)

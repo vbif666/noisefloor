@@ -132,5 +132,5 @@ def client_link(config: FallbackConfig, client: FallbackClient, host: str) -> st
     if ":" in host and not host.startswith("["):
         host = f"[{host}]"
     query = urlencode({"type": "tcp", "security": "reality", "encryption": "none", "flow": FLOW,
-                       "sni": config.sni, "fp": "chrome", "pbk": config.public_key, "sid": config.short_id})
+                       "sni": config.sni, "fp": settings.vless_fingerprint, "pbk": config.public_key, "sid": config.short_id})
     return f"vless://{client.uuid}@{host}:{config.port}?{query}#{quote(client.name, safe='')}"

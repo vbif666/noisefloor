@@ -59,6 +59,11 @@ class Settings(BaseSettings):
     # (Hiddify, NekoBox, Karing) представляются как 1.8.0 и получают отказ:
     # «reality verification failed», у пользователя «сбой подключения».
     # Пустая строка - порог xray по умолчанию.
+    # Отпечаток TLS (uTLS) в ссылке клиента. Не chrome: у Chrome приветствие с
+    # постквантовым ключом X25519MLKEM768 весит ~1.5 КБ и не влезает в один пакет
+    # мобильной сети (MSS 1300), а второй пакет мобильный DPI глушит - на 147 с
+    # МТС так застревали все попытки Hiddify. У safari приветствие ~0.5 КБ.
+    vless_fingerprint: str = Field(default="safari", pattern=r"^[a-z0-9_]+$")
     vless_min_client_ver: str = Field(default="1.8.0", pattern=r"^(\d+\.\d+\.\d+)?$")
 
     # Docker-шаблон: поднять интерфейс автоматически при старте контейнера,
