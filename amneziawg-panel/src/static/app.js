@@ -1656,7 +1656,7 @@ function renderCascadeChecklist(c) {
   if (c.checking === "verify") row("wait", "Проверяю трафик через релей…");
   else if (c.verified_ok === true) row("ok", "Трафик проходит через релей", c.verified_at ? `проверено ${timeAgo(new Date(c.verified_at))}` : "");
   else if (c.verified_ok === false) row("bad", "Трафик через релей не проходит", escapeHtml(c.verify_error || ""));
-  else if (c.running) row("todo", "Трафик ещё не проверялся", "нажмите «Проверить связь сейчас»");
+  else if (c.running) row("todo", "Трафик ещё не проверялся", "нажмите «Проверить подключение»");
 
   // В режиме redirect UDP уходит мимо каскада с адресом этого сервера:
   // сайты открываются, а звонки Telegram/WhatsApp из РФ не соединяются.
@@ -1673,10 +1673,23 @@ function renderCascadeChecklist(c) {
     if (c.canary_checked_at) details.push(`проверено ${timeAgo(new Date(c.canary_checked_at))}`);
     row("ok", "Канарейка: путь клиента работает", details.filter(Boolean).join(" · "));
   } else if (c.canary_ok === false) {
-    row("bad", "Канарейка: путь клиента сломан", escapeHtml(c.canary_error || ""));
+    const h = c.canary_hint;
+    row("bad", `Канарейка: ${h ? escapeHtml(h.title) : "путь клиента сломан"}`,
+        escapeHtml(c.canary_error || ""));
+    if (h) rows.push(renderCanaryHint(h));
   }
 
   box.innerHTML = rows.join("");
+}
+
+// Объяснение для неспециалиста: что сломалось и что проверить по шагам.
+function renderCanaryHint(h) {
+  const steps = (h.steps || []).map((step) => `<li>${escapeHtml(step)}</li>`).join("");
+  return `<details class="check-hint" open>
+    <summary>Что это значит и что делать</summary>
+    <p>${escapeHtml(h.meaning || "")}</p>
+    ${steps ? `<ol>${steps}</ol>` : ""}
+  </details>`;
 }
 
 function renderCascadeStatus(c) {

@@ -267,6 +267,7 @@ def cascade_status(db: Session = Depends(get_db), _admin: str = Depends(get_curr
         canary_checked_at=bird["checked_at"],
         canary_error=bird["error"],
         canary_stage=bird["stage"],
+        canary_hint=bird["hint"],
         canary_exit_ip=bird["exit_ip"],
         canary_duration_ms=bird["duration_ms"],
         canary_speed_bps=bird["speed_bps"],

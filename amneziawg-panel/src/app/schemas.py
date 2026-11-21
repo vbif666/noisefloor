@@ -167,6 +167,8 @@ class CascadeStatus(BaseModel):
     canary_checked_at: UtcDatetime | None = None
     canary_error: str | None = None
     canary_stage: str | None = None  # на чём упала: handshake, dns, exit_ip, download
+    # Простое объяснение и шаги самопроверки: {"title", "meaning", "steps": [...]}
+    canary_hint: dict | None = None
     canary_exit_ip: str | None = None
     canary_duration_ms: int | None = None
     canary_speed_bps: int | None = None

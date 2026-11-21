@@ -103,6 +103,13 @@ class PanelSideTests(unittest.TestCase):
         data = canary.status()
         self.assertIs(data["ok"], False)
         self.assertEqual(data["stage"], "exit_ip")
+        self.assertEqual(data["hint"]["title"], canary.HINTS["exit_ip"]["title"])
+
+    def test_success_has_no_hint(self):
+        self._result(state="idle")
+        canary.sync(self.db)
+        self._result(state="probed", ok=True, exit_ip="198.51.100.9", duration_ms=10)
+        self.assertIsNone(canary.status()["hint"])
 
     def test_silent_sidecar_is_a_failure(self):
         self._result(state="idle")
@@ -113,6 +120,7 @@ class PanelSideTests(unittest.TestCase):
         data = canary.status()
         self.assertIs(data["ok"], False)
         self.assertEqual(data["stage"], "stale")
+        self.assertIs(data["hint"], canary.HINTS["stale"])
 
     def test_expected_ip_override(self):
         with mock.patch.object(canary.settings, "canary_expected_exit_ip", "192.0.2.1, 192.0.2.2"):
@@ -215,3 +223,29 @@ class ProbeTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class HintTests(unittest.TestCase):
+    """Каждой поломке своя подсказка, внутри этапа различаем по тексту ошибки."""
+
+    def test_every_probe_stage_has_hint(self):
+        for stage in ("stale", "handshake", "dns", "exit_ip", "download", "tunnel", "internal"):
+            hint = canary.hint_for(stage, "")
+            self.assertIsNotNone(hint, stage)
+            self.assertTrue(hint["title"] and hint["meaning"] and hint["steps"], stage)
+
+    def test_refinements(self):
+        cases = {
+            ("exit_ip", "трафик выходит с 203.0.113.1, а не с адреса релея (198.51.100.9)"): "exit_ip_mismatch",
+            ("exit_ip", "адрес выхода не определён: timeout"): "exit_ip",
+            ("download", "скачивание вернуло HTTP 503"): "download_http",
+            ("download", "скорость 10 КБ/с ниже порога 64 КБ/с"): "download_slow",
+            ("download", "скачивание заняло 25.0 с при пороге 20 с"): "download_slow",
+            ("download", "скачивание оборвалось на 4000 байтах за 20.0 с (curl 28)"): "download",
+        }
+        for (stage, error), key in cases.items():
+            self.assertIs(canary.hint_for(stage, error), canary.HINTS[key], error)
+
+    def test_no_stage_no_hint(self):
+        self.assertIsNone(canary.hint_for(None, None))
+        self.assertIsNone(canary.hint_for("unknown", "x"))

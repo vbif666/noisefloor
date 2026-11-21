@@ -1280,6 +1280,23 @@ canvas.chart-canvas {
   word-break: break-word;
 }
 
+/* Подсказка под упавшей проверкой: простыми словами и по шагам. */
+.check-hint {
+  margin: 4px 0 6px 24px;
+  padding: 10px 12px;
+  font-size: 13px;
+  line-height: 1.5;
+  color: var(--text);
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-left: 3px solid var(--danger-strong);
+  border-radius: var(--radius-sm);
+}
+.check-hint summary { cursor: pointer; font-weight: 600; }
+.check-hint p { margin: 8px 0 6px; }
+.check-hint ol { margin: 0; padding-left: 20px; }
+.check-hint li + li { margin-top: 4px; }
+
 @media (max-width: 600px) {
   .save-bar-actions { width: 100%; }
   .save-bar-actions .btn { flex: 1; }

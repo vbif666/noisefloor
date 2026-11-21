@@ -320,6 +320,15 @@ def _observe_relays(lim: Limiter, db_relays: list) -> None:
                     quiet_first=not mismatch)
 
 
+def _canary_down_text(state: dict) -> str:
+    hint = state.get("hint")
+    if not hint:
+        return f"канарейка упала: {state['stage']}: {state['error']}"
+    first_step = (hint.get("steps") or [""])[0]
+    text = f"канарейка упала: {hint['title']} ({state['error']})"
+    return f"{text}\nЧто сделать первым: {first_step}" if first_step else text
+
+
 def _observe_canary(lim: Limiter) -> None:
     from . import canary
     state = canary.status()
@@ -327,7 +336,7 @@ def _observe_canary(lim: Limiter) -> None:
         return
     lim.observe("canary", state["ok"],
                 "канарейка восстановилась, каскад работает" if state["ok"]
-                else f"канарейка упала: {state['stage']}: {state['error']}",
+                else _canary_down_text(state),
                 quiet_first=state["ok"], hold=settings.notify_hold_seconds)
 
 

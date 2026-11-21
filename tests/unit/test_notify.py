@@ -321,6 +321,14 @@ class SourceTests(ModuleCase):
             notify._observe_canary(self.lim)
             self.assertIn("восстановилась", self.lim.due()[0])
 
+    def test_canary_down_text_explains(self):
+        from app import canary
+        hint = canary.HINTS["handshake"]
+        text = notify._canary_down_text(
+            {"stage": "handshake", "error": "нет рукопожатия с сервером", "hint": hint})
+        self.assertIn(hint["title"], text)
+        self.assertIn(hint["steps"][0], text)
+
 
 if __name__ == "__main__":
     unittest.main()
