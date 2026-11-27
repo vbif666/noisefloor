@@ -1,0 +1,79 @@
+"""
+VK напрямую с адреса сервера, мимо каскада.
+
+Зачем отдельный список, если есть geoip:ru. Разделение сравнивает адрес
+назначения с базой geoip, а у VK часть подсетей там не числится российской:
+5.101.40.0/22 (i.mycdn.me, i.okcdn.ru - картинки VK и OK, Москва, AS47764)
+и ещё десяток. А 95.142.206.0/24 (sun6-*.userapi.com) - узел VK в Амстердаме.
+Такие соединения уходили в каскад и выходили к VK с иностранного адреса
+релея. Проверено 2026-11-27 на боевом сервере: до списка картинки шли через
+релей за 0,37 с, напрямую за 0,07 с.
+
+Два правила: по имени (вход каскада разбирает SNI/Host, клиент VLESS
+присылает имя сам) и по адресу (имени может не быть: звонки, приложения
+с IP в коде). Оба - только при включённом разделении маршрутов.
+
+Домены - списки vk, ok и mailru-group из v2fly/domain-list-community плюс
+найденные в страницах и JS vk.ru. Подсети - анонсы автономных систем VK из
+RIPEstat: AS47541, AS47542, AS28709, AS62243, AS207581, AS47764, AS49988,
+AS60476. Список обновляется вместе с релизом панели.
+"""
+from __future__ import annotations
+
+DOMAIN_RULE_TAG = "nf-vk-domain"
+IP_RULE_TAG = "nf-vk-ip"
+
+# Формат xray: domain:X - X и все поддомены, full:X - только X.
+DOMAINS = (
+    "domain:mvk.com", "domain:vk.cc", "domain:vk.com", "domain:vk.design",
+    "domain:vk.link", "domain:vk.ru", "domain:vkontakte.com", "domain:vkontakte.ru",
+    "domain:vk-analytics.ru", "domain:cdn-vk.net", "domain:cdn-vk.ru", "domain:userapi.com",
+    "domain:userapi.ru", "domain:vk-cdn.me", "domain:vk-cdn.net", "domain:vk-portal.net",
+    "domain:vkcache.com", "domain:vkcdnservice.com", "domain:vkcloud-static.ru", "domain:vktech-static.ru",
+    "domain:vkuser.net", "domain:vkusercdn.ru", "domain:vkuserphoto.ru", "domain:vkuseraudio.com",
+    "domain:vkuseraudio.net", "domain:vkuseraudio.ru", "domain:vkuserlive.com", "domain:vkuserlive.net",
+    "domain:vkuservideo.com", "domain:vkuservideo.net", "domain:vkuservideo.ru", "domain:vk.me",
+    "domain:vkmessenger.app", "domain:vkmessenger.com", "domain:vkpay.app", "domain:vkpay.com",
+    "domain:vkpay.io", "domain:vkpay.ru", "domain:apiok.ru", "domain:insideok.ru",
+    "domain:odkl.ru", "domain:odnoklasniki.by", "domain:odnoklasniki.ua", "domain:odnoklassniki.am",
+    "domain:odnoklassniki.by", "domain:odnoklassniki.co.ee", "domain:odnoklassniki.eu", "domain:odnoklassniki.lv",
+    "domain:odnoklassniki.ru", "domain:odnoklassniki.tj", "domain:ok.me", "domain:ok.ru",
+    "domain:okl.lt", "domain:oktech.ru", "domain:okcdn.ru", "domain:vkvideo.ru",
+    "domain:vk.company", "domain:vk.team", "domain:vk.kz", "domain:vk-apps.com",
+    "domain:vk-apps.ru", "domain:vkclips.app", "domain:vklive.app", "domain:vkgo.app",
+    "domain:vk-records.ru", "domain:vkfest.ru", "domain:vkplay.ru", "domain:vkplay.live",
+    "domain:vkplay-arena.ru", "domain:mycdn.me", "domain:mrgcdn.ru", "domain:cdnmail.ru",
+    "domain:imgsmail.ru", "domain:mradx.net", "domain:apptracer.ru", "domain:mail.ru",
+    "domain:my.com", "domain:max.ru", "domain:oneme.ru", "domain:sferum.ru",
+    "domain:tamtam.chat",
+)
+
+IPV4_NETS = (
+    "5.61.16.0/21", "5.61.232.0/21", "5.101.40.0/22", "5.181.60.0/22", "5.188.140.0/22", "31.177.104.0/22",
+    "37.139.32.0/22", "37.139.40.0/22", "45.84.128.0/22", "45.136.20.0/22", "62.217.160.0/20", "79.137.132.0/24",
+    "79.137.139.0/24", "79.137.140.0/24", "79.137.157.0/24", "79.137.164.0/24", "79.137.167.0/24", "79.137.174.0/23",
+    "79.137.180.0/24", "79.137.183.0/24", "79.137.240.0/21", "83.166.232.0/21", "83.166.248.0/21", "83.217.216.0/22",
+    "83.222.28.0/22", "84.23.52.0/22", "85.142.115.0/24", "85.192.32.0/22", "85.198.107.0/24", "87.239.104.0/21",
+    "87.240.128.0/18", "87.242.112.0/22", "89.208.84.0/22", "89.208.196.0/22", "89.208.208.0/22", "89.208.216.0/21",
+    "89.208.228.0/22", "89.221.228.0/22", "89.221.232.0/21", "90.156.148.0/22", "90.156.212.0/22", "90.156.216.0/22",
+    "90.156.232.0/21", "91.219.224.0/22", "91.231.132.0/22", "92.38.217.0/24", "93.186.224.0/20", "94.100.176.0/20",
+    "94.139.244.0/22", "95.142.192.0/20", "95.163.32.0/19", "95.163.133.0/24", "95.163.180.0/22", "95.163.208.0/21",
+    "95.163.216.0/22", "95.163.248.0/21", "95.213.0.0/17", "109.120.180.0/22", "109.120.188.0/22", "128.140.168.0/21",
+    "130.49.224.0/19", "138.16.192.0/20", "138.16.240.0/20", "146.185.208.0/22", "146.185.240.0/22", "154.90.70.0/23",
+    "155.212.192.0/20", "160.5.208.0/20", "161.104.104.0/21", "168.113.128.0/20", "176.112.168.0/21", "178.22.88.0/21",
+    "178.237.16.0/20", "185.5.136.0/22", "185.16.148.0/22", "185.16.244.0/22", "185.29.130.0/24", "185.30.176.0/22",
+    "185.32.248.0/22", "185.86.144.0/22", "185.100.104.0/22", "185.130.112.0/22", "185.131.68.0/22", "185.180.200.0/22",
+    "185.187.63.0/24", "185.205.76.0/22", "185.226.52.0/22", "185.241.192.0/22", "188.93.56.0/21", "193.203.40.0/22",
+    "194.186.63.0/24", "195.211.20.0/22", "195.218.190.0/23", "212.111.84.0/22", "212.233.72.0/21", "212.233.88.0/21",
+    "212.233.96.0/22", "212.233.120.0/22", "213.219.212.0/22", "217.16.16.0/20", "217.20.144.0/20", "217.69.128.0/20",
+    "217.174.188.0/22",
+)
+
+
+def rules(inbounds: list[str], tag_suffix: str = "") -> list[dict]:
+    """Правила для указанных входов; outbound - прямой выход сервера."""
+    tagged = {"type": "field", "inboundTag": list(inbounds), "outboundTag": "direct"}
+    return [
+        {"ruleTag": DOMAIN_RULE_TAG + tag_suffix, **tagged, "domain": list(DOMAINS)},
+        {"ruleTag": IP_RULE_TAG + tag_suffix, **tagged, "ip": list(IPV4_NETS)},
+    ]

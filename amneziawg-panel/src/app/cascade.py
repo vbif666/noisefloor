@@ -42,6 +42,7 @@ from urllib.parse import parse_qs, unquote, urlparse
 
 from .config import DATA_DIR, settings
 from .fsutil import atomic_write
+from . import vk_direct
 
 XRAY_BIN = shutil.which("xray") or "/usr/local/bin/xray"
 CONFIG_PATH = DATA_DIR / "cascade-xray-config.json"
@@ -364,20 +365,27 @@ def _fallback_inbound(fallback: dict) -> dict:
     }
 
 
-def _fallback_rules(relay_route: dict) -> list[dict]:
+def _fallback_rules(relay_route: dict, vk: bool = False) -> list[dict]:
     """Только через релей: тот маршрут, что и у пробы, он никогда не выпускает
-    напрямую. Разделения здесь нет: клиент VLESS присылает имена, а не адреса, и
-    решать по ним на сервере было бы нечем. Имя, которое на релее разрешится в
+    напрямую. Разделения по geoip здесь нет: клиент VLESS присылает имена, а не
+    адреса, и решать по ним на сервере было бы нечем. Исключение - список VK
+    (vk=True): он задан именами, и VK должен видеть российский адрес. Частные
+    адреса и localhost закрыты раньше него. Имя, которое на релее разрешится в
     локальный адрес, этими правилами не поймать: кроме localhost их не знает никто."""
     tagged = {"type": "field", "inboundTag": [FALLBACK_TAG]}
     return [
         {"ruleTag": "nf-vless-private", **tagged, "ip": list(FALLBACK_BLOCKED_IPS), "outboundTag": "block"},
         {"ruleTag": "nf-vless-local", **tagged, "domain": ["full:localhost"], "outboundTag": "block"},
+        *(vk_direct.rules([FALLBACK_TAG], "-vless") if vk else []),
         {"ruleTag": "nf-vless", **tagged, **relay_route},
     ]
 
 
-def _split_ru_rules(route: dict | None = None) -> list[dict]:
+def vk_direct_enabled(split_ru_direct: bool) -> bool:
+    return bool(split_ru_direct and settings.cascade_vk_direct)
+
+
+def _split_ru_rules(route: dict | None = None, vk: bool = False) -> list[dict]:
     """Правила разделения: российские адреса — напрямую, остальное — в каскад.
 
     Порядок здесь не косметика, а суть механизма. Выученные исключения
@@ -387,6 +395,9 @@ def _split_ru_rules(route: dict | None = None) -> list[dict]:
 
     Сам список исключений здесь пуст: его на ходу подменяет панель через
     `xray api adrules`, не перезапуская движок и не рвя соединения.
+
+    Список VK (vk=True) стоит после исключений и перед geoip:ru: часть его
+    подсетей geoip российскими не считает, см. vk_direct.py.
     """
     route = route or {"outboundTag": RELAY_TAG}
     return [
@@ -394,6 +405,7 @@ def _split_ru_rules(route: dict | None = None) -> list[dict]:
          "ip": ["geoip:private"], "outboundTag": "direct"},
         {"ruleTag": "nf-fallback", "type": "field", "inboundTag": ["cascade-in"],
          "ip": ["0.0.0.0/32"], **route},
+        *(vk_direct.rules(["cascade-in"]) if vk else []),
         {"ruleTag": "nf-ru", "type": "field", "inboundTag": ["cascade-in"],
          "ip": ["geoip:ru"], "outboundTag": "direct"},
     ]
@@ -469,7 +481,8 @@ def build_xray_config(params: dict, dns_server: str = "1.1.1.1", split_ru_direct
 
     # Кэш идёт после nf-private: резолвер в локальной сети отвечает сам, и до
     # geoip:ru, иначе запрос к российскому резолверу ушёл бы мимо кэша.
-    split_rules = _split_ru_rules(route) if split_ru_direct else []
+    vk = vk_direct_enabled(split_ru_direct)
+    split_rules = _split_ru_rules(route, vk=vk) if split_ru_direct else []
     client_rules = [*split_rules[:1], *client_dns_rules, *split_rules[1:]]
 
     return {
@@ -599,7 +612,7 @@ def build_xray_config(params: dict, dns_server: str = "1.1.1.1", split_ru_direct
             **({"balancers": balancers} if balanced else {}),
             "rules": [
                 {"ruleTag": "nf-api", "type": "field", "inboundTag": ["api-in"], "outboundTag": "api"},
-                *(_fallback_rules(probe_route) if fallback else []),
+                *(_fallback_rules(probe_route, vk=vk) if fallback else []),
                 *client_rules,
                 {"ruleTag": "nf-default", "type": "field", "inboundTag": ["cascade-in"], **route},
                 # Проба обязана идти тем же путём, что и клиентский трафик,

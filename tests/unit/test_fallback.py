@@ -71,7 +71,22 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(fallbacks[cascade.PROBE_BALANCER_TAG], cascade.RELAY_TAG)
 
     def test_split_does_not_apply(self):
+        # geoip:ru клиентам VLESS не действует; напрямую идёт только список VK.
         config = cascade.build_xray_config(RELAY, split_ru_direct=True, fallback=FB)
+        direct = [r["ruleTag"] for r in rules_of(config) if r.get("outboundTag") == "direct"]
+        self.assertEqual(direct, ["nf-vk-domain-vless", "nf-vk-ip-vless"])
+
+    def test_vk_goes_direct_after_private_blocks(self):
+        config = cascade.build_xray_config(RELAY, split_ru_direct=True, fallback=FB)
+        tags = [r.get("ruleTag") for r in config["routing"]["rules"]]
+        self.assertEqual(tags[:6], ["nf-api", "nf-vless-private", "nf-vless-local",
+                                    "nf-vk-domain-vless", "nf-vk-ip-vless", "nf-vless"])
+
+    def test_vk_off_without_split_or_by_setting(self):
+        config = cascade.build_xray_config(RELAY, split_ru_direct=False, fallback=FB)
+        self.assertFalse(any(r.get("outboundTag") == "direct" for r in rules_of(config)))
+        with mock.patch.object(cascade.settings, "cascade_vk_direct", False):
+            config = cascade.build_xray_config(RELAY, split_ru_direct=True, fallback=FB)
         self.assertFalse(any(r.get("outboundTag") == "direct" for r in rules_of(config)))
 
     def test_change_of_clients_is_not_swapped_as_outbound(self):

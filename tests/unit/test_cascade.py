@@ -384,6 +384,57 @@ class SplitRuRoutingTests(unittest.TestCase):
         self.assertIn("RoutingService", self._config(True)["api"]["services"])
 
 
+class VkDirectTests(unittest.TestCase):
+    """VK напрямую по своему списку. Закрывает находку 2026-11-27: картинки VK
+    (5.101.40.0/22) и sun6-*.userapi.com (95.142.206.0/24) geoip российскими не
+    считает, и при разделении они уходили через релей с иностранным адресом."""
+
+    def _config(self, split=True):
+        return cascade.build_xray_config(cascade.parse_vless_url(VALID_URL), "1.1.1.1", split_ru_direct=split)
+
+    def _rules(self, config):
+        return {r.get("ruleTag"): r for r in config["routing"]["rules"]}
+
+    def test_vk_rules_go_direct(self):
+        rules = self._rules(self._config())
+        self.assertEqual(rules["nf-vk-domain"]["outboundTag"], "direct")
+        self.assertEqual(rules["nf-vk-ip"]["outboundTag"], "direct")
+        self.assertEqual(rules["nf-vk-domain"]["inboundTag"], ["cascade-in"])
+        self.assertIn("domain:vk.ru", rules["nf-vk-domain"]["domain"])
+        self.assertIn("domain:userapi.com", rules["nf-vk-domain"]["domain"])
+        self.assertIn("5.101.40.0/22", rules["nf-vk-ip"]["ip"])
+        self.assertIn("95.142.192.0/20", rules["nf-vk-ip"]["ip"])
+
+    def test_order_exceptions_then_vk_then_geoip(self):
+        tags = [r.get("ruleTag") for r in self._config()["routing"]["rules"]]
+        self.assertLess(tags.index("nf-fallback"), tags.index("nf-vk-domain"))
+        self.assertLess(tags.index("nf-vk-ip"), tags.index("nf-ru"))
+        self.assertLess(tags.index("nf-ru"), tags.index("nf-default"))
+
+    def test_absent_without_split(self):
+        self.assertNotIn("nf-vk-domain", self._rules(self._config(split=False)))
+
+    def test_setting_turns_it_off(self):
+        with mock.patch.object(cascade.settings, "cascade_vk_direct", False):
+            self.assertNotIn("nf-vk-ip", self._rules(self._config()))
+
+    def test_lists_are_valid(self):
+        import ipaddress
+        from app import vk_direct
+        for net in vk_direct.IPV4_NETS:
+            self.assertEqual(ipaddress.ip_network(net).version, 4)
+        self.assertEqual(len(set(vk_direct.DOMAINS)), len(vk_direct.DOMAINS))
+        for d in vk_direct.DOMAINS:
+            self.assertRegex(d, r"^(domain|full):[a-z0-9.-]+\.[a-z]+$")
+
+    def test_rule_tags_are_unique_with_vless(self):
+        fb = {"port": 8443, "sni": "example.com", "dest": "example.com:443",
+              "private_key": "k", "short_id": "ab", "clients": ["id"]}
+        config = cascade.build_xray_config(cascade.parse_vless_url(VALID_URL), split_ru_direct=True, fallback=fb)
+        tags = [r["ruleTag"] for r in config["routing"]["rules"] if "ruleTag" in r]
+        self.assertEqual(len(tags), len(set(tags)))
+
+
 class ConfigChangeDetectionTests(unittest.TestCase):
     """Решение «перезапускать движок или нет» принимается по конфигу
     целиком. Раньше сравнивалась только ссылка vless://, и смена любой
