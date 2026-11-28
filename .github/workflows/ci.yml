@@ -101,6 +101,7 @@ jobs:
           docker run --rm \
             -v "$PWD/tests/unit:/tests:ro" \
             -v "$PWD/amneziawg-panel/noisefloor-rules:/usr/local/bin/noisefloor-rules:ro" \
+            -v "$PWD/tools/noisefloor:/usr/local/bin/noisefloor:ro" \
             --entrypoint python3 "$PANEL_IMAGE:ci" \
             -m unittest discover -s /tests -p 'test_*.py'
 
