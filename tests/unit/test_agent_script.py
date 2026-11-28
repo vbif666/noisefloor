@@ -48,7 +48,8 @@ class AgentScriptTests(unittest.TestCase):
         self.assertNotRegex(self.text, r"config --images\s*\|\s*head")
 
     def test_pull_has_timeout(self):
-        self.assertRegex(self.text, r'timeout "\$PULL_TIMEOUT" docker pull')
+        # bash -c, чтобы работала подмена docker функцией в tests/smoke.sh
+        self.assertRegex(self.text, r"""timeout "\$PULL_TIMEOUT" bash -c 'docker pull""")
         self.assertNotRegex(self.text, r"^\s*docker pull", "pull мимо pull_image")
 
     @unittest.skipUnless(shutil.which("bash"), "нужен bash")

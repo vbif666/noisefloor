@@ -81,7 +81,9 @@ compose_image() { (cd "$1" && docker compose config --images | awk 'NR==1'); }
 pull_image() { # образ
     local i
     for i in $(seq 1 "$PULL_ATTEMPTS"); do
-        timeout "$PULL_TIMEOUT" docker pull -q "$1" >/dev/null && return 0
+        # Через bash -c, а не `timeout docker`: так видна экспортированная
+        # функция docker, которой приёмочный тест подменяет pull.
+        timeout "$PULL_TIMEOUT" bash -c 'docker pull -q "$1"' _ "$1" >/dev/null && return 0
         [ "$i" -lt "$PULL_ATTEMPTS" ] && warn "docker pull $1: попытка $i не удалась, повторяю"
     done
     return 1
