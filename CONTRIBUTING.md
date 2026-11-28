@@ -35,6 +35,7 @@ docker build -t noisefloor-relay:dev vless-reality
 docker run --rm \
     -v "$PWD/amneziawg-panel/src:/src" -v "$PWD/tests/unit:/tests:ro" \
     -v "$PWD/amneziawg-panel/noisefloor-rules:/usr/local/bin/noisefloor-rules:ro" \
+    -v "$PWD/tools/noisefloor:/usr/local/bin/noisefloor:ro" \
     -e PYTHONPATH=/src -w /src noisefloor-panel:dev \
     python3 -m unittest discover -s /tests -p 'test_*.py' -v
 ```

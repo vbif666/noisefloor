@@ -29,6 +29,10 @@ REPO=vbif666/noisefloor
 PANEL_IMAGE=vbif666/noisefloor-amneziawg-panel
 RELAY_IMAGE=vbif666/noisefloor-vless-reality
 HEALTH_TIMEOUT=${NOISEFLOOR_HEALTH_TIMEOUT:-150}
+# docker pull может навсегда повиснуть на залипшем соединении с CDN Docker Hub:
+# ждём не дольше этого и пробуем ещё раз.
+PULL_TIMEOUT=${NOISEFLOOR_PULL_TIMEOUT:-300}
+PULL_ATTEMPTS=3
 # Сколько ждать зелёную канарейку после обновления, если до него она была зелёной.
 CANARY_TIMEOUT=${NOISEFLOOR_CANARY_TIMEOUT:-300}
 CANARY_FRESH_SECONDS=180
@@ -66,6 +70,21 @@ services() {
         elif grep -q "$RELAY_IMAGE" "$f"; then printf 'relay\t%s\t%s\n' "$dir" "$RELAY_IMAGE"
         fi
     done
+}
+
+# Образ первого сервиса compose. Не `| head -1`: образ панели стоит и у
+# канарейки, compose печатает две строки, head закрывает канал после первой,
+# и docker на второй иногда выходит с кодом 255. Под set -o pipefail это
+# молча роняло обновление сразу после «проверяю». awk дочитывает до конца.
+compose_image() { (cd "$1" && docker compose config --images | awk 'NR==1'); }
+
+pull_image() { # образ
+    local i
+    for i in $(seq 1 "$PULL_ATTEMPTS"); do
+        timeout "$PULL_TIMEOUT" docker pull -q "$1" >/dev/null && return 0
+        [ "$i" -lt "$PULL_ATTEMPTS" ] && warn "docker pull $1: попытка $i не удалась, повторяю"
+    done
+    return 1
 }
 
 service_dir() { services | awk -F'\t' -v n="$1" '$1==n{print $2; exit}'; }
@@ -247,7 +266,7 @@ update_one() { # имя каталог образ
     before=$(running_image "$dir" || true)
     version_before=$(container_env "$dir" NOISEFLOOR_VERSION 2>/dev/null || echo "?")
 
-    local ref; ref=$(cd "$dir" && docker compose config --images | head -1)
+    local ref; ref=$(compose_image "$dir")
 
     if [ "$name" = panel ]; then
         (cd "$dir" && vless_port_check "$(container_id "$dir")")
@@ -275,7 +294,7 @@ update_one() { # имя каталог образ
     fi
 
     log "$name: скачиваю $repo:$tag"
-    docker pull -q "$repo:$tag" >/dev/null || {
+    pull_image "$repo:$tag" || {
         docker rmi "$held" >/dev/null 2>&1 || true
         write_result "$dir" 0 "не удалось скачать $repo:$tag" 0 "$version_before" "?"
         die "$name: не удалось скачать $repo:$tag"
@@ -349,12 +368,12 @@ channel_tag() { # каталог [явный тег]
     [ "$channel" = latest ] && echo latest || echo stable
 }
 
-image_repo() { (cd "$1" && docker compose config --images | head -1 | sed 's/:[^:/]*$//'); }
+image_repo() { (compose_image "$1" | sed 's/:[^:/]*$//'); }
 
 # Тег, под которым лежит прежняя версия: vbif666/…-panel:previous.
 previous_ref() {
     local repo
-    repo=$(cd "$1" && docker compose config --images | head -1 | sed 's/:[^:/]*$//')
+    repo=$(compose_image "$1" | sed 's/:[^:/]*$//')
     echo "$repo:previous"
 }
 
@@ -363,7 +382,7 @@ rollback_one() { # имя каталог образ [quiet]
     prev=$(previous_ref "$dir")
     docker image inspect "$prev" >/dev/null 2>&1 \
         || { [ "${4:-}" = quiet ] || warn "$name: прежней версии не сохранено ($prev)"; return 1; }
-    local ref; ref=$(cd "$dir" && docker compose config --images | head -1)
+    local ref; ref=$(compose_image "$dir")
     snapshot=$(rollback_snapshot "$dir")
     if [ -n "$snapshot" ]; then
         (cd "$dir" && docker compose stop) >/dev/null 2>&1 || warn "$name: compose stop вернул ошибку"
@@ -409,7 +428,7 @@ check_one() { # имя каталог образ
     version=$(container_env "$dir" NOISEFLOOR_VERSION 2>/dev/null || echo "?")
     sha=$(container_env "$dir" NOISEFLOOR_BUILD_SHA 2>/dev/null || echo "?")
     local tag; tag=$(channel_tag "$dir")
-    local_digest=$(docker image inspect "$(cd "$dir" && docker compose config --images | head -1)" --format '{{index .RepoDigests 0}}' 2>/dev/null | cut -d@ -f2 || true)
+    local_digest=$(docker image inspect "$(compose_image "$dir")" --format '{{index .RepoDigests 0}}' 2>/dev/null | cut -d@ -f2 || true)
     remote_digest=$(curl -fsS --max-time 10 "https://hub.docker.com/v2/repositories/$image/tags/$tag" 2>/dev/null \
         | python3 -c 'import sys,json; print(json.load(sys.stdin).get("digest",""))' 2>/dev/null || true)
     printf '%-6s %-28s коммит %-8s канал %-7s' "$name" "$version" "$sha" "$tag"
